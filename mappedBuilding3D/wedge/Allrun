@@ -1,0 +1,25 @@
+#!/bin/sh
+cd ${0%/*} || exit 1    # run from this directory
+
+# Source tutorial run functions
+. $WM_PROJECT_DIR/bin/tools/RunFunctions
+
+# -- Create paraview file
+paraFoam -builtin -touch
+
+# -- Create base mesh
+runApplication blockMesh
+
+# -- Decompose the case
+runApplication decomposePar
+
+# -- Add internal patch
+runParallel addEmptyPatch internalPatch internal -overwrite
+
+# -- Set the charge
+runParallel setRefinedFields
+
+# -- Run calculation
+runParallel $(getApplication)
+
+# ----------------------------------------------------------------- end-of-file
