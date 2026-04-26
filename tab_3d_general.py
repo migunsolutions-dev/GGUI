@@ -742,8 +742,12 @@ class TabGeneral3D(QWidget):
         g1 = QGroupBox("Simulation Control"); f1 = QFormLayout(g1)
         f1.setVerticalSpacing(3)     # מרווח בין שורות
         f1.setHorizontalSpacing(10)   # מרווח בין label לשדה
-        self.spin_end = self._spin(0, 100, 0.030, 0.001, 4)
+        self.spin_end = self._spin(0, 100, 0.030, 0.001, 10)
         self.spin_end.setMaximumWidth(120)
+        self.spin_end.setToolTip(
+            "Simulation end time [s]. Resolution down to 1e-10 s — values like 2e-6 are preserved.\n"
+            "Typical blast: 1e-3..1e-2 s (close-in), 1e-2..1 s (far-field)."
+        )
         # spin_cfl is created in _build_model_tab (Simulation Parameters group)
         self.spin_cores = QSpinBox()
         self.spin_cores.setRange(1, 128)
@@ -764,12 +768,15 @@ class TabGeneral3D(QWidget):
         self.combo_write_control.setToolTip("timeStep = write every N steps. adjustableRunTime = write every T seconds (simulation time).")
         self.combo_write_control.currentTextChanged.connect(self._on_write_control_changed)
         self.spin_write_time = QDoubleSpinBox()
-        self.spin_write_time.setRange(1e-7, 1.0)
+        self.spin_write_time.setRange(1e-10, 1.0)
         self.spin_write_time.setValue(5e-5)
-        self.spin_write_time.setDecimals(7)
+        self.spin_write_time.setDecimals(10)
         self.spin_write_time.setSingleStep(1e-5)
         self.spin_write_time.setMaximumWidth(120)
-        self.spin_write_time.setToolTip("Write results every T seconds of simulation time (when Write control = adjustableRunTime).")
+        self.spin_write_time.setToolTip(
+            "Write results every T seconds of simulation time (adjustableRunTime).\n"
+            "Resolution down to 1e-10 s; values like 5e-7 are preserved."
+        )
         self.spin_cycle_write = QSpinBox()
         self.spin_cycle_write.setRange(0, 1000)
         self.spin_cycle_write.setValue(0)
@@ -1382,13 +1389,18 @@ class TabGeneral3D(QWidget):
         spin_concave.setValue(80 if getattr(self, "_mesh_max_concave", None) is None else self._mesh_max_concave)
         f_geom.addRow(_mesh_row("Max concave angle", "meshQualityControls maxConcave.", spin_concave))
         spin_minvol = QDoubleSpinBox()
-        spin_minvol.setDecimals(4)
+        spin_minvol.setDecimals(20)
         spin_minvol.setRange(1e-20, 1.0)
+        spin_minvol.setSingleStep(1e-13)
         spin_minvol.setValue(1e-13 if getattr(self, "_mesh_min_vol", None) is None else self._mesh_min_vol)
+        spin_minvol.setToolTip("meshQualityControls minVol. Resolution down to 1e-20 — small values like 1e-13 are preserved.")
         f_geom.addRow(_mesh_row("Minimum cell volume", "meshQualityControls minVol.", spin_minvol))
         spin_mintet = QDoubleSpinBox()
-        spin_mintet.setDecimals(4)
+        spin_mintet.setDecimals(20)
+        spin_mintet.setRange(1e-20, 1.0)
+        spin_mintet.setSingleStep(1e-15)
         spin_mintet.setValue(1e-15 if getattr(self, "_mesh_min_tet_quality", None) is None else self._mesh_min_tet_quality)
+        spin_mintet.setToolTip("meshQualityControls minTetQuality. Resolution down to 1e-20 — small values like 1e-15 are preserved.")
         f_geom.addRow(_mesh_row("Minimum tet quality", "meshQualityControls minTetQuality.", spin_mintet))
         spin_twist = QDoubleSpinBox()
         spin_twist.setValue(0.02 if getattr(self, "_mesh_min_twist", None) is None else self._mesh_min_twist)

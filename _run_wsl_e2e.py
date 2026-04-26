@@ -61,12 +61,9 @@ def configure_sphere_b3d(tab: TabGeneral3D) -> None:
     tab.spin_charge_outer_min.setValue(2)
     tab.spin_charge_outer_max.setValue(3)
     tab._bubble_radius_factor = 1.5
-    tab.spin_end.setDecimals(10)
-    tab.spin_end.setSingleStep(1e-6)
-    tab.spin_end.setRange(0, 100)
+    # spin_end / spin_write_time are now configured with decimals=10 in the GUI itself,
+    # so small values like 2e-6 / 5e-7 are preserved without any local override.
     tab.spin_end.setValue(SHORT_END_TIME)
-    tab.spin_write_time.setDecimals(10)
-    tab.spin_write_time.setRange(0, 100)
     tab.spin_write_time.setValue(SHORT_WRITE_INTERVAL)
     idx = tab.combo_write_control.findText("adjustableRunTime")
     if idx >= 0:
