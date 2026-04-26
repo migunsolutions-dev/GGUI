@@ -490,6 +490,10 @@ class TabGeneral3D(QWidget):
         self._n_buffer_layers_dynamic = 2
         self._enable_balancing = False
         self._refine_indicator_field = "densityGradient"
+        # Backup radius factor used by setRefinedFields backup region (sphere/cylinder).
+        # backup.radius = factor * charge_radius. Larger value -> more robust seeding on
+        # coarse base meshes, but seeds field into a larger volume around the charge.
+        self._bubble_radius_factor = 1.5
         self._obstacle_feature_angle = 120
         self._obstacle_cells_between_levels = 2
         self._obstacle_snap_iter = 100
@@ -1211,6 +1215,19 @@ class TabGeneral3D(QWidget):
         spin_buf_setfields.setToolTip("nBufferLayers in setFieldsDict. Default 2 (building3D-style).")
         f_buf.addRow("Buffer layers (setFields)", spin_buf_setfields)
         f_buf.addRow("", QLabel("nBufferLayers for charge/refinement regions (building3D: 2)."))
+        spin_bubble_factor = QDoubleSpinBox()
+        spin_bubble_factor.setRange(1.0, 5.0)
+        spin_bubble_factor.setSingleStep(0.1)
+        spin_bubble_factor.setDecimals(2)
+        spin_bubble_factor.setValue(getattr(self, "_bubble_radius_factor", 1.5))
+        spin_bubble_factor.setToolTip(
+            "Backup radius factor for setRefinedFields backup region.\n"
+            "backup.radius = factor x charge_radius.\n"
+            "Larger = more robust seeding on coarse base meshes; charge field is\n"
+            "placed in a larger volume around the geometric charge."
+        )
+        f_buf.addRow("Backup radius factor (bubble)", spin_bubble_factor)
+        f_buf.addRow("", QLabel("backup.radius = factor x charge radius. 1.5 matches building3D-style robust seeding; use 1.0 for tight backup."))
         v.addWidget(grp_buf)
 
         # Group: Dyn Refine (AMR) – Advanced
@@ -1410,6 +1427,7 @@ class TabGeneral3D(QWidget):
         layout.addWidget(bb)
         if d.exec_() == QDialog.Accepted:
             self._buffer_layers = spin_buf_setfields.value()
+            self._bubble_radius_factor = spin_bubble_factor.value()
             self._refine_interval = spin_ref_int.value()
             self._lower_refine_threshold = spin_lower.value()
             self._unrefine_threshold = spin_unref.value()
@@ -1780,6 +1798,41 @@ class TabGeneral3D(QWidget):
     def _on_init_clicked(self):
         self.sig_request_init.emit(self.get_case_inputs())
 
+    def _build_initialize_write_plan(self) -> list[str]:
+        """Build explicit initialize write/command preview for user confirmation."""
+        plan = []
+        remap = self.rad_init_remap.isChecked()
+        has_obstacles = any(obs.enabled for obs in self.obstacles)
+        shape = self.c_shape.currentText()
+        dyn_refine = self.rad_dyn_mesh.isChecked() and self.rad_dyn_mesh.isEnabled()
+        charge_refine = self.spin_charge_refine.value() if dyn_refine else 0
+        outside_min = self.spin_charge_outer_min.value()
+        outside_max = self.spin_charge_outer_max.value()
+
+        plan.append("Create/refresh case dictionaries under system/, constant/, and 0.orig/.")
+        plan.append(f"Mesh mode: {'Dynamic/Hybrid' if dyn_refine else 'Fixed/Static'}")
+        plan.append(f"Charge geometry: {shape}")
+        plan.append(f"Charge refine level (requested): {charge_refine}")
+        plan.append(f"Outer transition levels (requested): {outside_min}-{outside_max}")
+        plan.append(f"Obstacle meshing: {'enabled' if has_obstacles else 'disabled'}")
+        if remap:
+            plan.append("Initialization source: remap from pre-cursor case.")
+            plan.append(f"Remap case path: {(self._remap_case_path or '').strip() or '(empty)'}")
+            if self._remap_time_mode == "latest":
+                plan.append("Remap time: latest solved time.")
+            else:
+                plan.append(f"Remap time: specific ({(self._remap_specific_time or '').strip() or '(empty)'})")
+            plan.append("Initialize commands: blockMesh -> optional surfaceFeatures/snappy -> remap_radial.py.")
+        else:
+            placement = "setRefinedFields" if charge_refine > 0 and shape in ("Sphere", "Cylinder") else "setFields"
+            plan.append(f"Placement command preference: {placement}")
+            if has_obstacles:
+                plan.append("Initialize commands: blockMesh -> surfaceFeatures -> snappyHexMesh -> setFields workflow.")
+            else:
+                plan.append("Initialize commands: blockMesh -> setFields workflow.")
+        plan.append("Post-checks: charge-cell verification (alpha.c4) and init summary.")
+        return plan
+
     def _on_field_change_req(self, txt):
         if self.viewer: self.viewer.set_field(txt)
 
@@ -2004,6 +2057,8 @@ class TabGeneral3D(QWidget):
             self.spin_transition_cells.setValue(2)
         elif key == "refine_interval":
             self._refine_interval = 3
+        elif key == "bubble_radius_factor":
+            self._bubble_radius_factor = 1.5
         elif key == "lower_refine_threshold":
             self._lower_refine_threshold = 0.1
         elif key == "unrefine_threshold":
@@ -2295,6 +2350,9 @@ class TabGeneral3D(QWidget):
                     self.c_cylinder_axis.setCurrentIndex(idx)
             if "charge_backup_radius_factor" in data:
                 self.spin_backup_factor.setValue(data["charge_backup_radius_factor"])
+                self._bubble_radius_factor = float(data["charge_backup_radius_factor"])
+            if "bubble_radius_factor" in data:
+                self._bubble_radius_factor = float(data["bubble_radius_factor"])
             if "buffer_layers" in data:
                 self._buffer_layers = int(data["buffer_layers"])
             if "ignition_mode" in data:
@@ -2372,6 +2430,7 @@ class TabGeneral3D(QWidget):
         obs_refine = self.chk_obstacle_refine.isChecked()
         remap_enabled = self.rad_init_remap.isChecked()
         transition_cells = self.spin_transition_cells.value()
+        est_cells = self._estimate_charge_cells()
         enable_dyn = None if prov.get("enable_dyn_refine") == "UNSET" else refine
         enable_obs = None if prov.get("enable_obstacle_refine") == "UNSET" else obs_refine
         ignition_mode = self.combo_ignition_mode.currentText()
@@ -2434,6 +2493,7 @@ class TabGeneral3D(QWidget):
             lower_refine_threshold=getattr(self, "_lower_refine_threshold", 0.1),
             unrefine_threshold=getattr(self, "_unrefine_threshold", 0.1),
             n_buffer_layers_dynamic=getattr(self, "_n_buffer_layers_dynamic", 2),
+            bubble_radius_factor=getattr(self, "_bubble_radius_factor", 1.5),
             enable_balancing=getattr(self, "_enable_balancing", False),
             dynamic_max_cells=getattr(self, "_dynamic_max_cells", 200000000),
             refine_indicator_field=getattr(self, "_refine_indicator_field", "densityGradient"),
@@ -2474,4 +2534,5 @@ class TabGeneral3D(QWidget):
             mesh_error_reduction=getattr(self, "_mesh_error_reduction", None),
             mesh_relaxed_max_non_ortho=getattr(self, "_mesh_relaxed_max_non_ortho", None),
             provenance=dict(getattr(self, "_provenance", {})),
+            estimated_charge_cells=est_cells,
         )

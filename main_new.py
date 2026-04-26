@@ -5,6 +5,7 @@ Main application window with multi-panel layout following specification.
 import sys
 import os
 import subprocess
+from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFrame, QProgressBar, QMessageBox, QToolBar, QAction,
@@ -25,7 +26,7 @@ from simulation_service import SimulationService
 from models import CaseInputs1D, CaseInputs3D
 from path_utils import get_latest_time_dir, win_to_wsl_path
 from case_loader import load_case
-from generator_3d import effective_charge_refine, check_coarse_mesh_would_fail
+from generator_3d import effective_charge_refine
 try:
     from verification.verify_output import get_charge_cell_count
 except ImportError:
@@ -622,6 +623,68 @@ class BlastFoamApp(QMainWindow):
         except ValueError:
             pass
         return norm, None
+
+    def _show_initialize_result_summary(
+        self,
+        case_dir: str,
+        inputs: CaseInputs3D,
+        use_remap: bool,
+        mode: dict | None,
+        retries_used: int,
+        set_cmd_actual: str | None,
+    ) -> None:
+        """Show concise post-initialize summary with explicit effective outcomes."""
+        lines = [
+            "3D Initialize Result Summary",
+            "",
+            f"Case directory: {case_dir}",
+            f"Initialize mode: {'Remap' if use_remap else 'Standard'}",
+            f"Dynamic refine enabled: {getattr(inputs, 'enable_dyn_refine', None)}",
+            f"Obstacle refine enabled: {getattr(inputs, 'enable_obstacle_refine', None)}",
+            f"Estimated charge cells (preflight): {getattr(inputs, 'estimated_charge_cells', 0.0):.2f}",
+        ]
+        if use_remap:
+            lines.extend(
+                [
+                    f"Remap source: {(getattr(inputs, 'remap_case_path', '') or '').strip() or '—'}",
+                    f"Remap time mode: {getattr(inputs, 'remap_time_mode', 'latest')}",
+                    f"Remap specific time: {getattr(inputs, 'remap_specific_time', '—')}",
+                ]
+            )
+        else:
+            mode = mode or {}
+            lines.extend(
+                [
+                    f"set_cmd (effective): {mode.get('set_cmd', '—')}",
+                    f"set_cmd_actual (executed): {set_cmd_actual or '—'}",
+                    f"capture_levels: {mode.get('capture_levels', 0)}",
+                    f"charge_levels: {mode.get('charge_levels', 0)}",
+                    f"outside_levels: {mode.get('outside_levels', 0)}",
+                    f"charge_refinement_effective: {mode.get('charge_refinement_effective', 0)}",
+                    f"charge_clipped_by_domain: {mode.get('charge_clipped_by_domain', '—')}",
+                    f"cells_inside_charge: {mode.get('cells_inside_charge', '—')}",
+                ]
+            )
+        lines.append(f"Retries used: {retries_used}")
+        self._write_initialize_summary_file(case_dir, lines)
+
+    def _write_initialize_summary_file(self, case_dir: str, lines: list[str]) -> None:
+        """Persist initialize summary to case folder for full traceability."""
+        try:
+            out_path = os.path.join(case_dir, "initialize_summary.txt")
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            payload = [
+                "=" * 72,
+                f"Initialize Summary @ {ts}",
+                "=" * 72,
+                *lines,
+                "",
+            ]
+            with open(out_path, "a", encoding="utf-8") as f:
+                f.write("\n".join(payload))
+        except OSError:
+            # Non-fatal: summary dialog is still shown in UI.
+            pass
     
     def on_initialize_model_3d(self, inputs):
         """Initialize 3D model (mesh generation and field initialization)"""
@@ -648,13 +711,32 @@ class BlastFoamApp(QMainWindow):
                     mapped_source_dir_linux = win_to_wsl_path(source_case_dir_win) if source_case_dir_win else ""
                     remap_time_mode = getattr(inputs, "remap_time_mode", "latest") or "latest"
                     if remap_time_mode == "latest":
-                        mapped_source_time = get_latest_time_dir(source_case_dir_win) or source_time_from_path or getattr(inputs, "remap_specific_time", "1e-4")
+                        mapped_source_time = get_latest_time_dir(source_case_dir_win) or source_time_from_path
+                        if not mapped_source_time:
+                            QMessageBox.critical(
+                                self,
+                                "Remap time not defined",
+                                "Could not resolve a remap time in 'latest' mode.\n"
+                                "Please select a source case with solved time folders or switch to 'specific time'."
+                            )
+                            self.status_bar.set_status("Init blocked", "#e74c3c")
+                            return
                     else:
-                        mapped_source_time = getattr(inputs, "remap_specific_time", None) or source_time_from_path or "1e-4"
+                        mapped_source_time = getattr(inputs, "remap_specific_time", None) or source_time_from_path
+                        if not mapped_source_time:
+                            QMessageBox.critical(
+                                self,
+                                "Remap time not defined",
+                                "Specific remap time is empty.\n"
+                                "Please define a specific time before Initialize."
+                            )
+                            self.status_bar.set_status("Init blocked", "#e74c3c")
+                            return
                     use_remap = bool(mapped_source_dir_linux and mapped_source_time)
                 
                 # Start clean: run Allclean if present (safe; preserves 0.orig, system/, constant dicts, triSurface)
                 clean_first = "([ -x ./Allclean ] && ./Allclean || true) && "
+                set_cmd_actual = None
                 if use_remap:
                     if has_obstacles:
                         preflight_remap = " && ( [ ! -f system/expectedFeatureEdges.txt ] || ( while read -r f; do [ -z \"$f\" ] && continue; [ -f \"$f\" ] || { echo \"FATAL: .eMesh required at $f missing\"; exit 1; }; done < system/expectedFeatureEdges.txt ) ) && "
@@ -694,70 +776,25 @@ class BlastFoamApp(QMainWindow):
                     if getattr(inputs, "enable_dyn_refine", None) is False:
                         set_cmd = "setFields"
                     alpha_check = "bash ./check_alpha_c4.sh || exit 1"
-                    # Fail-fast: no startup refinement + coarse base mesh would fail charge capture
-                    coarse_msg = check_coarse_mesh_would_fail(inputs)
-                    if coarse_msg:
-                        self.status_bar.set_status("Init blocked", "#e74c3c")
-                        QMessageBox.critical(
-                            self, "Init blocked (coarse mesh)",
-                            coarse_msg
-                        )
-                        return
-                    # Abort when Inside < n_capture_needed (do not silently exceed user's Inside)
-                    cap_impossible_msg = mode.get("charge_capture_impossible_message")
-                    if cap_impossible_msg:
-                        self.status_bar.set_status("Init blocked", "#e74c3c")
-                        QMessageBox.critical(
-                            self, "Init blocked — Inside too low for capture",
-                            cap_impossible_msg
-                        )
-                        return
-                    # Stage 1: mesh (blockMesh → snappy) then [charge interior + outside refinement if use_charge_interior_refinement] then addEmptyPatch → restore 0 → changeDictionary
+                    # Native flow (matches BlastFoam ``building3D`` reference):
+                    #   blockMesh → surfaceFeatures (if obstacles) → snappyHexMesh
+                    #   → addEmptyPatch → restore 0 → changeDictionary
+                    #   → setRefinedFields (refines mesh inside charge AND fills α.c4 in one
+                    #   pass via ``refineInternal yes; level N`` in setFieldsDict regions).
+                    # No manual topoSet+refineMesh capture/charge stages: setRefinedFields
+                    # handles small charges on coarse base meshes natively (with backup region
+                    # in setFieldsDict as the search fallback).
                     preflight = " && ( [ ! -f system/expectedFeatureEdges.txt ] || ( while read -r f; do [ -z \"$f\" ] && continue; [ -f \"$f\" ] || { echo \"FATAL: .eMesh required at $f missing\"; exit 1; }; done < system/expectedFeatureEdges.txt ) ) && "
                     init_part1 = (
                         clean_first
                         + "blockMesh && surfaceFeatures "
                         + preflight
                         + "snappyHexMesh -overwrite"
-                    )
-                    # Stage 1a: Capture envelope; 1b: true charge region only (Inside = only inside true charge); Stage 2: setRefinedFields true geometry
-                    topo_capture_envelope = os.path.join(case_dir, "system", "topoSet_captureEnvelopeDict")
-                    topo_charge_region    = os.path.join(case_dir, "system", "topoSet_chargeRegionDict")
-                    cap_lv = mode.get("capture_levels", 0) or 0
-                    chg_lv = mode.get("charge_levels", 0) or 0
-                    use_charge_interior = mode.get("use_charge_interior_refinement", False) and (cap_lv > 0 or chg_lv > 0)
-                    if use_charge_interior:
-                        # --- Stage 1a: capture envelope (only when capture_levels > 0) ---
-                        if cap_lv > 0 and os.path.isfile(topo_capture_envelope):
-                            init_part1 += " && topoSet -dict system/topoSet_captureEnvelopeDict"
-                            env_msg = mode.get("envelope_empty_message") or "Capture envelope is empty. Reduce base Cell Size and try again."
-                            init_part1 += " && ( test -s constant/polyMesh/sets/captureEnvelope || ( echo \"FATAL: " + env_msg.replace('"', '\\"').replace("\n", " ") + "\"; exit 1 ) )"
-                            for _ in range(cap_lv):
-                                init_part1 += " && refineMesh -dict system/refineMesh_captureEnvelopeDict -overwrite"
-                        # --- Stage 1b: true charge region (independently of whether capture ran) ---
-                        if chg_lv > 0 and os.path.isfile(topo_charge_region):
-                            init_part1 += " && topoSet -dict system/topoSet_chargeRegionDict"
-                            chg_empty = mode.get("charge_region_empty_message") or "True charge region has no cells. Reduce base Cell Size or increase Inside."
-                            init_part1 += " && ( test -s constant/polyMesh/sets/chargeRegion || ( echo \"FATAL: " + chg_empty.replace('"', '\\"').replace("\n", " ") + "\"; exit 1 ) )"
-                            for _ in range(chg_lv):
-                                init_part1 += " && refineMesh -dict system/refineMesh_chargeDict -overwrite"
-                        outside_lv = mode.get("outside_levels", 0) or 0
-                        if outside_lv > 0 and os.path.isfile(os.path.join(case_dir, "system", "topoSet_outsideShellDict")):
-                            init_part1 += " && topoSet -dict system/topoSet_outsideShellDict"
-                            for _ in range(outside_lv):
-                                init_part1 += " && refineMesh -dict system/refineMesh_outsideDict -overwrite"
-                        init_part1 += " && rm -f constant/polyMesh/cellLevel constant/polyMesh/pointLevel constant/polyMesh/level0Edge constant/polyMesh/refinementHistory 2>/dev/null || true"
-                    init_part1 += (
-                        " && addEmptyPatch internalPatch internal -overwrite && "
+                        + " && addEmptyPatch internalPatch internal -overwrite && "
                         "rm -rf 0 && cp -r 0.orig 0 && changeDictionary"
                     )
-                    # setRefinedFields only places charge; no post-setRefinedFields topoSet+refineMesh
-                    # When use_charge_interior: refinement was done by topoSet/refineMesh and hexRef stripped, so setRefinedFields must run with -noRefine (placement-only).
-                    # Cuboid placement: 0.orig/alpha.c4 is uniform 0 (valid for any mesh size);
-                    # run setFields directly with boxToCell to fill the refined charge region.
-                    # Sphere/Cylinder with topoSet/refineMesh pre-refinement: setRefinedFields -noRefine (placement-only).
-                    set_cmd_actual = "setRefinedFields -noRefine" if (use_charge_interior and set_cmd == "setRefinedFields") else set_cmd
-                    init_part2 = f"{set_cmd_actual} && {alpha_check}"
+                    init_part2 = f"{set_cmd} && {alpha_check}"
+                    set_cmd_actual = set_cmd
                 
                 if not use_remap and not os.path.isfile(os.path.join(case_dir, "check_alpha_c4.sh")):
                     self.status_bar.set_status("Init Failed", "#e74c3c")
@@ -773,35 +810,21 @@ class BlastFoamApp(QMainWindow):
                     success = self._run_wsl_commands(case_dir, init_part1)
                     if not success:
                         self.status_bar.set_status("Init Failed", "#e74c3c")
-                        # Show envelope-empty or charge-capture explanation in dialog if available
-                        detail_msg = None
-                        try:
-                            import json
-                            mode_path = os.path.join(case_dir, "case_init_mode.json")
-                            if os.path.isfile(mode_path):
-                                with open(mode_path, "r", encoding="utf-8") as f:
-                                    init_mode = json.load(f)
-                                detail_msg = (
-                                    init_mode.get("envelope_empty_message")
-                                    or init_mode.get("charge_region_empty_message")
-                                    or init_mode.get("charge_capture_impossible_message")
-                                )
-                        except (OSError, ValueError, KeyError):
-                            pass
-                        if detail_msg:
-                            QMessageBox.critical(
-                                self, "Init Error — Mesh refinement failed",
-                                detail_msg
-                            )
-                        else:
-                            QMessageBox.critical(self, "Init Error", "Mesh initialization failed. Check console output for details.")
+                        QMessageBox.critical(
+                            self, "Init Error",
+                            "Mesh initialization (blockMesh / snappyHexMesh / addEmptyPatch / changeDictionary) failed. Check console output for details."
+                        )
                         return
                     success = self._run_wsl_commands(case_dir, init_part2)
                 retries_used = 0
                 last_retry_level = None
                 if not success and not use_remap:
-                    # Retry with setRefinedFields only in Dyn Mesh mode (startup charge refinement allowed)
-                    allow_retry_refine = getattr(inputs, "enable_dyn_refine", False)
+                    # If alpha.c4 fill failed, retry setRefinedFields up to 3x with a higher
+                    # internal refinement level (Inside).  Native ``refineInternal`` mechanism:
+                    # higher level → finer subdivision inside the charge region → better chance
+                    # of capturing a small charge on a coarse base mesh.  Allowed only when
+                    # AMR is on (Dyn Mesh) — Fixed Mesh users explicitly opted out of refinement.
+                    allow_retry_refine = bool(getattr(inputs, "enable_dyn_refine", False))
                     mode_path = os.path.join(case_dir, "case_init_mode.json")
                     try:
                         import json
@@ -817,12 +840,9 @@ class BlastFoamApp(QMainWindow):
                     for retry in range(1, 4) if allow_retry_refine else []:
                         next_level = min(current_eff + retry, 8) if (set_cmd == "setRefinedFields" and current_eff > 0) else min(retry, 8)
                         last_retry_level = next_level
-                        # Placement-only (use_charge_interior): do not override setFieldsDict with refineInternal; mesh has no level data.
-                        if not use_charge_interior:
-                            gen.write_set_fields_dict_only(case_dir, inputs, override_charge_refinement_level=next_level)
-                        retry_set_cmd = "setRefinedFields -noRefine" if use_charge_interior else "setRefinedFields"
+                        gen.write_set_fields_dict_only(case_dir, inputs, override_charge_refinement_level=next_level)
                         retry_cmd = (
-                            "rm -rf 0 && cp -r 0.orig 0 && changeDictionary && " + retry_set_cmd + " && " + alpha_check
+                            "rm -rf 0 && cp -r 0.orig 0 && changeDictionary && setRefinedFields && " + alpha_check
                         )
                         success = self._run_wsl_commands(case_dir, retry_cmd)
                         retries_used = retry
@@ -858,6 +878,7 @@ class BlastFoamApp(QMainWindow):
                             json.dump(mode, f, indent=2)
                     except (OSError, ValueError, KeyError):
                         pass
+                final_mode = mode if not use_remap else None
                 
                 # Update viewer with charge center (no auto-adjust; user position is used)
                 self.tab_3d.viewer.load_case(
@@ -878,6 +899,14 @@ class BlastFoamApp(QMainWindow):
                 if self.active_case_dir_3d:
                     self.tab_3d.update_charge_cells_display(self.active_case_dir_3d, threshold=0.5)
                 
+                self._show_initialize_result_summary(
+                    case_dir=case_dir,
+                    inputs=inputs,
+                    use_remap=use_remap,
+                    mode=final_mode,
+                    retries_used=retries_used,
+                    set_cmd_actual=(set_cmd_actual if not use_remap else None),
+                )
                 self.status_bar.set_status("3D Initialized", "#2ecc71")
                 
             except Exception as e:

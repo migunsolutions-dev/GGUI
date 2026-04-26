@@ -201,4 +201,6 @@ class CaseInputs3D:
     # Provenance per optional key: "LOADED" | "USER" | "UNSET". Only write/activate when LOADED or USER.
     provenance: ProvenanceMap = field(default_factory=dict)
 
+    estimated_charge_cells: float = 0.0
+
 CaseInputs = Union[CaseInputs1D, CaseInputs3D]

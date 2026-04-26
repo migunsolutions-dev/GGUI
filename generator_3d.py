@@ -888,16 +888,6 @@ class Generator3D(BaseGenerator):
             solver_app = "blastFoam"
             if not remap_enabled:
                 self._write_charge_region_files(case_dir, inputs, dims)
-                # Realization check script requires topoSet/refineMesh logs to exist.
-                # In the new architecture (snappy-does-all) capture_levels=charge_levels=0,
-                # so no such logs are written; alpha check covers placement correctness instead.
-                _use_interior_ref = use_set_refined and (getattr(inputs, "charge_refinement_level", 0) or 0) > 0
-                _topo_refine_loops_run = (
-                    (getattr(self, "_capture_levels", 0) or 0) > 0
-                    or (getattr(self, "_charge_levels", 0) or 0) > 0
-                )
-                if _use_interior_ref and _topo_refine_loops_run and not getattr(self, "_charge_capture_impossible_message", None):
-                    self._write_check_realization_script(case_dir, inputs, dims)
             self._write_check_internal_patch_sh(case_dir)
             self.write_scripts(
                 case_dir,
@@ -911,16 +901,19 @@ class Generator3D(BaseGenerator):
                 use_set_refined=use_set_refined,
                 use_seed_bubble=False,
                 startup_refinement_levels=0,
-                remaining_inside_levels=getattr(self, "_remaining_inside_levels", 0) or 0,
+                remaining_inside_levels=0,
                 use_charge_region_check=not remap_enabled,
-                use_charge_interior_refinement=use_set_refined and (getattr(inputs, "charge_refinement_level", 0) or 0) > 0,
+                # Native setRefinedFields path: no manual topoSet/refineMesh
+                # capture/charge stages → use_charge_interior_refinement=False
+                # ensures Allrun runs ``setRefinedFields`` (not ``-noRefine``).
+                use_charge_interior_refinement=False,
                 inside_levels=getattr(inputs, "charge_refinement_level", 0) or 0,
-                capture_levels=getattr(self, "_capture_levels", 0) or 0,
-                charge_levels=getattr(self, "_charge_levels", 0) or 0,
-                outside_levels=getattr(self, "_charge_outer_refine_max", 0) or 0,
-                charge_capture_impossible_message=getattr(self, "_charge_capture_impossible_message", None),
-                envelope_empty_message=getattr(self, "_envelope_empty_message", None),
-                charge_region_empty_message=getattr(self, "_charge_region_empty_message", None),
+                capture_levels=0,
+                charge_levels=0,
+                outside_levels=0,
+                charge_capture_impossible_message=None,
+                envelope_empty_message=None,
+                charge_region_empty_message=None,
                 placement_use_setfields=use_set_refined and getattr(inputs, "charge_shape", "") == "Cuboid",
             )
 
@@ -949,26 +942,26 @@ class Generator3D(BaseGenerator):
                     "expected_eMesh": self._expected_emesh_list(case_dir),
                     "retries_used": 0,
                 }
-                # Refinement: capture envelope (stage 1) then exact charge fill (stage 2); Inside = target refinement inside true charge
+                # Native setRefinedFields path: refineInternal handles inner
+                # charge refinement; no manual topoSet/refineMesh stages.
                 mode["startup_refinement_levels"] = 0
-                mode["remaining_inside_levels"] = getattr(self, "_remaining_inside_levels", charge_level if use_set_refined else 0)
-                mode["use_charge_interior_refinement"] = use_set_refined and (getattr(inputs, "charge_refinement_level", 0) or 0) > 0
+                mode["remaining_inside_levels"] = 0
+                mode["use_charge_interior_refinement"] = False
                 mode["inside_levels"] = getattr(inputs, "charge_refinement_level", 0) or 0
-                mode["capture_levels"] = getattr(self, "_capture_levels", 0) or 0
-                mode["charge_levels"] = getattr(self, "_charge_levels", 0) or 0
-                mode["outside_levels"] = getattr(self, "_charge_outer_refine_max", 0) or 0
-                mode["charge_capture_impossible_message"] = getattr(self, "_charge_capture_impossible_message", None)
-                mode["envelope_empty_message"] = getattr(self, "_envelope_empty_message", None)
-                mode["charge_region_empty_message"] = getattr(self, "_charge_region_empty_message", None)
-                # Fields for post-refinement realization check (filled at run time by check_realization.py)
+                mode["capture_levels"] = 0
+                mode["charge_levels"] = 0
+                mode["outside_levels"] = 0
+                mode["charge_capture_impossible_message"] = None
+                mode["envelope_empty_message"] = None
+                mode["charge_region_empty_message"] = None
                 mode["base_cell_size"] = float(getattr(inputs, "cell_size", 0.5))
                 mode["charge_shape"] = getattr(inputs, "charge_shape", "Sphere")
                 mode["charge_size_info"] = self._charge_size_info(inputs, dims)
                 mode["user_requested_inside"] = getattr(inputs, "charge_refinement_level", 0) or 0
-                mode["snappy_charge_pre_level"] = getattr(self, "_snappy_pre_level", 0) or 0
-                mode["internal_capture_levels"] = getattr(self, "_capture_levels", 0) or 0
-                mode["internal_charge_levels"] = getattr(self, "_charge_levels", 0) or 0
-                mode["attempted_refine_iterations"] = (getattr(self, "_capture_levels", 0) or 0) + (getattr(self, "_charge_levels", 0) or 0)
+                mode["snappy_charge_pre_level"] = 0
+                mode["internal_capture_levels"] = 0
+                mode["internal_charge_levels"] = 0
+                mode["attempted_refine_iterations"] = 0
                 mode["realized_refinement_level"] = None
                 mode["smallest_cell_near_charge"] = None
                 mode["cells_inside_charge_post_refine"] = None
@@ -1029,28 +1022,13 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
         self._write_text(os.path.join(case_dir, "system", "surfaceFeaturesDict"), content)
 
     def _snappy_charge_pre_level(self, inputs: CaseInputs3D, dims: Optional[Dict[str, float]] = None) -> int:
-        """Return how many refinement levels snappy will apply INSIDE the charge geometry.
+        """Return snappy inside pre-level for charge geometry.
 
-        When the TRUE charge geometry is capturable on the base mesh (at least one cell
-        centre lies inside it), snappy can pre-refine to the full inside_level independently
-        of any outer/transition settings.
-
-        When the true geometry is too small for the base mesh, snappy cannot start inner
-        refinement (mode inside requires a cell centre on the current mesh level).  In that
-        case returns 0 to signal that topoSet/refineMesh initialization refinement will
-        handle the inner region instead.  The capture envelope in topoSet is the explicit
-        inner-initialization mechanism — it is not hidden inflation because it drives mesh
-        refinement only; seeding always uses the true charge geometry.
+        We keep this at 0 so inner charge refinement is handled only by explicit
+        topoSet/refineMesh stages. This avoids mixed inside levels caused by combining
+        snappy inside refinement with capture/charge loops.
         """
-        inside_level = getattr(inputs, "charge_refinement_level", 0) or 0
-        if inside_level == 0:
-            return 0
-        if getattr(inputs, "enable_dyn_refine", None) is False:
-            return 0
-        # Route to topoSet/refineMesh inner-init path when snappy cannot capture
-        if dims is not None and not self._is_charge_capturable_on_base_mesh(inputs, dims):
-            return 0
-        return inside_level
+        return 0
 
     def _snappy_charge_geometry_block(self, inputs: CaseInputs3D, dims: Dict[str, float]) -> str:
         """Return a snappy geometry sub-block (geometry{} section) for the charge refinement
@@ -1774,11 +1752,20 @@ air
         target_inside_level: Optional[int] = None,
         charge_refinement_by_topo_set: bool = False,
     ) -> str:
-        """Build setFieldsDict content for 3D non-remap. When override_charge_refinement_level is set, use it for Sphere/Cylinder (retry).
-        When remaining_inside_levels is set and > 0, or charge_refinement_by_topo_set is True, we do NOT add refineInternal: setRefinedFields only places the charge.
-        Refinement inside charge is then done by topoSet chargeRegion + refineMesh (Inside-only flow)."""
+        """Build setFieldsDict content for 3D non-remap.
+
+        Refinement inside the charge is handled natively by ``setRefinedFields`` via
+        ``refineInternal yes; level N;`` in the region.  This adaptively subdivides
+        the mesh until level ``N`` is reached inside the charge region and then sets
+        the field — works regardless of base-mesh coarseness (matches the BlastFoam
+        ``building3D`` reference tutorial).
+
+        ``override_charge_refinement_level`` (retry path) replaces the user level.
+        ``charge_refinement_by_topo_set`` is kept for backward compatibility but
+        ignored: the native path is always used now.
+        """
+        _ = charge_refinement_by_topo_set  # accepted for compatibility, not used
         remap_enabled = getattr(inputs, "remap_enabled", False)
-        cell_size = max(getattr(inputs, "cell_size", 0.1), 1e-9)
         n_buf = getattr(inputs, "buffer_layers", 2)
         if remap_enabled:
             return self._foam_header("setFieldsDict", "dictionary", "system") + f"""
@@ -1797,9 +1784,8 @@ regions ( );
             charge_refine = max(0, min(8, remaining_inside_levels))
         else:
             charge_refine = max(0, min(8, getattr(inputs, "charge_refinement_level", 0)))
-        # When refinement is by topoSet chargeRegion (Inside-only flow) or remaining_inside_levels > 0, do not add refineInternal here
-        apply_refine_in_region = charge_refine > 0 and not charge_refinement_by_topo_set and (remaining_inside_levels is None or remaining_inside_levels == 0)
-        use_refined = (charge_refine > 0 or (remaining_inside_levels and remaining_inside_levels > 0)) and inputs.charge_shape in ("Sphere", "Cylinder")
+        apply_refine_in_region = charge_refine > 0
+        use_refined = charge_refine > 0 and inputs.charge_shape in ("Sphere", "Cylinder")
         rho = inputs.rho_charge if inputs.rho_charge > 0 else 1600.0
         mass = inputs.mass_kg  # Always user mass; never inflate
 
@@ -1824,12 +1810,23 @@ regions ( );
                     side = dims.get("side", 0.1)
                     self._validate_charge_position(inputs, side / 2.0, half_extent_axis=side / 2.0)
 
-        # No backup region for mass (avoids smearing). Seed+bubble retry in Allrun if 0 cells.
+        # Backup region (mirrors the BlastFoam building3D reference): provides a fallback
+        # search domain when the true charge is too small for setRefinedFields to find
+        # any cell on the base mesh.  Backup factor = bubble_radius_factor (default 1.5x).
+        backup_factor = max(1.0, min(5.0, getattr(inputs, "bubble_radius_factor", 1.5)))
         if use_refined and inputs.charge_shape == "Sphere":
             r = dims["radius"]
             ref_part = f"        refineInternal yes;\n        level {charge_refine};\n        " if apply_refine_in_region else ""
+            backup_radius = r * backup_factor
+            backup_block = (
+                f"        backup\n        {{\n"
+                f"            centre ({cx} {cy} {cz});\n"
+                f"            radius {backup_radius:.6g};\n"
+                f"        }}\n"
+            )
             region_str = (
                 f"sphericalMassToCell\n    {{\n        rho {rho:.6g};\n        mass {mass:.6g};\n        centre ({cx} {cy} {cz});\n"
+                f"{backup_block}"
                 f"{ref_part}fieldValues ( volScalarFieldValue alpha.c4 1 );\n    }}"
             )
         elif use_refined and inputs.charge_shape == "Cylinder":
@@ -1845,9 +1842,22 @@ regions ( );
             dir_map = {"X": "(1 0 0)", "Y": "(0 1 0)", "Z": "(0 0 1)"}
             direction = dir_map.get(inputs.cylinder_axis, "(0 0 1)")
             ref_part = f"        refineInternal yes;\n        level {charge_refine};\n        " if apply_refine_in_region else ""
+            # Backup cylinder: same axis, half-length vector, larger radius
+            axis_idx = {"X": 0, "Y": 1, "Z": 2}.get(getattr(inputs, "cylinder_axis", "Z"), 2)
+            l_vec = [0.0, 0.0, 0.0]
+            l_vec[axis_idx] = half_l
+            backup_radius = r * backup_factor
+            backup_block = (
+                f"        backup\n        {{\n"
+                f"            centre ({cx} {cy} {cz});\n"
+                f"            L ({l_vec[0]:.6g} {l_vec[1]:.6g} {l_vec[2]:.6g});\n"
+                f"            radius {backup_radius:.6g};\n"
+                f"        }}\n"
+            )
             region_str = (
                 f"cylindericalMassToCell\n    {{\n        rho {rho:.6g};\n        mass {mass:.6g};\n        centre ({cx} {cy} {cz});\n"
                 f"        direction {direction};\n        LbyD {lbyd:.6g};\n"
+                f"{backup_block}"
                 f"{ref_part}fieldValues ( volScalarFieldValue alpha.c4 1 );\n    }}"
             )
         elif inputs.charge_shape == "Sphere":
@@ -3092,66 +3102,27 @@ if __name__ == "__main__":
         self._charge_levels = 0
         self._snappy_pre_level = 0
         if not remap_enabled:
-            # setFieldsDict uses TRUE charge geometry only (dims). setRefinedFields places charge in true region; no refineInternal.
+            # Native flow (matches BlastFoam ``building3D`` reference):
+            #   setRefinedFields reads setFieldsDict and, for any region with
+            #   ``refineInternal yes; level N;``, adaptively refines the mesh until
+            #   level ``N`` is reached inside the region AND sets the field — in one
+            #   pass.  This works even when the charge is much smaller than a base
+            #   cell (no manual topoSet+refineMesh capture loop required).
             sf = self._build_set_fields_dict_3d(
                 inputs, dims, override_charge_refinement_level=None,
-                remaining_inside_levels=0,
-                target_inside_level=None,
-                charge_refinement_by_topo_set=bool(use_set_refined_allrun and inside_level > 0),
             )
             self._write_text(os.path.join(sys_dir, "setFieldsDict"), sf)
-            # Cuboid placement: 0.orig/alpha.c4 is uniform 0 (valid for any mesh size);
-            # setFields with boxToCell runs directly — no resize step needed.
-            if use_set_refined_allrun and inside_level > 0:
-                # Stage C — inner initialization refinement.
-                #
-                # Routing decision: when the true charge geometry is capturable on the BASE mesh
-                # (snappy mode inside can select it), snappy handles all inside_level refinement
-                # directly and cleanly.  When not capturable (charge smaller than base cell),
-                # snappy_pre_level = 0 and the explicit topoSet/refineMesh inner-init path takes
-                # over: capture_levels passes refine a progressively tightening envelope until
-                # the true charge is capturable, then charge_levels passes refine the true region.
-                # In both routes the capture envelope (when used) drives MESH only; seeding always
-                # uses the true charge geometry.  This is not hidden corrective meshing — it is the
-                # explicit inner initialization refinement the user requested via the Inside setting.
-                snappy_pre_level = self._snappy_charge_pre_level(inputs, dims)
-                n_capture_needed = self._capture_levels_needed(
-                    inputs, dims, pre_refined_levels=snappy_pre_level
-                )
-                total_levels_needed = snappy_pre_level + n_capture_needed
-
-                # Stage B — validate that the user-requested inside_level is sufficient.
-                # Error fires only when inside_level < total_levels_needed; the message
-                # instructs the user to raise Inside or reduce Cell Size (never "base capture
-                # must exist first").
-                if inside_level < total_levels_needed:
-                    self._charge_capture_impossible_message = build_inside_insufficient_for_capture_message(
-                        inside_level, total_levels_needed, inputs, dims
-                    )
-                    self._capture_levels = 0
-                    self._charge_levels = 0
-                else:
-                    # Levels budget:
-                    #   snappy_pre_level (snappy, true geometry, 0 when not capturable on base)
-                    #   + capture_levels (topoSet captureEnvelope + refineMesh, envelope-based)
-                    #   + charge_levels  (topoSet chargeRegion   + refineMesh, true geometry)
-                    #   = inside_level
-                    self._capture_levels = n_capture_needed
-                    self._charge_levels = inside_level - snappy_pre_level - n_capture_needed
-                    if self._capture_levels > 0:
-                        self._write_topo_set_capture_envelope_dict(case_dir, inputs, dims)
-                        self._write_refine_mesh_capture_envelope_dict(case_dir)
-                    # chargeRegion dict needed for final cell-count topoSet even when
-                    # charge_levels == 0 (base_generator.py final-count step reads it).
-                    self._write_topo_set_charge_region_dict(case_dir, inputs, dims)
-                    if self._charge_levels > 0:
-                        self._write_refine_mesh_charge_dict(case_dir, set_name="chargeRegion")
-
-                self._snappy_pre_level = snappy_pre_level
-                self._remaining_inside_levels = self._capture_levels + self._charge_levels
-                # Stage D — outer transition handled by snappy chargeRefineOuter geometry.
-                # No topoSet/refineMesh outside steps; snappy + nCellsBetweenLevels covers it.
-                self._charge_outer_refine_max = 0
+            # Inner initialization refinement is owned by setRefinedFields → no
+            # manual topoSet/refineMesh capture or charge stages, no envelope dicts.
+            self._capture_levels = 0
+            self._charge_levels = 0
+            self._snappy_pre_level = 0
+            self._remaining_inside_levels = inside_level
+            self._charge_capture_impossible_message = None
+            self._envelope_empty_message = None
+            self._charge_region_empty_message = None
+            # Stage D — outer transition handled by snappy chargeRefineOuter geometry.
+            self._charge_outer_refine_max = 0
         else:
             self._write_text(os.path.join(sys_dir, "setFieldsDict"), self._build_set_fields_dict_3d(inputs, dims or {}, None))
 
