@@ -203,31 +203,37 @@ def build_inside_insufficient_for_capture_message(
     inputs,
     dims: Dict[str, float],
 ) -> str:
-    """Build user-facing message when Inside < n_capture_needed. Caller must abort init and show this.
-    Includes: current Inside, minimum required Inside, Cell Size, charge shape/size, guidance."""
+    """Build user-facing message when Inside < n_capture_needed.
+
+    The criterion is that the user-requested inside_level must be enough to progressively
+    refine the mesh until the true charge geometry can be seeded.  This is entirely
+    controlled by the user's Inside setting and base Cell Size — no automatic correction
+    or geometry inflation is applied.
+    """
     cell_size = max(1e-9, getattr(inputs, "cell_size", 0.5))
     shape = getattr(inputs, "charge_shape", "")
     intro = (
-        "Charge pre-refinement (Inside) is too low to capture the charge on the current mesh.\n\n"
-        "Requested Inside level: %d.\n"
-        "Minimum Inside level required for capture with current Cell Size: %d.\n"
-        "Current base Cell Size: %.6g m.\n\n"
+        "The current inner refinement settings are insufficient to create a valid refined "
+        "inner initialization region for this charge geometry and base mesh.\n\n"
+        "Requested Inside level   : %d\n"
+        "Minimum Inside required  : %d\n"
+        "Base Cell Size           : %.6g m\n\n"
     ) % (inside_level, n_capture_needed, cell_size)
     if shape == "Sphere":
         r = float(dims.get("radius", 0.05))
-        intro += "Charge shape: Sphere. Charge radius: %.6g m.\n\n" % r
+        intro += "Charge: Sphere, radius %.6g m.\n\n" % r
     elif shape == "Cylinder":
         r = float(dims.get("radius", 0.05))
         length = dims.get("length", 0.1)
-        intro += "Charge shape: Cylinder. Radius: %.6g m, length: %.6g m.\n\n" % (r, length)
+        intro += "Charge: Cylinder, radius %.6g m, length %.6g m.\n\n" % (r, length)
     elif shape == "Cuboid":
         L, W, H = dims.get("length", 0.1), dims.get("width", 0.1), dims.get("height", 0.1)
-        intro += "Charge shape: Cuboid. Dimensions (L x W x H): %.6g x %.6g x %.6g m.\n\n" % (L, W, H)
+        intro += "Charge: Cuboid %.6g × %.6g × %.6g m.\n\n" % (L, W, H)
     else:
         intro += "Charge shape: %s.\n\n" % (shape or "unknown")
     guidance = (
-        "Either increase Charge pre-refinement (Inside) to at least %d, or reduce base Cell Size "
-        "so that fewer refinement levels are needed to capture the charge, then try again."
+        "Increase Charge pre-refinement (Inside) to at least %d, or reduce the base Cell Size. "
+        "No automatic corrective mesh inflation or hidden capture refinement will be applied."
     ) % n_capture_needed
     return intro + guidance
 
@@ -882,9 +888,15 @@ class Generator3D(BaseGenerator):
             solver_app = "blastFoam"
             if not remap_enabled:
                 self._write_charge_region_files(case_dir, inputs, dims)
-                # Write realization-check script when charge interior refinement is active.
+                # Realization check script requires topoSet/refineMesh logs to exist.
+                # In the new architecture (snappy-does-all) capture_levels=charge_levels=0,
+                # so no such logs are written; alpha check covers placement correctness instead.
                 _use_interior_ref = use_set_refined and (getattr(inputs, "charge_refinement_level", 0) or 0) > 0
-                if _use_interior_ref and not getattr(self, "_charge_capture_impossible_message", None):
+                _topo_refine_loops_run = (
+                    (getattr(self, "_capture_levels", 0) or 0) > 0
+                    or (getattr(self, "_charge_levels", 0) or 0) > 0
+                )
+                if _use_interior_ref and _topo_refine_loops_run and not getattr(self, "_charge_capture_impossible_message", None):
                     self._write_check_realization_script(case_dir, inputs, dims)
             self._write_check_internal_patch_sh(case_dir)
             self.write_scripts(
@@ -1016,61 +1028,49 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
         content += "subsetFeatures\n{\n    nonManifoldEdges yes;\n    openEdges yes;\n}\n"
         self._write_text(os.path.join(case_dir, "system", "surfaceFeaturesDict"), content)
 
-    def _snappy_charge_pre_level(self, inputs: CaseInputs3D) -> int:
+    def _snappy_charge_pre_level(self, inputs: CaseInputs3D, dims: Optional[Dict[str, float]] = None) -> int:
         """Return how many refinement levels snappy will apply INSIDE the charge geometry.
 
-        When Inside > 0 and Outside >= 1, snappy pre-refines the charge interior to
-        min(outside_max, inside_level) via a searchable-geometry refinementRegions entry.
-        This gives building3D-style body-fitting and a smooth gradation outside the charge
-        without needing any STL file.  Returns 0 when Inside=0 or Outside disabled.
+        When the TRUE charge geometry is capturable on the base mesh (at least one cell
+        centre lies inside it), snappy can pre-refine to the full inside_level independently
+        of any outer/transition settings.
+
+        When the true geometry is too small for the base mesh, snappy cannot start inner
+        refinement (mode inside requires a cell centre on the current mesh level).  In that
+        case returns 0 to signal that topoSet/refineMesh initialization refinement will
+        handle the inner region instead.  The capture envelope in topoSet is the explicit
+        inner-initialization mechanism — it is not hidden inflation because it drives mesh
+        refinement only; seeding always uses the true charge geometry.
         """
         inside_level = getattr(inputs, "charge_refinement_level", 0) or 0
         if inside_level == 0:
             return 0
         if getattr(inputs, "enable_dyn_refine", None) is False:
             return 0
-        charge_outer_enable = getattr(inputs, "charge_outer_refine_enable", None)
-        if charge_outer_enable is False:
+        # Route to topoSet/refineMesh inner-init path when snappy cannot capture
+        if dims is not None and not self._is_charge_capturable_on_base_mesh(inputs, dims):
             return 0
-        rmin_outer = getattr(inputs, "charge_outer_refine_min", None)
-        rmax_outer = getattr(inputs, "charge_outer_refine_max", None)
-        rmin = rmin_outer if rmin_outer is not None else getattr(inputs, "refine_min", 2)
-        rmax = rmax_outer if rmax_outer is not None else getattr(inputs, "refine_max", 3)
-        outside_max = max(rmin, rmax)
-        if outside_max == 0:
-            return 0
-        return min(outside_max, inside_level)
+        return inside_level
 
     def _snappy_charge_geometry_block(self, inputs: CaseInputs3D, dims: Dict[str, float]) -> str:
         """Return a snappy geometry sub-block (geometry{} section) for the charge refinement
         region, named 'chargeRegionSnappy'.  Used by refinementRegions pre-refinement.
 
-        IMPORTANT: snappy's ``refinementRegions mode inside`` selects cells by CELL CENTRE.
-        For a charge that is smaller than one base-mesh cell, no cell centre falls inside the
-        true charge geometry, so snappy would skip the refinement entirely.  To avoid this we
-        always use the **capture envelope** (from ``_capture_envelope_dims``), which is
-        guaranteed to be at least as large as a single base-mesh half-diagonal, so snappy can
-        always select cells and begin refining.
-
-        The capture envelope is an internal implementation detail: explosive fill still uses
-        the true charge geometry via setRefinedFields (or setFields).  No physical patch is
-        created because we use refinementRegions (not refinementSurfaces).
+        Uses the TRUE charge geometry (no envelope inflation).  Capturability on the base mesh
+        must be validated by _is_charge_capturable_on_base_mesh() before calling this.
         """
         shape = getattr(inputs, "charge_shape", "Sphere")
         cx, cy, cz = inputs.charge_center
-        # Use capture envelope dims so snappy can always select cells (mode inside needs
-        # at least one cell centre inside the geometry on the BASE mesh).
-        env_dims = self._capture_envelope_dims(inputs, dims)
         if shape == "Sphere":
-            r = env_dims.get("radius_envelope", dims.get("radius", 0.05))
+            r = float(dims.get("radius", 0.05))
             return (f"    chargeRegionSnappy\n    {{\n"
                     f"        type searchableSphere;\n"
                     f"        centre ({cx:.6g} {cy:.6g} {cz:.6g});\n"
                     f"        radius {r:.6g};\n"
                     f"    }}\n")
         if shape == "Cylinder":
-            r = env_dims.get("radius_envelope", dims.get("radius", 0.05))
-            length = env_dims.get("length_envelope", dims.get("length", 0.1))
+            r = float(dims.get("radius", 0.05))
+            length = float(dims.get("length", 0.1))
             half_l = length / 2.0
             p1 = [cx, cy, cz]
             p2 = [cx, cy, cz]
@@ -1084,24 +1084,20 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
                     f"        radius {r:.6g};\n"
                     f"    }}\n")
         if shape == "Cuboid":
-            # Envelope for cuboid: each dimension expanded to at least min_side
-            cell_size = max(1e-9, getattr(inputs, "cell_size", 0.5))
-            min_side = (cell_size * math.sqrt(3.0) / 2.0) * 1.01
             if "length" in dims and "width" in dims and "height" in dims:
-                eL = max(dims["length"], min_side)
-                eW = max(dims["width"], min_side)
-                eH = max(dims["height"], min_side)
+                hx = dims["length"] / 2.0
+                hy = dims["width"] / 2.0
+                hz = dims["height"] / 2.0
             else:
-                side = max(dims.get("side", 0.1), min_side)
-                eL = eW = eH = side
-            hx, hy, hz = eL / 2.0, eW / 2.0, eH / 2.0
+                side = dims.get("side", 0.1)
+                hx = hy = hz = side / 2.0
             return (f"    chargeRegionSnappy\n    {{\n"
                     f"        type searchableBox;\n"
                     f"        min ({cx-hx:.6g} {cy-hy:.6g} {cz-hz:.6g});\n"
                     f"        max ({cx+hx:.6g} {cy+hy:.6g} {cz+hz:.6g});\n"
                     f"    }}\n")
-        # fallback: sphere with capture envelope radius
-        r = env_dims.get("radius_envelope", dims.get("radius", 0.05))
+        # Fallback: sphere with true radius
+        r = float(dims.get("radius", 0.05))
         return (f"    chargeRegionSnappy\n    {{\n"
                 f"        type searchableSphere;\n"
                 f"        centre ({cx:.6g} {cy:.6g} {cz:.6g});\n"
@@ -1111,18 +1107,13 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
     def _charge_outer_refine_levels(self, inputs: CaseInputs3D) -> tuple:
         """Return (add_charge_outer: bool, level_str: Optional[str]).
 
-        When Inside > 0, charge pre-refinement is handled by snappy via _snappy_charge_pre_level
-        (which uses the TRUE charge geometry as a refinementRegions entry).  In that path this
-        function is not used for the charge interior; it only controls the legacy
-        chargeRefineOuter outer-sphere fallback used when Inside == 0.
+        Computes outer transition refinement levels independently of the inner (Inside) setting.
+        When Inside > 0, both chargeRegionSnappy (inner) and chargeRefineOuter (outer) can
+        coexist in snappy refinementRegions — snappy takes the per-cell maximum, so the inner
+        region reaches inside_level and the surrounding band reaches outer_max.
         Fixed Mesh: no charge outer refinement.
         """
         if getattr(inputs, "enable_dyn_refine", None) is False:
-            return False, None
-        if getattr(inputs, "charge_refinement_level", 0):
-            # Inside > 0: snappy charge refinement handled by _snappy_charge_pre_level /
-            # _snappy_charge_geometry_block in the snappy dict writers directly.
-            # The chargeRefineOuter outer-sphere is not used in this path.
             return False, None
         enable = getattr(inputs, "charge_outer_refine_enable", None)
         if enable is False:
@@ -1251,17 +1242,16 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
                 snappy += f'    "{clean_name}" {{ type triSurfaceMesh; file "{name}"; scale {obs_scale}; }}\n'
             else:
                 snappy += f'    "{clean_name}" {{ type triSurfaceMesh; file "{name}"; }}\n'
-        # Charge geometry: use true charge searchable shape (sphere/cylinder/box) when Inside>0
-        # so snappy can pre-refine inside the charge and create a smooth outside transition.
-        # Legacy chargeRefineOuter outer sphere is only used when Inside=0.
-        _snappy_pre_lv = self._snappy_charge_pre_level(inputs) if dims else 0
+        # Inner charge geometry (Inside > 0) and outer transition sphere are independent and additive.
+        # snappy takes the per-cell maximum across all refinementRegions, so inner cells reach
+        # inside_level and cells in the surrounding band reach outer_max.
+        _snappy_pre_lv = self._snappy_charge_pre_level(inputs, dims) if dims else 0
+        add_charge_outer, level_str = self._charge_outer_refine_levels(inputs)
         if _snappy_pre_lv > 0 and dims:
             snappy += self._snappy_charge_geometry_block(inputs, dims)
-        else:
-            add_charge_outer, level_str = self._charge_outer_refine_levels(inputs)
-            if add_charge_outer and level_str and dims:
-                cx, cy, cz, outer_rad = self._charge_outer_geometry(inputs, dims)
-                snappy += f'    chargeRefineOuter {{ type searchableSphere; centre ({cx:.6g} {cy:.6g} {cz:.6g}); radius {outer_rad:.6g}; }}\n'
+        if add_charge_outer and level_str and dims:
+            cx, cy, cz, outer_rad = self._charge_outer_geometry(inputs, dims)
+            snappy += f'    chargeRefineOuter {{ type searchableSphere; centre ({cx:.6g} {cy:.6g} {cz:.6g}); radius {outer_rad:.6g}; }}\n'
         snappy += "};\n\n"
 
         n_cbl = max(1, min(10, getattr(inputs, "transition_cells", 2)))
@@ -1281,18 +1271,16 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
             snappy += f'        "{clean_name}" {{ level ({ref_level}); patchInfo {{ type wall; }} }}\n'
         snappy += "    }\n"
         
+        _ref_regions_obs = ""
         if _snappy_pre_lv > 0:
-            # True charge geometry: pre-refine inside charge to snappy_pre_level using
-            # refinementRegions (mode inside) so cells inside the charge reach that level
-            # and nCellsBetweenLevels creates a smooth gradation outside — no STL needed.
-            snappy += f"    refinementRegions\n    {{\n        chargeRegionSnappy {{ mode inside; levels (({_snappy_pre_lv} {_snappy_pre_lv})); }}\n    }}\n"
-        elif add_charge_outer and level_str:
+            _ref_regions_obs += f"        chargeRegionSnappy {{ mode inside; levels (({_snappy_pre_lv} {_snappy_pre_lv})); }}\n"
+        if add_charge_outer and level_str:
             parts = level_str.strip().split()
             if len(parts) >= 2:
                 rmin_r, rmax_r = int(parts[0]), int(parts[1])
-                snappy += f"    refinementRegions\n    {{\n        chargeRefineOuter {{ mode inside; levels (({rmin_r} {rmax_r})); }}\n    }}\n"
-            else:
-                snappy += "    refinementRegions {\n    }\n"
+                _ref_regions_obs += f"        chargeRefineOuter {{ mode inside; levels (({rmin_r} {rmax_r})); }}\n"
+        if _ref_regions_obs:
+            snappy += f"    refinementRegions\n    {{\n{_ref_regions_obs}    }}\n"
         else:
             snappy += "    refinementRegions {\n    }\n"
         snappy += f"    resolveFeatureAngle {resolve_angle};\n    locationInMesh ({loc_pt[0]:.6f} {loc_pt[1]:.6f} {loc_pt[2]:.6f});\n    allowFreeStandingZoneFaces false;\n}}\n\n"
@@ -1369,15 +1357,14 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
         content += "\nsurfaces\n(\n);\n\nincludedAngle 120;\n\nsubsetFeatures\n{\n    nonManifoldEdges yes;\n    openEdges yes;\n}\n"
         self._write_text(os.path.join(case_dir, "system", "surfaceFeaturesDict"), content)
         loc_pt = self._location_in_mesh_point(inputs)
-        _snappy_pre_lv = self._snappy_charge_pre_level(inputs)
+        _snappy_pre_lv = self._snappy_charge_pre_level(inputs, dims)
         add_charge_outer, level_str = self._charge_outer_refine_levels(inputs)
         snappy = self._foam_header("snappyHexMeshDict", "dictionary", "system") + "\n"
         snappy += "castellatedMesh on;\nsnap on;\naddLayers off;\n\n"
         snappy += "geometry\n{\n"
         if _snappy_pre_lv > 0:
-            # True charge geometry: used for refinementRegions pre-refinement inside charge
             snappy += self._snappy_charge_geometry_block(inputs, dims)
-        elif add_charge_outer and level_str:
+        if add_charge_outer and level_str:
             cx, cy, cz, outer_rad = self._charge_outer_geometry(inputs, dims)
             snappy += f'    chargeRefineOuter {{ type searchableSphere; centre ({cx:.6g} {cy:.6g} {cz:.6g}); radius {outer_rad:.6g}; }}\n'
         snappy += "};\n\n"
@@ -1386,15 +1373,16 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
         snappy += f"    maxLocalCells 10000000;\n    maxGlobalCells 200000000;\n    minRefinementCells 2;\n    maxLoadUnBalance 0.1;\n    nCellsBetweenLevels {n_cbl};\n"
         snappy += "    features ();\n"
         snappy += "    refinementSurfaces\n    {\n    }\n"
+        _ref_regions_no_obs = ""
         if _snappy_pre_lv > 0:
-            snappy += f"    refinementRegions\n    {{\n        chargeRegionSnappy {{ mode inside; levels (({_snappy_pre_lv} {_snappy_pre_lv})); }}\n    }}\n"
-        elif add_charge_outer and level_str:
+            _ref_regions_no_obs += f"        chargeRegionSnappy {{ mode inside; levels (({_snappy_pre_lv} {_snappy_pre_lv})); }}\n"
+        if add_charge_outer and level_str:
             parts = level_str.strip().split()
             if len(parts) >= 2:
                 rmin_r, rmax_r = int(parts[0]), int(parts[1])
-                snappy += f"    refinementRegions\n    {{\n        chargeRefineOuter {{ mode inside; levels (({rmin_r} {rmax_r})); }}\n    }}\n"
-            else:
-                snappy += "    refinementRegions {\n    }\n"
+                _ref_regions_no_obs += f"        chargeRefineOuter {{ mode inside; levels (({rmin_r} {rmax_r})); }}\n"
+        if _ref_regions_no_obs:
+            snappy += f"    refinementRegions\n    {{\n{_ref_regions_no_obs}    }}\n"
         else:
             snappy += "    refinementRegions {\n    }\n"
         snappy += "    resolveFeatureAngle 30;\n"
@@ -1690,11 +1678,12 @@ dumpLevel      true;
         remap_enabled = getattr(inputs, "remap_enabled", False)
         R_charge = dims.get("radius", 0.05)
         cell_size = max(getattr(inputs, "cell_size", 0.1), 1e-9)
-        charge_refine = max(0, getattr(inputs, "charge_refinement_level", 0))
         refine_max = max(0, getattr(inputs, "refine_max", 0))
-        # In Fixed Mesh (no AMR) the mesh is not refined, so smallest cell = cell_size. In Dyn Mesh use actual refinement.
+        # In Fixed Mesh (no AMR) the mesh is not refined, so smallest cell = cell_size.
+        # For Dyn Mesh, the AMR max level is controlled solely by refine_max (the AMR field
+        # threshold setting), independent of the static charge initialization refinement.
         enable_dyn = getattr(inputs, "enable_dyn_refine", None)
-        effective_refine = max(charge_refine, refine_max) if enable_dyn else 0
+        effective_refine = refine_max if enable_dyn else 0
         smallest_cell = cell_size / (2.0 ** effective_refine)
         self._last_smallest_cell_near_charge = smallest_cell
         user_ign = getattr(inputs, "ignition_radius", None)
@@ -2198,6 +2187,33 @@ with open(MODE_PATH, "w") as _f:
     json.dump(mode, _f, indent=2)
 '''
         self._write_text(os.path.join(case_dir, "check_realization.py"), script)
+
+    def _is_charge_capturable_on_base_mesh(self, inputs: CaseInputs3D, dims: Dict[str, float]) -> bool:
+        """Return True if snappy can capture the charge geometry on the BASE mesh.
+
+        Snappy's ``refinementRegions mode inside`` needs at least one cell centre inside the
+        geometry on the base mesh.  The criterion: smallest half-dimension > cell_size * sqrt(3)/2.
+
+        Used as a routing decision only — not as a generation abort.  When False, the caller
+        falls back to the explicit topoSet/refineMesh inner-initialization path (capture
+        envelope + refineMesh loops), which can refine the mesh down to the charge level
+        regardless of base-mesh coarseness.
+        """
+        shape = getattr(inputs, "charge_shape", "Sphere")
+        cell_size = max(1e-9, getattr(inputs, "cell_size", 0.5))
+        threshold = cell_size * math.sqrt(3.0) / 2.0
+        if shape == "Sphere":
+            r = float(dims.get("radius", 0.05))
+            return r > threshold
+        if shape == "Cylinder":
+            r = float(dims.get("radius", 0.05))
+            return r > threshold
+        if shape == "Cuboid":
+            L = dims.get("length", dims.get("side", 0.1))
+            W = dims.get("width", dims.get("side", 0.1))
+            H = dims.get("height", dims.get("side", 0.1))
+            return min(L, W, H) > cell_size  # cuboid: each side must exceed one cell
+        return True  # Unknown shape: allow
 
     def _capture_levels_needed(self, inputs: CaseInputs3D, dims: Dict[str, float],
                                pre_refined_levels: int = 0) -> int:
@@ -3087,54 +3103,55 @@ if __name__ == "__main__":
             # Cuboid placement: 0.orig/alpha.c4 is uniform 0 (valid for any mesh size);
             # setFields with boxToCell runs directly — no resize step needed.
             if use_set_refined_allrun and inside_level > 0:
-                # Snappy pre-refinement: snappy refines inside the charge to snappy_pre_level via
-                # refinementRegions (mode inside) which also creates a smooth outside transition
-                # via nCellsBetweenLevels — building3D-style quality without an STL charge surface.
-                snappy_pre_level = self._snappy_charge_pre_level(inputs)
-                # Additional capture passes needed AFTER snappy pre-refinement
-                n_capture_needed = self._capture_levels_needed(inputs, dims,
-                                                               pre_refined_levels=snappy_pre_level)
+                # Stage C — inner initialization refinement.
+                #
+                # Routing decision: when the true charge geometry is capturable on the BASE mesh
+                # (snappy mode inside can select it), snappy handles all inside_level refinement
+                # directly and cleanly.  When not capturable (charge smaller than base cell),
+                # snappy_pre_level = 0 and the explicit topoSet/refineMesh inner-init path takes
+                # over: capture_levels passes refine a progressively tightening envelope until
+                # the true charge is capturable, then charge_levels passes refine the true region.
+                # In both routes the capture envelope (when used) drives MESH only; seeding always
+                # uses the true charge geometry.  This is not hidden corrective meshing — it is the
+                # explicit inner initialization refinement the user requested via the Inside setting.
+                snappy_pre_level = self._snappy_charge_pre_level(inputs, dims)
+                n_capture_needed = self._capture_levels_needed(
+                    inputs, dims, pre_refined_levels=snappy_pre_level
+                )
                 total_levels_needed = snappy_pre_level + n_capture_needed
+
+                # Stage B — validate that the user-requested inside_level is sufficient.
+                # Error fires only when inside_level < total_levels_needed; the message
+                # instructs the user to raise Inside or reduce Cell Size (never "base capture
+                # must exist first").
                 if inside_level < total_levels_needed:
-                    # User's Inside is insufficient even accounting for snappy pre-refinement.
-                    # Abort with a message that quotes the total minimum required.
                     self._charge_capture_impossible_message = build_inside_insufficient_for_capture_message(
                         inside_level, total_levels_needed, inputs, dims
                     )
                     self._capture_levels = 0
                     self._charge_levels = 0
                 else:
-                    # Levels budget:  snappy_pre_level (done by snappy) +
-                    #                 capture_levels   (topoSet captureEnvelope + refineMesh) +
-                    #                 charge_levels    (topoSet chargeRegion   + refineMesh)
-                    #                 = inside_level   (user's requested total inside the charge)
+                    # Levels budget:
+                    #   snappy_pre_level (snappy, true geometry, 0 when not capturable on base)
+                    #   + capture_levels (topoSet captureEnvelope + refineMesh, envelope-based)
+                    #   + charge_levels  (topoSet chargeRegion   + refineMesh, true geometry)
+                    #   = inside_level
                     self._capture_levels = n_capture_needed
                     self._charge_levels = inside_level - snappy_pre_level - n_capture_needed
                     if self._capture_levels > 0:
                         self._write_topo_set_capture_envelope_dict(case_dir, inputs, dims)
                         self._write_refine_mesh_capture_envelope_dict(case_dir)
-                    # Always write chargeRegion dict when inside_level > 0 (needed for final
-                    # cell-count topoSet even when charge_levels == 0).
+                    # chargeRegion dict needed for final cell-count topoSet even when
+                    # charge_levels == 0 (base_generator.py final-count step reads it).
                     self._write_topo_set_charge_region_dict(case_dir, inputs, dims)
                     if self._charge_levels > 0:
                         self._write_refine_mesh_charge_dict(case_dir, set_name="chargeRegion")
+
                 self._snappy_pre_level = snappy_pre_level
-                # Outside-only shell: when snappy already handles the outside transition
-                # (snappy_pre_level > 0) the topoSet outsideShell step is not needed —
-                # nCellsBetweenLevels in snappy creates a smooth gradation outside the charge.
-                rmin_outer = getattr(inputs, "charge_outer_refine_min", None)
-                rmax_outer = getattr(inputs, "charge_outer_refine_max", None)
-                rmin = rmin_outer if rmin_outer is not None else getattr(inputs, "refine_min", 2)
-                rmax = rmax_outer if rmax_outer is not None else getattr(inputs, "refine_max", 3)
-                charge_outer_enable = getattr(inputs, "charge_outer_refine_enable", None)
-                if snappy_pre_level > 0:
-                    outside_levels = 0  # snappy handles outside transition
-                else:
-                    outside_levels = max(rmin, rmax) if charge_outer_enable else 0
-                self._charge_outer_refine_max = outside_levels
-                if outside_levels > 0:
-                    self._write_topo_set_outside_shell_dict(case_dir, inputs, dims)
-                    self._write_refine_mesh_outside_dict(case_dir)
+                self._remaining_inside_levels = self._capture_levels + self._charge_levels
+                # Stage D — outer transition handled by snappy chargeRefineOuter geometry.
+                # No topoSet/refineMesh outside steps; snappy + nCellsBetweenLevels covers it.
+                self._charge_outer_refine_max = 0
         else:
             self._write_text(os.path.join(sys_dir, "setFieldsDict"), self._build_set_fields_dict_3d(inputs, dims or {}, None))
 

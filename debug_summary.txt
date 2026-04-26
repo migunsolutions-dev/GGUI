@@ -1,0 +1,362 @@
+=== Simulation failure: automatic error summary ===
+
+Case directory: \\wsl.localhost\Ubuntu-20.04\home\naor\OpenFOAM\naor-9\run\Work\Case_3D_20260323_212938
+Allrun exit code: 1
+
+--- Last 50 lines of each log file (newest first) ---
+
+=== log.stageVerification (last 20 lines) ===
+
+=== STAGE: 1_after_restore_0_from_0.orig ===
+21:internalField   uniform 0;
+alpha_check: N/A (before setRefinedFields/setFields)
+=== STAGE: 2_after_blockMesh ===
+21:internalField   uniform 0;
+alpha_check: N/A (before setRefinedFields/setFields)
+FATAL: Charge pre-refinement realization FAILED.
+  Shape            : Sphere
+  Charge dimensions: radius=0.1541 m
+  Base Cell Size   : 0.2 m
+  Requested Inside : 2 levels
+  Realized level   : -55
+  Min cell size    : 4503600000000000.0 m
+  Expected min     : 0.05 m  (= 0.2 m / 2^2)
+  Cells in charge  : 7400
+  Reason           : Global minimum cell size 4.5036e+15 m corresponds to realized level -55, but requested Inside level is 2 (expected minimum cell size <= 0.05 m). The mesh was under-refined; a stale cellSet may have been used.
+  To fix:
+    - Reduce base Cell Size to <= 0.025 m
+    - OR review charge geometry / location
+    - OR increase Inside to 3 if the mesh cannot be refined further
+
+=== log.topoSet_chargeRegion (last 50 lines) ===
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Create polyMesh for time = 0
+
+Reading "system/topoSet_chargeRegionDict"
+
+Time = 0
+    mesh not changed.
+Created cellSet chargeRegion
+    Applying source sphereToCell
+    Adding cells with centre within sphere, with centre = (0 0 0) and radius = 0.15413
+    cellSet chargeRegion now size 968
+End
+
+/*---------------------------------------------------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  9
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+Build  : 9-b456138dc4bc
+Exec   : topoSet -dict system/topoSet_chargeRegionDict
+Date   : Mar 23 2026
+Time   : 21:31:23
+Host   : "LenovoPC"
+PID    : 3404
+I/O    : uncollated
+Case   : /home/naor/OpenFOAM/naor-9/run/Work/Case_3D_20260323_212938
+nProcs : 1
+sigFpe : Enabling floating point exception trapping (FOAM_SIGFPE).
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 10)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Create polyMesh for time = 0
+
+Reading "system/topoSet_chargeRegionDict"
+
+Time = 0
+    mesh not changed.
+Created cellSet chargeRegion
+    Applying source sphereToCell
+    Adding cells with centre within sphere, with centre = (0 0 0) and radius = 0.15413
+    cellSet chargeRegion now size 7400
+End
+
+
+=== log.refineMesh_charge (last 49 lines) ===
+
+/*---------------------------------------------------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  9
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+Build  : 9-b456138dc4bc
+Exec   : refineMesh -dict system/refineMesh_chargeDict -overwrite
+Date   : Mar 23 2026
+Time   : 21:31:23
+Host   : "LenovoPC"
+PID    : 3403
+I/O    : uncollated
+Case   : /home/naor/OpenFOAM/naor-9/run/Work/Case_3D_20260323_212938
+nProcs : 1
+sigFpe : Enabling floating point exception trapping (FOAM_SIGFPE).
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 10)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Create polyMesh for time = 0
+
+Mesh edge statistics:
+    x aligned :  number:20766	minLen:0.025	maxLen:0.2
+    y aligned :  number:20766	minLen:0.025	maxLen:0.2
+    z aligned :  number:20766	minLen:0.025	maxLen:0.2
+    other     :  number:0	minLen:4.5036e+15	maxLen:-4.5036e+15
+
+Reading "system/refineMesh_chargeDict"
+
+Refining according to "/home/naor/OpenFOAM/naor-9/run/Work/Case_3D_20260323_212938/system"
+
+Read 968 cells from cellSet "constant/polyMesh/sets/chargeRegion"
+
+Writing refined cells (7744) to cellSet "constant/polyMesh/sets/refinedCells"
+
+Writing map from new to old cell to "0/polyMesh/cellMap"
+
+Mesh edge statistics:
+    x aligned :  number:28274	minLen:0.0125	maxLen:0.2
+    y aligned :  number:28274	minLen:0.0125	maxLen:0.2
+    z aligned :  number:28274	minLen:0.0125	maxLen:0.2
+    other     :  number:0	minLen:4.5036e+15	maxLen:-4.5036e+15
+
+End
+
+
+=== log.refineMesh_captureEnvelope (last 49 lines) ===
+
+/*---------------------------------------------------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  9
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+Build  : 9-b456138dc4bc
+Exec   : refineMesh -dict system/refineMesh_captureEnvelopeDict -overwrite
+Date   : Mar 23 2026
+Time   : 21:31:23
+Host   : "LenovoPC"
+PID    : 3401
+I/O    : uncollated
+Case   : /home/naor/OpenFOAM/naor-9/run/Work/Case_3D_20260323_212938
+nProcs : 1
+sigFpe : Enabling floating point exception trapping (FOAM_SIGFPE).
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 10)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Create polyMesh for time = 0
+
+Mesh edge statistics:
+    x aligned :  number:19448	minLen:0.05	maxLen:0.2
+    y aligned :  number:19448	minLen:0.05	maxLen:0.2
+    z aligned :  number:19448	minLen:0.05	maxLen:0.2
+    other     :  number:0	minLen:4.5036e+15	maxLen:-4.5036e+15
+
+Reading "system/refineMesh_captureEnvelopeDict"
+
+Refining according to "/home/naor/OpenFOAM/naor-9/run/Work/Case_3D_20260323_212938/system"
+
+Read 160 cells from cellSet "constant/polyMesh/sets/captureEnvelope"
+
+Writing refined cells (1280) to cellSet "constant/polyMesh/sets/refinedCells"
+
+Writing map from new to old cell to "0/polyMesh/cellMap"
+
+Mesh edge statistics:
+    x aligned :  number:20766	minLen:0.025	maxLen:0.2
+    y aligned :  number:20766	minLen:0.025	maxLen:0.2
+    z aligned :  number:20766	minLen:0.025	maxLen:0.2
+    other     :  number:0	minLen:4.5036e+15	maxLen:-4.5036e+15
+
+End
+
+
+=== log.topoSet_captureEnvelope (last 35 lines) ===
+
+/*---------------------------------------------------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  9
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+Build  : 9-b456138dc4bc
+Exec   : topoSet -dict system/topoSet_captureEnvelopeDict
+Date   : Mar 23 2026
+Time   : 21:31:23
+Host   : "LenovoPC"
+PID    : 3400
+I/O    : uncollated
+Case   : /home/naor/OpenFOAM/naor-9/run/Work/Case_3D_20260323_212938
+nProcs : 1
+sigFpe : Enabling floating point exception trapping (FOAM_SIGFPE).
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 10)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Create polyMesh for time = 0
+
+Reading "system/topoSet_captureEnvelopeDict"
+
+Time = 0
+    mesh not changed.
+Created cellSet captureEnvelope
+    Applying source sphereToCell
+    Adding cells with centre within sphere, with centre = (0 0 0) and radius = 0.174937
+    cellSet captureEnvelope now size 160
+End
+
+
+=== log.snappyHexMesh (last 50 lines) ===
+
+    faces with concavity > 80  degrees                     : 0
+    faces with skewness > 4   (internal) or 20  (boundary) : 0
+    faces with interpolation weights (0..1)  < 0.05        : 0
+    faces with volume ratio of neighbour cells < 0.01      : 0
+    faces with face twist < 0.02                           : 0
+    faces on cells with determinant < 0.001                : 0
+Successfully moved mesh
+Moved mesh in = 0.03 s
+
+
+Repatching faces according to nearest surface ...
+Repatched 0 faces in = 0 s
+
+
+Edge intersection testing:
+    Number of edges             : 55476
+    Number of edges to retest   : 8676
+    Number of intersected edges : 0
+Merging 0 sets of faces.
+
+No faces merged ...
+
+Merging all points on surface that
+- are used by only two boundary faces and
+- make an angle with a cosine of more than 0.866025.
+
+No straight edges simplified and no points removed ...
+Snapped mesh : cells:17576  faces:55476  points:20445
+Cells per refinement level:
+    0	7696
+    1	1368
+    2	8512
+Writing mesh to time constant
+Wrote mesh in = 0.03 s.
+Mesh snapped in = 0.9 s.
+Checking final mesh ...
+Checking faces in error :
+    non-orthogonality > 65  degrees                        : 0
+    faces with face pyramid volume < 1e-13                 : 0
+    faces with face-decomposition tet quality < 1e-15      : 0
+    faces with concavity > 80  degrees                     : 0
+    faces with skewness > 4   (internal) or 20  (boundary) : 0
+    faces with interpolation weights (0..1)  < 0.05        : 0
+    faces with volume ratio of neighbour cells < 0.01      : 0
+    faces with face twist < 0.02                           : 0
+    faces on cells with determinant < 0.001                : 0
+Finished meshing without any errors
+Finished meshing in = 1.35 s.
+End
+
+
+=== log.blockMesh (last 50 lines) ===
+
+    "system/blockMeshDict"
+Creating block edges
+No non-planar block faces defined
+Creating topology blocks
+Creating topology patches
+
+Creating block mesh topology
+
+Check topology
+
+	Basic statistics
+		Number of internal faces : 0
+		Number of boundary faces : 6
+		Number of defined boundary faces : 6
+		Number of undefined boundary faces : 0
+	Checking patch -> block consistency
+
+Creating block offsets
+Creating merge list .
+
+Creating polyMesh from blockMesh
+Creating patches
+Creating cells
+Creating points with scale 1
+    Block 0 cell size :
+        i : 0.2 .. 0.2
+        j : 0.2 .. 0.2
+        k : 0.2
+
+Writing polyMesh
+----------------
+Mesh Information
+----------------
+  boundingBox: (-2 -2 -2) (2 2 2)
+  nPoints: 9261
+  nCells: 8000
+  nFaces: 25200
+  nInternalFaces: 22800
+----------------
+Patches
+----------------
+  patch 0 (start: 22800 size: 400) name: minX
+  patch 1 (start: 23200 size: 400) name: maxX
+  patch 2 (start: 23600 size: 400) name: minY
+  patch 3 (start: 24000 size: 400) name: maxY
+  patch 4 (start: 24400 size: 400) name: minZ
+  patch 5 (start: 24800 size: 400) name: maxZ
+
+End
+
+
+=== log.surfaceFeatures (last 29 lines) ===
+
+/*---------------------------------------------------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  9
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+Build  : 9-b456138dc4bc
+Exec   : surfaceFeatures
+Date   : Mar 23 2026
+Time   : 21:31:22
+Host   : "LenovoPC"
+PID    : 3324
+I/O    : uncollated
+Case   : /home/naor/OpenFOAM/naor-9/run/Work/Case_3D_20260323_212938
+nProcs : 1
+sigFpe : Enabling floating point exception trapping (FOAM_SIGFPE).
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 10)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Reading "surfaceFeaturesDict"
+
+ExecutionTime = 0 s  ClockTime = 0 s
+
+End
+
