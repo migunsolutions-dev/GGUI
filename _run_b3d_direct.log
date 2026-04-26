@@ -1,0 +1,82 @@
+==== Preparing fresh copy ====
+Renamed 0/T.orig -> 0/T
+Renamed 0/U.orig -> 0/U
+Renamed 0/alpha.c4.orig -> 0/alpha.c4
+Renamed 0/p.orig -> 0/p
+Renamed 0/rho.air.orig -> 0/rho.air
+Renamed 0/rho.c4.orig -> 0/rho.c4
+==== Files in 0/ now ====
+T
+U
+alpha.c4
+p
+rho.air
+rho.c4
+==== Running parallel pipeline (4 cores) ====
+Start: 23:24:13
+  surfaceFeatures: .146172242 s
+  blockMesh:       .046541030 s
+  decomposePar:    .075239110 s
+  snappyHexMesh:   1.001793070 s
+  addEmptyPatch:   .490308883 s
+  setRefinedFields:1.837851743 s
+==== blastFoam (parallel, 4 cores) ====
+  blastFoam:       61.051625386 s
+==== Total wall (no meshing-overhead extras): 64.656592009 s ====
+
+==== blastFoam log tail ====
+Courant Number Mean/Max = 0.00882629, 0.463449
+deltaT = 2.27273e-06
+Time = 0.0006
+
+Calculating Fluxes
+RK2SSP: step 1
+Solving compressibleSystem:
+
+RK2SSP: step 2
+Solving compressibleSystem:
+
+RK2SSP: step 3
+Solving compressibleSystem:
+
+Post-updating compressibleSystem:
+
+max(p): 1.89874e+07, min(p): 55852.7
+max(T): 4885.4, min(T): 287.926
+Detected 64 cells that are protected from refinement. Writing these to cellSet protectedCells.
+Detected 64 cells that are protected from refinement. Writing these to cellSet protectedCells.
+ExecutionTime = 60.64 s  ClockTime = 61 s
+
+End
+
+Finalising parallel run
+
+==== Final markers ====
+Time = 0.000590909090909
+ExecutionTime = 60.06 s  ClockTime = 60 s
+Time = 0.000593181818182
+ExecutionTime = 60.22 s  ClockTime = 60 s
+Time = 0.000595454545455
+ExecutionTime = 60.33 s  ClockTime = 60 s
+Time = 0.000597727272727
+ExecutionTime = 60.43 s  ClockTime = 61 s
+Time = 0.0006
+ExecutionTime = 60.64 s  ClockTime = 61 s
+
+==== Mesh sizes (initial after snappy + setRefinedFields) ====
+4
+Final cell count per processor (last time step):
+0
+0.0001
+0.00015
+0.0002
+0.00025
+0.0003
+0.00035
+0.0004
+0.00045
+0.0005
+0.00055
+0.0006
+5e-05
+constant

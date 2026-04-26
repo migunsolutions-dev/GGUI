@@ -255,6 +255,14 @@ def _parse_controlDict(case_dir: str, out: Dict[str, Any]) -> None:
     iv = _int_val(text, "cycleWrite")
     if iv is not None:
         out["cycle_write"] = iv
+    # Detect post-processing function objects (impulse / overpressure / fieldMinMax).
+    # If any are present, flip enable_post_processing ON so a regenerated case keeps them.
+    has_pp = any(
+        re.search(rf"\btype\s+{name}\s*;", text)
+        for name in ("impulse", "overpressure", "fieldMinMax")
+    )
+    if has_pp:
+        out["enable_post_processing"] = True
 
 
 def _parse_setFieldsDict(case_dir: str, out: Dict[str, Any]) -> None:
@@ -721,6 +729,7 @@ UI_FIELD_KEYS = [
     "outside_extent", "transition_cells",
     "charge_refinement_level", "charge_outer_refine_min", "charge_outer_refine_max", "charge_outer_refine_enable",
     "cylinder_axis", "charge_backup_radius_factor", "buffer_layers",
+    "enable_post_processing",
     "refine_interval", "lower_refine_threshold", "unrefine_threshold", "n_buffer_layers_dynamic", "refine_indicator_field", "enable_balancing",
     "obstacle_feature_angle", "obstacle_cells_between_levels", "obstacle_snap_iter", "obstacle_feature_snap_iter",
     "activation_model", "activation_model_ui",
@@ -738,7 +747,7 @@ UI_FIELD_KEYS = [
 # Keys present in these case files that we do NOT map to any UI (reported as "not supported yet").
 UNSUPPORTED_KEYS_BY_FILE: Dict[str, List[str]] = {
     "system/blockMeshDict": ["convertToMeters", "blocks", "edges", "patches"],
-    "system/controlDict": ["startTime", "startFrom", "purgeWrite", "writeFormat", "writePrecision", "writeCompression", "timeFormat", "runTimeModifiable", "functions"],
+    "system/controlDict": ["startTime", "startFrom", "purgeWrite", "writeFormat", "writePrecision", "writeCompression", "timeFormat", "runTimeModifiable"],
     "system/setFieldsDict": ["defaultFieldValues", "regions"],
     "constant/phaseProperties": ["phases", "products", "reactants", "air", "activationModel", "initiationPoints", "equationOfState", "thermodynamics"],
     "system/decomposeParDict": ["method", "numberOfSubdomains", "roots", "hierarchicalCoeffs", "manualCoeffs", "scotchCoeffs"],

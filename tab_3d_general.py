@@ -494,6 +494,11 @@ class TabGeneral3D(QWidget):
         # backup.radius = factor * charge_radius. Larger value -> more robust seeding on
         # coarse base meshes, but seeds field into a larger volume around the charge.
         self._bubble_radius_factor = 1.5
+        # Run-mode tradeoffs (default: FAST). Both default OFF so a fresh run is as
+        # fast as building3D's hand-tuned Allrun. Loaders flip them ON when an
+        # opened case explicitly contains the corresponding constructs.
+        self._enable_post_processing = False  # functions { impulse; overpressure; fieldMinMax; }
+        self._fast_run_mode = True            # skip stage_check / log.stageVerification / checkMesh / check_internal_patch
         self._obstacle_feature_angle = 120
         self._obstacle_cells_between_levels = 2
         self._obstacle_snap_iter = 100
@@ -1237,6 +1242,32 @@ class TabGeneral3D(QWidget):
         f_buf.addRow("", QLabel("backup.radius = factor x charge radius. 1.5 matches building3D-style robust seeding; use 1.0 for tight backup."))
         v.addWidget(grp_buf)
 
+        # Run mode (Allrun + controlDict) — tradeoffs between speed and verification.
+        # Default values are tuned to match building3D's hand-tuned Allrun (~2.5x faster
+        # than verbose mode for the same simulated time).
+        grp_run = QGroupBox("Run mode (speed vs verification)")
+        f_run = QFormLayout(grp_run)
+        chk_post_proc = QCheckBox()
+        chk_post_proc.setChecked(getattr(self, "_enable_post_processing", False))
+        chk_post_proc.setToolTip(
+            "Add controlDict 'functions { impulse; overpressure; fieldMinMax; }'.\n"
+            "Useful for downstream analysis (max overpressure, impulse fields), but\n"
+            "adds work at every writeTime. Default OFF for faster runs."
+        )
+        f_run.addRow("Write impulse / overpressure / fieldMinMax", chk_post_proc)
+        f_run.addRow("", QLabel("OFF = building3D-style fast solver (no postProcess at writeTime).\nON = adds 'functions {...}' block; useful for analysis but slower."))
+        chk_fast = QCheckBox()
+        chk_fast.setChecked(getattr(self, "_fast_run_mode", True))
+        chk_fast.setToolTip(
+            "Fast Allrun: skip optional verification (stage_check / log.stageVerification\n"
+            "/ checkMesh / check_internal_patch). check_alpha_c4.sh still gates the\n"
+            "solver against 'no mass in domain'. Default ON.\n"
+            "Turn OFF only when debugging mesh / charge initialization."
+        )
+        f_run.addRow("Fast Allrun (skip optional verification)", chk_fast)
+        f_run.addRow("", QLabel("ON = ~5-8 s saved per run (no stage_check tee, no checkMesh).\nOFF = full stage logs in log.stageVerification (debugging mode)."))
+        v.addWidget(grp_run)
+
         # Group: Dyn Refine (AMR) – Advanced
         grp_amr = QGroupBox("Dyn Refine (AMR) – Advanced")
         f_amr = QFormLayout(grp_amr)
@@ -1440,6 +1471,8 @@ class TabGeneral3D(QWidget):
         if d.exec_() == QDialog.Accepted:
             self._buffer_layers = spin_buf_setfields.value()
             self._bubble_radius_factor = spin_bubble_factor.value()
+            self._enable_post_processing = chk_post_proc.isChecked()
+            self._fast_run_mode = chk_fast.isChecked()
             self._refine_interval = spin_ref_int.value()
             self._lower_refine_threshold = spin_lower.value()
             self._unrefine_threshold = spin_unref.value()
@@ -2367,6 +2400,11 @@ class TabGeneral3D(QWidget):
                 self._bubble_radius_factor = float(data["bubble_radius_factor"])
             if "buffer_layers" in data:
                 self._buffer_layers = int(data["buffer_layers"])
+            # Run-mode tradeoffs: load if loader detected them, otherwise leave fast defaults.
+            if "enable_post_processing" in data:
+                self._enable_post_processing = bool(data["enable_post_processing"])
+            if "fast_run_mode" in data:
+                self._fast_run_mode = bool(data["fast_run_mode"])
             if "ignition_mode" in data:
                 idx = self.combo_ignition_mode.findText(data["ignition_mode"])
                 if idx >= 0:
@@ -2506,6 +2544,8 @@ class TabGeneral3D(QWidget):
             unrefine_threshold=getattr(self, "_unrefine_threshold", 0.1),
             n_buffer_layers_dynamic=getattr(self, "_n_buffer_layers_dynamic", 2),
             bubble_radius_factor=getattr(self, "_bubble_radius_factor", 1.5),
+            enable_post_processing=getattr(self, "_enable_post_processing", False),
+            fast_run_mode=getattr(self, "_fast_run_mode", True),
             enable_balancing=getattr(self, "_enable_balancing", False),
             dynamic_max_cells=getattr(self, "_dynamic_max_cells", 200000000),
             refine_indicator_field=getattr(self, "_refine_indicator_field", "densityGradient"),

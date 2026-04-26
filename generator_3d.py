@@ -902,7 +902,10 @@ class Generator3D(BaseGenerator):
                 use_seed_bubble=False,
                 startup_refinement_levels=0,
                 remaining_inside_levels=0,
-                use_charge_region_check=not remap_enabled,
+                # Charge-region post-init check (writeCellCentres + check_charge_region.py)
+                # is a verification step. In fast_run_mode it is skipped to save ~1-2 s
+                # of postProcess + Python work; check_alpha_c4.sh still gates the solver.
+                use_charge_region_check=(not remap_enabled) and (not getattr(inputs, "fast_run_mode", True)),
                 # Native setRefinedFields path: no manual topoSet/refineMesh
                 # capture/charge stages → use_charge_interior_refinement=False
                 # ensures Allrun runs ``setRefinedFields`` (not ``-noRefine``).
@@ -915,6 +918,7 @@ class Generator3D(BaseGenerator):
                 envelope_empty_message=None,
                 charge_region_empty_message=None,
                 placement_use_setfields=use_set_refined and getattr(inputs, "charge_shape", "") == "Cuboid",
+                fast_run_mode=getattr(inputs, "fast_run_mode", True),
             )
 
             # 3D non-remap only: export init mode and effective values for GUI Info panel
@@ -3172,10 +3176,11 @@ if __name__ == "__main__":
             "runTimeModifiable true;",
             "",
             "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //",
-            "functions",
-            "{",
         ]
-        cd_lines += [
+        if getattr(inputs, "enable_post_processing", False):
+            cd_lines += [
+                "functions",
+                "{",
                 "    impulse",
                 "    {",
                 "        type            impulse;",
@@ -3200,6 +3205,8 @@ if __name__ == "__main__":
                 "        );",
                 "    }",
                 "};",
+            ]
+        cd_lines += [
             "",
             "// ************************************************************************* //",
         ]

@@ -139,6 +139,13 @@ class CaseInputs3D:
     # --- setFields/setRefinedFields ---
     buffer_layers: int = 2                   # nBufferLayers in setFieldsDict (replaces hardcoded 5)
 
+    # --- Run mode (Allrun + controlDict speed-vs-verbosity tradeoffs) ---
+    # Defaults are tuned for FAST runs: skip optional post-processing and verbose
+    # stage verification. Enable explicitly when debugging or when impulse/
+    # overpressure/fieldMinMax fields are required for downstream analysis.
+    enable_post_processing: bool = False     # write functions { impulse; overpressure; fieldMinMax; } in controlDict
+    fast_run_mode: bool = True               # skip stage_check/log.stageVerification/checkMesh/check_charge_region/check_internal_patch in Allrun
+
     # --- Charge outer refinement (snappyHexMesh refinement region); None = use global refine_min/refine_max
     charge_outer_refine_enable: Optional[bool] = None   # None/True = enable; False = disable charge outer refinement
     charge_outer_refine_min: Optional[int] = None      # None = use refine_min

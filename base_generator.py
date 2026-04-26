@@ -115,9 +115,21 @@ class BaseGenerator:
         envelope_empty_message: Optional[str] = None,
         charge_region_empty_message: Optional[str] = None,
         placement_use_setfields: bool = False,
+        fast_run_mode: bool = True,
     ) -> None:
         """
         Write Allrun and Allclean scripts.
+
+        When fast_run_mode is True (default), the Allrun script omits optional
+        verbose verification steps that add ~5-10s of overhead but are not
+        required for correctness:
+          - stage_check definition + 9 invocations (and `tee log.stageVerification`)
+          - checkMesh (purely informational)
+          - check_internal_patch.sh
+        check_alpha_c4.sh remains in both modes (it gates the solver against
+        "no mass in domain" failures, which is a real correctness guard).
+        Charge-region check (writeCellCentres + check_charge_region.py) follows
+        use_charge_region_check independently.
         When init_from_1d is True, mapped_source_dir_linux and mapped_source_time must be set;
         Allrun will run postProcess writeCellCentres and remap_radial.py (after mesh + cp 0.orig 0) then the solver, skipping setFields.
         When use_set_refined is True, Allrun uses setRefinedFields instead of setFields.
@@ -145,10 +157,16 @@ fi
 # Ensure case.foam exists for Paraview/PyVista
 touch case.foam
 
-# Stage verification: tee all output to log.stageVerification and define stage_check
+"""
+        if fast_run_mode:
+            # FAST MODE: define stage_check as no-op so existing call sites stay valid
+            # without producing log.stageVerification or per-stage spew. Saves ~5-8s.
+            script_head += "stage_check () { :; }\n"
+        else:
+            script_head += r"""# Stage verification: tee all output to log.stageVerification and define stage_check
 # alpha_check only meaningful AFTER setRefinedFields/setFields (stages 5/6); before that 0/alpha.c4 is still 0 from 0.orig
 exec > >(tee log.stageVerification) 2>&1
-stage_check () {{
+stage_check () {
   echo "=== STAGE: $1 ==="
   if [ -f 0/alpha.c4 ]; then
     grep -n "internalField" -m 1 0/alpha.c4 || true
@@ -164,7 +182,7 @@ stage_check () {{
   else
     echo "alpha_check: FAIL (missing 0/alpha.c4)"
   fi
-}}
+}
 stage_check "1_after_restore_0_from_0.orig"
 """
         use_mapping = init_from_1d and mapped_source_dir_linux and mapped_source_time
@@ -227,12 +245,15 @@ postProcess -func writeCellCentres -time 0 > log.writeCellCentres 2>&1 || { echo
 [ -f 0/C ] || { echo "FATAL: 0/C missing after writeCellCentres. Check controlDict writeFormat and log.writeCellCentres."; exit 1; }
 python3 check_charge_region.py || exit 1
 """
-            # Stage 5 runs after setFields/setRefinedFields; then gate on alpha check; internalPatch preflight; Stage 6 before solver
+            # Stage 5 runs after setFields/setRefinedFields; then gate on alpha check; internalPatch preflight; Stage 6 before solver.
+            # check_alpha_c4.sh stays in BOTH modes: it gates the solver against "no mass in domain" (real correctness check, not verification).
             init_fields_block += """
 stage_check "5_after_setFields_or_setRefinedFields"
-""" + alpha_check_block + """
-[ -f check_internal_patch.sh ] && { bash check_internal_patch.sh || exit 1; } || true
-stage_check "6_before_blastFoam"
+""" + alpha_check_block
+            if not fast_run_mode:
+                init_fields_block += """[ -f check_internal_patch.sh ] && { bash check_internal_patch.sh || exit 1; } || true
+"""
+            init_fields_block += """stage_check "6_before_blastFoam"
 """
 
         if cores > 1:
@@ -332,8 +353,9 @@ rm -rf processor* 0
 cp -r 0.orig 0
 # --- changeDictionary adds boundaryField for ALL patches (internalPatch + obs.*) ---
 changeDictionary > log.changeDictionary 2>&1
-checkMesh > log.checkMesh 2>&1
 """
+                if not fast_run_mode:
+                    script_body += "checkMesh > log.checkMesh 2>&1\n"
             else:
                 pass
 
@@ -460,8 +482,9 @@ stage_check "4_after_restore_0"
 # --- changeDictionary adds boundaryField for ALL patches (internalPatch + obs.*) ---
 changeDictionary > log.changeDictionary 2>&1
 stage_check "5_after_changeDictionary"
-checkMesh > log.checkMesh 2>&1
 """
+                if not fast_run_mode:
+                    script_body += "checkMesh > log.checkMesh 2>&1\n"
 
             script_body += init_fields_block
             script_body += """

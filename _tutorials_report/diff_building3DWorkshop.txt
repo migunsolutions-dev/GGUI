@@ -1,0 +1,1085 @@
+=== Original  : /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop
+=== GUI rebuild: /home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI
+
+=== system/blockMeshDict ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop/system/blockMeshDict	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI/system/blockMeshDict	2026-04-27 00:06:30.865634615 +0300
+@@ -1,8 +1,8 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+ | =========                 |                                                 |
+ | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+-|  \\    /   O peration     | Version:  2.3.0                                 |
+-|   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
+ |    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+@@ -11,26 +11,28 @@
+     format      ascii;
+     class       dictionary;
+     object      blockMeshDict;
++    location    "system";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
++
+ convertToMeters 1;
+ 
+ vertices
+ (
+-    ( -5.0 -5.0     0.0) // bottom
+-    (  5.0 -5.0     0.0)
+-    (  5.0  5.0     0.0)
+-    ( -5.0  5.0     0.0)
+-    ( -5.0 -5.0     5.0) // top
+-    (  5.0 -5.0     5.0)
+-    (  5.0  5.0     5.0)
+-    ( -5.0  5.0     5.0)
++    (-5.0 -5.0 0.0)
++    (5.0 -5.0 0.0)
++    (5.0 5.0 0.0)
++    (-5.0 5.0 0.0)
++    (-5.0 -5.0 5.0)
++    (5.0 -5.0 5.0)
++    (5.0 5.0 5.0)
++    (-5.0 5.0 5.0)
+ );
+ 
+ blocks
+ (
+-	 hex (0 1 2 3 4 5 6 7) (25 25 10) simpleGrading (1 1 1)
++    hex (0 1 2 3 4 5 6 7) (23 23 12) simpleGrading (1 1 1)
+ );
+ 
+ edges
+@@ -39,31 +41,56 @@
+ 
+ boundary
+ (
+-    ground
++    minX
+     {
+         type patch;
+         faces
+         (
+-            (0 1 2 3)
++            (0 4 7 3)
+         );
+     }
+-    outlet
++    maxX
+     {
+         type patch;
+         faces
+         (
+-            (0 1 5 4)
+             (1 2 6 5)
+-            (3 2 6 7)
+-            (0 3 7 4)
++        );
++    }
++    minY
++    {
++        type patch;
++        faces
++        (
++            (0 1 5 4)
++        );
++    }
++    maxY
++    {
++        type patch;
++        faces
++        (
++            (3 7 6 2)
++        );
++    }
++    minZ
++    {
++        type wall;
++        faces
++        (
++            (0 3 2 1)
++        );
++    }
++    maxZ
++    {
++        type patch;
++        faces
++        (
+             (4 5 6 7)
+         );
+     }
+-
+ );
+ 
+ mergePatchPairs
+ (
+ );
+-
+-// ************************************************************************* //
+=== system/controlDict ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop/system/controlDict	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI/system/controlDict	2026-04-27 00:06:30.893634616 +0300
+@@ -1,8 +1,8 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+ | =========                 |                                                 |
+ | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+-|  \\    /   O peration     | Version:  2.3.0                                 |
+-|   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
+ |    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+@@ -10,158 +10,63 @@
+     version     2.0;
+     format      ascii;
+     class       dictionary;
+-    location    "system";
+     object      controlDict;
++    location    "system";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
++
+ application     blastFoam;
+ 
+ startFrom       startTime;
+-
+ startTime       0;
+-
+ stopAt          endTime;
+-
+ endTime         0.0025;
+ 
+-deltaT          1e-7;
++deltaT          1e-07;
++adjustTimeStep  yes;
++maxCo            0.5;
++maxDeltaT       1;
+ 
+ writeControl    adjustableRunTime;
+-
+-writeInterval   5e-5;
+-
++writeInterval   5e-05;
+ cycleWrite      0;
++purgeWrite      0;
+ 
+ writeFormat     ascii;
+-
+ writePrecision  6;
+-
+ writeCompression off;
+ 
+ timeFormat      general;
+-
+ timePrecision   12;
+-
+ runTimeModifiable true;
+ 
+-adjustTimeStep  yes;
+-
+-maxCo           0.5;
+-
+-maxDeltaT       1;
+-
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+-
+ functions
+ {
+     impulse
+     {
+-        type                impulse;
+-
+-        writeControl        writeTime;
+-        pRef                101298;
++        type            impulse;
++        writeControl    writeTime;
++        pRef            101298.0;
+     }
+     overpressure
+     {
+-        type                overpressure;
+-
+-        writeControl        writeTime;
+-        store               yes;
+-        pRef                101298;
++        type            overpressure;
++        writeControl    writeTime;
++        store           yes;
++        pRef            101298.0;
+     }
+     maxPImpulse
+     {
+-        type                fieldMinMax;
+-
+-        writeControl        writeTime;
++        type            fieldMinMax;
++        writeControl    writeTime;
+         fields
+         (
+             overpressure
+             impulse
+         );
+     }
+-
+-    surfaces
+-    {
+-        type                surfaces;
+-        writeControl        adjustableRunTime;
+-        writeInterval       1e-4;
+-        interpolate         false;
+-        interpolationScheme cellPointFace;
+-        surfaceFormat       vtkTimeSeries;
+-        fields ( p );
+-        surfaces
+-        (
+-            ground
+-            {
+-                type        patch;
+-                patches     (ground);
+-                triangulate false;
+-            }
+-            pContours
+-            {
+-                type        isoSurface;
+-                isoField    p;
+-                isoValues   (1.1e5);
+-            }
+-            zNormal
+-            {
+-                type        cuttingPlane;
+-                planeType   pointAndNormal;
+-                pointAndNormalDict
+-                {
+-                    point   (0 0 0.5);
+-                    normal  (0 0 1);
+-                }
+-                interpolate true;
+-            }
+-            yNormal
+-            {
+-                type        cuttingPlane;
+-                planeType   pointAndNormal;
+-                pointAndNormalDict
+-                {
+-                    point   (0 0 0.5);
+-                    normal  (0 1 0);
+-                }
+-                interpolate true;
+-            }
+-            xNormal
+-            {
+-                type        cuttingPlane;
+-                planeType   pointAndNormal;
+-                pointAndNormalDict
+-                {
+-                    point   (0 0 0.5);
+-                    normal  (1 0 0);
+-                }
+-                interpolate true;
+-            }
+-        );
+-    }
+-
+-    pressureProbes
+-    {
+-        type                blastProbes;
+-        writeControl        timeStep;
+-        writeInterval       1;
+-        adjustLocations     yes;
+-        append yes;
+-        probeLocations
+-        (
+-            // probe locations in ( x y z ) format
+-            // unlimited number -- needs to be inside the domain!
+-            ( 2.0 0 0.5)    // In mesh
+-            (0 2.1 1.0)     // Not in mesh
+-            // etc.
+-        );
+-        fields
+-        (
+-            p
+-        );
+-    }
+ };
+ 
+-
+-// ************************************************************************* //
++// ************************************************************************* //
+\ No newline at end of file
+=== system/setFieldsDict ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop/system/setFieldsDict	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI/system/setFieldsDict	2026-04-27 00:06:30.893634616 +0300
+@@ -1,8 +1,8 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+ | =========                 |                                                 |
+ | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+-|  \\    /   O peration     | Version:  2.3.0                                 |
+-|   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
+ |    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+@@ -10,53 +10,27 @@
+     version     2.0;
+     format      ascii;
+     class       dictionary;
+-    location    "system";
+     object      setFieldsDict;
++    location    "system";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
++
+ fields (alpha.c4);
+ nBufferLayers 2;
+ 
+-defaultFieldValues
+-(
+-    volScalarFieldValue alpha.c4 0
+-);
+-
+-
+-regions
+-(
+-    sphericalMassToCell // Use cylinder for 3D
++defaultFieldValues ( volScalarFieldValue alpha.c4 0 );
++regions ( sphericalMassToCell
+     {
+-        centre (0 0 0.5);
+-        p1 (0 0 0.25);
+-        p2 (0 0 0.75);
+-        radius 0.1;
+-        mass 10;
+         rho 1601;
++        mass 10;
++        centre (0.0 0.0 0.5);
+         backup
+         {
+-            centre (0 0 0.5);
+-            p1 (0 0 0.0);
+-            p2 (0 0 1.0);
+-            radius 0.75;
++            centre (0.0 0.0 0.5);
++            radius 0.171369;
+         }
+         refineInternal yes;
+         level 3;
+-
+-        fieldValues
+-        (
+-            volScalarFieldValue alpha.c4    1
+-        );
+-    }
+-
+-    // patchToFace // Refine walls
+-    // {
+-    //     name wall;
+-    //     level 3;
+-    //     refineFaces yes;
+-    // }
+-);
+-
+-
+-// ************************************************************************* //
++        fieldValues ( volScalarFieldValue alpha.c4 1 );
++    } );
+=== system/fvSchemes ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop/system/fvSchemes	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI/system/fvSchemes	2026-04-27 00:06:30.901634617 +0300
+@@ -1,8 +1,8 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+ | =========                 |                                                 |
+ | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+-|  \\    /   O peration     | Version:  2.3.0                                 |
+-|   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
+ |    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+@@ -10,52 +10,16 @@
+     version     2.0;
+     format      ascii;
+     class       dictionary;
+-    location    "system";
+     object      fvSchemes;
++    location    "system";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
+-fluxScheme      Tadmor;
+-
+-ddtSchemes
+-{
+-    default         Euler;
+-    timeIntegrator  RK2SSP;
+-}
+-
+-gradSchemes
+-{
+-    default         cellMDLimited leastSquares 1.0;
+-}
+-
+-divSchemes
+-{
+-    default         none;
+-    div(alphaRhoPhi.c4,lambda.c4) Riemann;
+-}
+-
+-laplacianSchemes
+-{
+-    default         Gauss linear corrected;
+-}
+-
+-interpolationSchemes
+-{
+-    default             linear;
+-    reconstruct(alpha)  vanAlbada;
+-    reconstruct(rho)    vanAlbada;
+-    reconstruct(U)      vanAlbadaV;
+-    reconstruct(e)      vanAlbada;
+-    reconstruct(p)      vanAlbada;
+-    reconstruct(speedOfSound)      vanAlbada;
+-
+-    reconstruct(lambda.c4) vanAlbada;
+-}
+-
+-snGradSchemes
+-{
+-    default         corrected;
+-}
+-
+ 
+-// ************************************************************************* //
++fluxScheme Kurganov;
++ddtSchemes { default Euler; timeIntegrator RK2SSP 3; }
++gradSchemes { default cellMDLimited leastSquares 1.0; }
++divSchemes { default none; div(alphaRhoPhi.c4,lambda.c4) Riemann; }
++laplacianSchemes { default Gauss linear corrected; }
++interpolationSchemes { default linear; reconstruct(alpha) quadraticMUSCL Minmod; reconstruct(rho) quadraticMUSCL Minmod; reconstruct(U) quadraticMUSCL Minmod; reconstruct(e) quadraticMUSCL Minmod; reconstruct(p) quadraticMUSCL Minmod; reconstruct(speedOfSound) quadraticMUSCL Minmod; reconstruct(lambda.c4) quadraticMUSCL Minmod; }
++snGradSchemes { default corrected; }
+=== system/fvSolution ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop/system/fvSolution	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI/system/fvSolution	2026-04-27 00:06:30.897634617 +0300
+@@ -1,8 +1,8 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+ | =========                 |                                                 |
+ | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+-|  \\    /   O peration     | Version:  2.3.0                                 |
+-|   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
+ |    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+@@ -10,18 +10,10 @@
+     version     2.0;
+     format      ascii;
+     class       dictionary;
+-    location    "system";
+     object      fvSolution;
++    location    "system";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
+-solvers
+-{
+-    "(rho|rhoU|rhoE|alpha|.*)"
+-    {
+-        solver          diagonal;
+-    }
+-}
+-
+ 
+-// ************************************************************************* //
++solvers { "(rho|rhoU|rhoE|alpha|.*)" { solver diagonal; } }
+=== system/decomposeParDict ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop/system/decomposeParDict	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI/system/decomposeParDict	2026-04-27 00:06:30.901634617 +0300
+@@ -1,8 +1,8 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+ | =========                 |                                                 |
+ | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+-|  \\    /   O peration     | Version:  2.3.0                                 |
+-|   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
+ |    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+@@ -10,16 +10,16 @@
+     version     2.0;
+     format      ascii;
+     class       dictionary;
+-    location    "system";
+     object      decomposeParDict;
++    location    "system";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
+-numberOfSubdomains 4; // this is number of proc
++numberOfSubdomains 4;
+ 
+-method         scotch; // automatic
++method         scotch;
+ 
+-simpleCoeffs // not auto
++simpleCoeffs
+ {
+     n               ( 2 2 1 );
+     delta           0.001;
+@@ -29,5 +29,4 @@
+ 
+ roots           ( );
+ 
+-
+ // ************************************************************************* //
+=== system/snappyHexMeshDict ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop/system/snappyHexMeshDict	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI/system/snappyHexMeshDict	2026-04-27 00:06:30.861634615 +0300
+@@ -1,203 +1,104 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+-  | =========                 |                                                 |
+-  | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+-  |  \\    /   O peration     | Version:  2.3.x                                 |
+-  |   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
+-  |    \\/     M anipulation  |                                                 |
+-  \*---------------------------------------------------------------------------*/
++| =========                 |                                                 |
++| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
++|    \\/     M anipulation  |                                                 |
++\*---------------------------------------------------------------------------*/
+ FoamFile
+ {
+-  version     2.0;
+-  format      ascii;
+-  class       dictionary;
+-  object      snappyHexMeshDict;
++    version     2.0;
++    format      ascii;
++    class       dictionary;
++    object      snappyHexMeshDict;
++    location    "system";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
++
+ castellatedMesh on;
+-snap            off;
+-addLayers       off;
++snap on;
++addLayers off;
+ 
+ geometry
+ {
+-    walls
+-    {
+-        type triSurfaceMesh;
+-        file "L_Wall.stl";
+-        scale 0.001;
+-    }
++    "obs0_L_Wall_stl" { type triSurfaceMesh; file "obs0_L_Wall.stl"; }
++    chargeRefineOuter { type searchableSphere; centre (0 0 0.5); radius 1.03803; }
+ };
+ 
+ castellatedMeshControls
+ {
+-    // Refinement parameters
+-    // ~~~~~~~~~~~~~~~~~~~~~
+-
+-    // If local number of cells is >= maxLocalCells on any processor
+-    // switches from from refinement followed by balancing
+-    // (current method) to (weighted) balancing before refinement.
+     maxLocalCells 10000000;
+-
+-    // Overall cell limit (approximately). Refinement will stop immediately
+-    // upon reaching this number so a refinement level might not complete.
+-    // Note that this is the number of cells before removing the part which
+-    // is not 'visible' from the keepPoint. The final number of cells might
+-    // actually be a lot less.
+     maxGlobalCells 200000000;
+-
+-    // The surface refinement loop might spend lots of iterations refining just a
+-    // few cells. This setting will cause refinement to stop if <= minimumRefine
+-    // are selected for refinement. Note: it will at least do one iteration
+-    // (unless the number of cells to refine is 0)
+     minRefinementCells 2;
+-
+     maxLoadUnBalance 0.1;
+-
+-    // Number of buffer layers between different levels.
+-    // 1 means normal 2:1 refinement restriction, larger means slower
+-    // refinement.
+     nCellsBetweenLevels 2;
+-
+-    resolveFeatureAngle 30;
+-    allowFreeStandingZoneFaces false;
+-
+     features
+     (
+-        {
+-            file  "L_Wall.extendedFeatureEdgeMesh";
+-            level 0;
+-        }
++        { file "obs0_L_Wall.extendedFeatureEdgeMesh"; level 1; }
+     );
+-
+     refinementSurfaces
+     {
+-        walls
+-        {
+-            level (0 0);
+-            patchInfo { type wall; }
+-        }
++        "obs0_L_Wall_stl" { level (1 2); patchInfo { type wall; } }
+     }
+-
+-
+     refinementRegions
+     {
++        chargeRefineOuter { mode inside; levels ((1 2)); }
+     }
+-
+-    locationInMesh (0 0 0.5);
++    resolveFeatureAngle 120;
++    locationInMesh (0.000000 0.000000 0.500000);
++    allowFreeStandingZoneFaces false;
+ }
+ 
+ snapControls
+ {
+-
+-    nSmoothPatch    3;
+-    tolerance       2.0;
+-    nSolveIter      100;
+-    nRelaxIter      5;
+-
+-    nFeatureSnapIter 10;
+-
+-    explicitFeatureSnap    true;
++    nSmoothPatch 3;
++    tolerance 1.0;
++    nSolveIter 100;
++    nRelaxIter 10;
++    nFeatureSnapIter 15;
++    implicitFeatureSnap true;
++    explicitFeatureSnap false;
+     multiRegionFeatureSnap false;
+-    implicitFeatureSnap    false;
+ }
+ 
+ addLayersControls
+ {
+-    featureAngle              100;
+-    slipFeatureAngle          30;
+-
+-    nLayerIter                50;
+-    nRelaxedIter              20;
+-    nRelaxIter                5;
+-
+-    nGrow                     0;
+-
+-    nSmoothSurfaceNormals     1;
+-    nSmoothNormals            3;
+-    nSmoothThickness          10;
+-    maxFaceThicknessRatio     0.5;
++    featureAngle 100;
++    slipFeatureAngle 30;
++    nLayerIter 50;
++    nRelaxedIter 20;
++    nRelaxIter 5;
++    nGrow 0;
++    nSmoothSurfaceNormals 1;
++    nSmoothNormals 3;
++    nSmoothThickness 10;
++    maxFaceThicknessRatio 0.5;
+     maxThicknessToMedialRatio 0.3;
+-
+-    minMedialAxisAngle        90;
+-    nMedialAxisIter           10;
+-
+-    nBufferCellsNoExtrude     0;
+-    additionalReporting       false;
+-//    nSmoothDisplacement       0;
+-//    detectExtrusionIsland     false;
+-
+-    layers
+-    {
+-    }
+-
+-    relativeSizes       true;
+-    expansionRatio      1.2;
++    minMedialAxisAngle 90;
++    nBufferCellsNoExtrude 0;
++    layers {}
++    relativeSizes true;
++    expansionRatio 1.2;
+     finalLayerThickness 0.5;
+-    minThickness        1e-3;
++    minThickness 1e-3;
+ }
+-
+ meshQualityControls
+ {
+     maxNonOrtho 65;
+-
+     maxBoundarySkewness 20;
+-
+     maxInternalSkewness 4;
+-
+     maxConcave 80;
+-
+-    // Minimum cell pyramid volume; case dependent
+     minVol 1e-13;
+-
+-    //  1e-15 (small positive) to enable tracking
+-    // -1e+30 (large negative) for best layer insertion
+     minTetQuality 1e-15;
+-
+-    // if >0 : preserve single cells with all points on the surface if the
+-    // resulting volume after snapping (by approximation) is larger than
+-    // minVolCollapseRatio times old volume (i.e. not collapsed to flat cell).
+-    //  If <0 : delete always.
+-    //minVolCollapseRatio 0.5;
+-
+-    minArea          -1;
+-
+-    minTwist          0.02;
+-
+-    minDeterminant    0.001;
+-
+-    minFaceWeight     0.05;
+-
+-    minVolRatio       0.01;
+-
++    minArea -1;
++    minTwist 0.02;
++    minDeterminant 0.001;
++    minFaceWeight 0.05;
++    minVolRatio 0.01;
+     minTriangleTwist -1;
+-
+-    nSmoothScale   4;
+-
++    nSmoothScale 4;
+     errorReduction 0.75;
+-
+-    relaxed
+-    {
+-        maxNonOrtho   75;
+-    }
++    relaxed { maxNonOrtho 75; }
+ }
+-
+-writeFlags
+-(
+-    scalarLevels
+-    layerSets
+-    layerFields
+-//     mesh
+-//     noRefinement
+-);
+-// debugFlags
+-// (
+-//     layerInfo
+-// );
+-// outputFlags
+-// (
+-//     layerInfo
+-// );
+-// debug 1;
+ mergeTolerance 1e-6;
+-
+-// ************************************************************************* //
+=== system/surfaceFeaturesDict ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop/system/surfaceFeaturesDict	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI/system/surfaceFeaturesDict	2026-04-27 00:06:30.857634615 +0300
+@@ -1,8 +1,8 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+ | =========                 |                                                 |
+ | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+-|  \\    /   O peration     | Version:  5                                     |
+-|   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
+ |    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+@@ -11,25 +11,20 @@
+     format      ascii;
+     class       dictionary;
+     object      surfaceFeatureExtractDict;
++    location    "system";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
++
+ surfaces
+ (
+-    "L_Wall.stl"
++    "obs0_L_Wall.stl"
+ );
+ 
+-// Identify a feature when angle between faces < includedAngle
+ includedAngle   120;
+ 
+ subsetFeatures
+ {
+-    // Keep nonManifold edges (edges with >2 connected faces)
+-    nonManifoldEdges       yes;
+-
+-    // Keep open edges (edges with 1 connected face)
+-    openEdges       yes;
++    nonManifoldEdges yes;
++    openEdges yes;
+ }
+-
+-
+-// ************************************************************************* //
+=== constant/dynamicMeshDict ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop/constant/dynamicMeshDict	2026-01-18 20:29:45.436469083 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI/constant/dynamicMeshDict	2026-04-27 00:06:30.885634616 +0300
+@@ -1,9 +1,9 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+-  =========                 |
+-  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+-   \\    /   O peration     | Website:  https://openfoam.org
+-    \\  /    A nd           | Version:  dev
+-     \\/     M anipulation  |
++| =========                 |                                                 |
++| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
++|    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+ {
+@@ -11,40 +11,16 @@
+     format      ascii;
+     class       dictionary;
+     object      dynamicMeshDict;
++    location    "constant";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
++
+ dynamicFvMesh   adaptiveFvMesh;
+ errorEstimator  densityGradient;
+-
+-// protectedPatches (walls);
+-
+-// How often to refine
+ refineInterval  2;
+-
+-loadBalance
+-{
+-    balance yes;
+-    balanceInterval 10;
+-    allowableImbalance 0.15;
+-    method scotch;
+-}
+-
+-// Refine field in between lower..upper
+ lowerRefineLevel 0.1;
+-
+-// If value < unrefineLevel unrefine
+ unrefineLevel   0.1;
+-
+-// Have slower than 2:1 refinement
+ nBufferLayers   3;
+-
+-// Refine cells only up to maxRefinement levels
+ maxRefinement   2;
+-
+-// Stop refinement if maxCells reached
+-maxCells        10000000;
+-
+-// Write the refinement level as a volScalarField
+-dumpLevel       true;
+-// ************************************************************************* //
++dumpLevel      true;
+=== constant/phaseProperties ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop/constant/phaseProperties	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI/constant/phaseProperties	2026-04-27 00:06:30.889634616 +0300
+@@ -1,8 +1,8 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+ | =========                 |                                                 |
+ | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+-|  \\    /   O peration     | Version:  2.3.0                                 |
+-|   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
+ |    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+@@ -10,123 +10,52 @@
+     version     2.0;
+     format      ascii;
+     class       dictionary;
+-    location    "constant";
+     object      phaseProperties;
++    location    "constant";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
+-phases (c4 air);                // List of phases
+ 
++phases (c4 air);
+ c4
+ {
+     type detonating;
+     reactants
+     {
+-        thermoType
+-        {
+-            transport   const;
+-            thermo      eConst;
+-            equationOfState Murnaghan;
+-        }
+-        equationOfState
+-        {
+-            Gamma           0.25;
+-            pRef            101298;
+-            rho0            1601;
+-            K0              0;
+-        }
+-        specie
+-        {
+-            molWeight       55.0;
+-        }
+-        transport
+-        {
+-            mu              0;              // Viscosity
+-            Pr              1;              // Prandtl number
+-        }
+-        thermodynamics
+-        {
+-            Cv              1400;           // Heat capacity
+-            Hf              0.0;
+-        }
++        thermoType { transport const; thermo eConst; equationOfState BirchMurnaghan3; }
++        equationOfState { rho0 1601.0; Gamma 0.25; pRef 101298; K0 8.04e9; K0Prime 7.97; }
++        specie { molWeight 55.0; }
++        transport { mu 0; Pr 1; }
++        thermodynamics { Cv 1400; Hf 0.0; }
+     }
+     products
+     {
+-        thermoType
+-        {
+-            transport   const;
+-            thermo      eConst;
+-            equationOfState JWL;
+-        }
+-        equationOfState
+-        {
+-            rho0      1601;
+-            A         609.77e9;
+-            B         12.95e9;
+-            R1        4.50;
+-            R2        1.4;
+-            omega     0.25;
+-        }
+-        specie
+-        {
+-            molWeight       55.0;
+-        }
+-        transport
+-        {
+-            mu              0;              // Viscosity
+-            Pr              1;              // Prandtl number
+-        }
+-        thermodynamics
+-        {
+-            Cv              1400;           // Heat capacity
+-            Hf              0.0;
+-        }
++        thermoType { transport const; thermo ePolynomial; equationOfState JWL; }
++        equationOfState { rho0 1601.0; A 6.098e+11; B 1.295e+10; R1 4.5; R2 1.4; omega 0.25; }
++        specie { molWeight 55.0; }
++        transport { mu 0; Pr 1; }
++        thermodynamics { CvCoeffs<8> (413.15 2.1538 0 0 0 0 0 0); Sf 0.0; Hf 0.0; }
+     }
+-
+-    activationModel linear;
++    activationModel pressureBased;
+     initiation
+     {
+-        E0              9.0e9;   // detonation energy in units of pressure
+-        points     ((0 0 0.5));     // Detonation points
+-        vDet       7850;            // Detonation velocity [m/s]
+-        useCOM yes;                 // Overridden by the detonation points
++        E0 9000000000.0; I 4.0e6; a 0.0367; b 0.667; x 7.0; maxLambdaI 0.022;
++        G1 1.4997e-7; c 0.667; d 0.33; y 2.0; minLambda1 0.022;
++        G2 0.0; e 0.667; f 0.667; z 3.0; minLambda2 0.022;
++        pMin 101298.0;
++        useCOM yes;
++        radius 0.325;
++        vDet 7850;
+     }
+-
+-    residualRho     1e-6;           // Minimum density of the phase
+-    residualAlpha   1e-10;          // Minimum volume fraction used for division
++    residualRho 1e-6; residualAlpha 1e-6;
+ }
+-
+ air
+ {
+     type basic;
+-    thermoType
+-    {
+-        transport   const;
+-        thermo      eConst;
+-        equationOfState idealGas;
+-    }
+-    equationOfState
+-    {
+-        gamma           1.4;            // Heat capactiy ratio
+-    }
+-    specie
+-    {
+-        molWeight       28.97;
+-    }
+-    transport
+-    {
+-        mu              0;
+-        Pr              1;
+-    }
+-    thermodynamics
+-    {
+-        type        eConst;
+-        Cv          718;
+-        Hf          0;
+-    }
+-
+-    residualRho     1e-6;
+-    residualAlpha   1e-10;
++    thermoType { transport const; thermo eConst; equationOfState idealGas; }
++    equationOfState { gamma 1.4; }
++    specie { molWeight 28.97; }
++    transport { mu 0; Pr 1; }
++    thermodynamics { type eConst; Cv 718; Hf 0; }
++    residualRho 1e-6; residualAlpha 1e-6;
+ }
+-
+-// ************************************************************************* //
+=== 0/p.orig ===
+(missing on one side: orig=/home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop/0/p.orig new=/home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI/0/p.orig)
+=== 0/T.orig ===
+(missing on one side: orig=/home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop/0/T.orig new=/home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI/0/T.orig)
+=== 0/U.orig ===
+(missing on one side: orig=/home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop/0/U.orig new=/home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI/0/U.orig)
+=== 0/alpha.c4.orig ===
+(missing on one side: orig=/home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop/0/alpha.c4.orig new=/home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI/0/alpha.c4.orig)
+=== 0/rho.c4.orig ===
+(missing on one side: orig=/home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop/0/rho.c4.orig new=/home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI/0/rho.c4.orig)
+=== 0/rho.air.orig ===
+(missing on one side: orig=/home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/building3DWorkshop/0/rho.air.orig new=/home/naor/OpenFOAM/naor-9/run/Work/building3DWorkshop_GUI/0/rho.air.orig)

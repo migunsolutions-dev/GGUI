@@ -1,0 +1,648 @@
+=== Original  : /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField
+=== GUI rebuild: /home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI
+
+=== system/blockMeshDict ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField/system/blockMeshDict	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI/system/blockMeshDict	2026-04-27 00:06:31.065634623 +0300
+@@ -1,8 +1,8 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+ | =========                 |                                                 |
+ | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+-|  \\    /   O peration     | Version:  2.3.0                                 |
+-|   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
+ |    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+@@ -11,26 +11,28 @@
+     format      ascii;
+     class       dictionary;
+     object      blockMeshDict;
++    location    "system";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
+-convertToMeters 0.3048;
++
++convertToMeters 1;
+ 
+ vertices
+ (
+-    (  0.0  0.0     0.0) // bottom
+-    (  10.0 0.0     0.0)
+-    (  10.0 10.0    0.0)
+-    (  0.0  10.0    0.0)
+-    (  0.0  0.0     10.0) // top
+-    (  10.0 0.0     10.0)
+-    (  10.0 10.0    10.0)
+-    (  0.0  10.0    10.0)
++    (0.0 0.0 0.0)
++    (10.0 0.0 0.0)
++    (10.0 10.0 0.0)
++    (0.0 10.0 0.0)
++    (0.0 0.0 10.0)
++    (10.0 0.0 10.0)
++    (10.0 10.0 10.0)
++    (0.0 10.0 10.0)
+ );
+ 
+ blocks
+ (
+-	 hex (0 1 2 3 4 5 6 7) (10 10 10) simpleGrading (1 1 1)
++    hex (0 1 2 3 4 5 6 7) (10 10 10) simpleGrading (1 1 1)
+ );
+ 
+ edges
+@@ -39,49 +41,56 @@
+ 
+ boundary
+ (
+-
+-    ground
++    minX
+     {
+-        type wall;
++        type patch;
+         faces
+         (
+-            (0 1 2 3)
++            (0 4 7 3)
+         );
+     }
+-
+-    midPlane1
++    maxX
+     {
+-        type symmetry;
++        type patch;
+         faces
+         (
+-            (0 3 7 4)
++            (1 2 6 5)
+         );
+     }
+-    midPlane2
++    minY
+     {
+-        type symmetry;
++        type patch;
+         faces
+         (
+             (0 1 5 4)
+         );
+     }
+-
+-    outlet
++    maxY
++    {
++        type patch;
++        faces
++        (
++            (3 7 6 2)
++        );
++    }
++    minZ
++    {
++        type wall;
++        faces
++        (
++            (0 3 2 1)
++        );
++    }
++    maxZ
+     {
+         type patch;
+         faces
+         (
+-            (1 2 6 5)
+-            (3 2 6 7)
+-
+             (4 5 6 7)
+         );
+     }
+-
+ );
+ 
+ mergePatchPairs
+ (
+ );
+-
+-// ************************************************************************* //
+=== system/controlDict ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField/system/controlDict	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI/system/controlDict	2026-04-27 00:06:31.101634625 +0300
+@@ -1,8 +1,8 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+ | =========                 |                                                 |
+ | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+-|  \\    /   O peration     | Version:  2.3.0                                 |
+-|   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
+ |    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+@@ -10,45 +10,37 @@
+     version     2.0;
+     format      ascii;
+     class       dictionary;
+-    location    "system";
+     object      controlDict;
++    location    "system";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
++
+ application     blastFoam;
+ 
+ startFrom       startTime;
+-
+ startTime       0;
+-
+ stopAt          endTime;
+-
+ endTime         0.0005;
+ 
+-deltaT          1e-7;
++deltaT          1e-07;
++adjustTimeStep  yes;
++maxCo            0.5;
++maxDeltaT       1;
+ 
+ writeControl    adjustableRunTime;
+-
+-writeInterval   1e-5;
+-
++writeInterval   1e-05;
+ cycleWrite      0;
++purgeWrite      0;
+ 
+ writeFormat     ascii;
+-
+ writePrecision  6;
+-
+ writeCompression off;
+ 
+ timeFormat      general;
+-
+ timePrecision   12;
+-
+ runTimeModifiable true;
+ 
+-adjustTimeStep  yes;
+-
+-maxCo           0.5;
+-
+-maxDeltaT       1;
++// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
+-// ************************************************************************* //
++// ************************************************************************* //
+\ No newline at end of file
+=== system/setFieldsDict ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField/system/setFieldsDict	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI/system/setFieldsDict	2026-04-27 00:06:31.097634625 +0300
+@@ -1,8 +1,8 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+ | =========                 |                                                 |
+ | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+-|  \\    /   O peration     | Version:  2.3.0                                 |
+-|   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
+ |    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+@@ -10,34 +10,14 @@
+     version     2.0;
+     format      ascii;
+     class       dictionary;
+-    location    "system";
+     object      setFieldsDict;
++    location    "system";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
++
+ fields (alpha.c4);
+ nBufferLayers 1;
+ 
+-defaultFieldValues
+-(
+-    volScalarFieldValue alpha.c4 0
+-);
+-
+-
+-regions
+-(
+-    boxToCell
+-    {
+-        box (0 0 0) (0.5 0.25 0.25);
+-        refineInternal yes;
+-        level 4;
+-
+-        fieldValues
+-        (
+-            volScalarFieldValue alpha.c4    1
+-        );
+-    }
+-);
+-
+-
+-// ************************************************************************* //
++defaultFieldValues ( volScalarFieldValue alpha.c4 0 );
++regions ( boxToCell { box (-0.124974 -0.124974 0.375026) (0.124974 0.124974 0.624974); refineInternal yes; level 4; fieldValues ( volScalarFieldValue alpha.c4 1 ); } );
+=== system/fvSchemes ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField/system/fvSchemes	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI/system/fvSchemes	2026-04-27 00:06:31.105634625 +0300
+@@ -1,8 +1,8 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+ | =========                 |                                                 |
+ | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+-|  \\    /   O peration     | Version:  2.3.0                                 |
+-|   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
+ |    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+@@ -10,52 +10,16 @@
+     version     2.0;
+     format      ascii;
+     class       dictionary;
+-    location    "system";
+     object      fvSchemes;
++    location    "system";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
+-fluxScheme      Kurganov;
+-
+-ddtSchemes
+-{
+-    default         Euler;
+-    timeIntegrator  RK2SSP;
+-}
+-
+-gradSchemes
+-{
+-    default         cellMDLimited leastSquares 1.0;
+-}
+-
+-divSchemes
+-{
+-    default         none;
+-    div(alphaRhoPhi.c4,lambda.c4) Riemann;
+-}
+-
+-laplacianSchemes
+-{
+-    default         Gauss linear corrected;
+-}
+-
+-interpolationSchemes
+-{
+-    default             cubic;
+-    reconstruct(alpha)  vanAlbada;
+-    reconstruct(rho)    vanAlbada;
+-    reconstruct(U)      vanAlbadaV;
+-    reconstruct(e)      vanAlbada;
+-    reconstruct(p)      vanAlbada;
+-    reconstruct(speedOfSound)      vanAlbada;
+-
+-    reconstruct(lambda.c4) vanAlbada;
+-}
+-
+-snGradSchemes
+-{
+-    default         corrected;
+-}
+-
+ 
+-// ************************************************************************* //
++fluxScheme Kurganov;
++ddtSchemes { default Euler; timeIntegrator RK2SSP 3; }
++gradSchemes { default cellMDLimited leastSquares 1.0; }
++divSchemes { default none; div(alphaRhoPhi.c4,lambda.c4) Riemann; }
++laplacianSchemes { default Gauss linear corrected; }
++interpolationSchemes { default linear; reconstruct(alpha) quadraticMUSCL Minmod; reconstruct(rho) quadraticMUSCL Minmod; reconstruct(U) quadraticMUSCL Minmod; reconstruct(e) quadraticMUSCL Minmod; reconstruct(p) quadraticMUSCL Minmod; reconstruct(speedOfSound) quadraticMUSCL Minmod; reconstruct(lambda.c4) quadraticMUSCL Minmod; }
++snGradSchemes { default corrected; }
+=== system/fvSolution ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField/system/fvSolution	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI/system/fvSolution	2026-04-27 00:06:31.101634625 +0300
+@@ -1,8 +1,8 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+ | =========                 |                                                 |
+ | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+-|  \\    /   O peration     | Version:  2.3.0                                 |
+-|   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
+ |    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+@@ -10,18 +10,10 @@
+     version     2.0;
+     format      ascii;
+     class       dictionary;
+-    location    "system";
+     object      fvSolution;
++    location    "system";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
+-solvers
+-{
+-    "(rho|rhoU|rhoE|alpha|.*)"
+-    {
+-        solver          diagonal;
+-    }
+-}
+-
+ 
+-// ************************************************************************* //
++solvers { "(rho|rhoU|rhoE|alpha|.*)" { solver diagonal; } }
+=== system/decomposeParDict ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField/system/decomposeParDict	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI/system/decomposeParDict	2026-04-27 00:06:31.109634625 +0300
+@@ -1,8 +1,8 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+ | =========                 |                                                 |
+ | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+-|  \\    /   O peration     | Version:  2.3.0                                 |
+-|   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
+ |    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+@@ -10,19 +10,18 @@
+     version     2.0;
+     format      ascii;
+     class       dictionary;
+-    location    "system";
+     object      decomposeParDict;
++    location    "system";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
+-numberOfSubdomains 4; // 8; // this is number of proc
++numberOfSubdomains 4;
+ 
++method         scotch;
+ 
+-method         scotch; // automatic
+-
+-simpleCoeffs // not auto
++simpleCoeffs
+ {
+-    n               ( 4 1 1 );
++    n               ( 2 2 1 );
+     delta           0.001;
+ }
+ 
+@@ -30,5 +29,4 @@
+ 
+ roots           ( );
+ 
+-
+ // ************************************************************************* //
+=== system/snappyHexMeshDict ===
+(missing on one side: orig=/home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField/system/snappyHexMeshDict new=/home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI/system/snappyHexMeshDict)
+=== system/surfaceFeaturesDict ===
+(missing on one side: orig=/home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField/system/surfaceFeaturesDict new=/home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI/system/surfaceFeaturesDict)
+=== constant/dynamicMeshDict ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField/constant/dynamicMeshDict	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI/constant/dynamicMeshDict	2026-04-27 00:06:31.089634624 +0300
+@@ -1,9 +1,9 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+-  =========                 |
+-  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+-   \\    /   O peration     | Website:  https://openfoam.org
+-    \\  /    A nd           | Version:  dev
+-     \\/     M anipulation  |
++| =========                 |                                                 |
++| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
++|    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+ {
+@@ -11,30 +11,16 @@
+     format      ascii;
+     class       dictionary;
+     object      dynamicMeshDict;
++    location    "constant";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
++
+ dynamicFvMesh   adaptiveFvMesh;
+ errorEstimator  densityGradient;
+-
+-// When can unrefinement start
+-beginUnrefine 1e-5;
+-
+-// How often to refine
+ refineInterval  3;
+-
+-// Refine field in between lower..upper
+ lowerRefineLevel 0.1;
+-
+-// If value < unrefineLevel unrefine
+ unrefineLevel   0.1;
+-
+-// Have slower than 2:1 refinement
+ nBufferLayers   3;
+-
+-// Refine cells only up to maxRefinement levels
+ maxRefinement   3;
+-
+-// Write the refinement level as a volScalarField
+-dumpLevel       true;
+-// ************************************************************************* //
++dumpLevel      true;
+=== constant/phaseProperties ===
+--- /home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField/constant/phaseProperties	2026-01-18 20:29:45.440469081 +0200
++++ /home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI/constant/phaseProperties	2026-04-27 00:06:31.093634624 +0300
+@@ -1,8 +1,8 @@
+ /*--------------------------------*- C++ -*----------------------------------*\
+ | =========                 |                                                 |
+ | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+-|  \\    /   O peration     | Version:  2.3.0                                 |
+-|   \\  /    A nd           | Web:      www.OpenFOAM.org                      |
++|  \\    /   O peration     |                                                 |
++|   \\  /    A nd           |                                                 |
+ |    \\/     M anipulation  |                                                 |
+ \*---------------------------------------------------------------------------*/
+ FoamFile
+@@ -10,128 +10,52 @@
+     version     2.0;
+     format      ascii;
+     class       dictionary;
+-    location    "constant";
+     object      phaseProperties;
++    location    "constant";
+ }
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
+-phases (c4 air);
+-
+-radiationModel none;
+ 
++phases (c4 air);
+ c4
+ {
+     type detonating;
+     reactants
+     {
+-        thermoType
+-        {
+-            transport   const;
+-            thermo      eConst;
+-            equationOfState Murnaghan;
+-        }
+-        equationOfState
+-        {
+-            Gamma           0.25;
+-            pRef            101298;
+-            rho0            1601;
+-            K0              0.0;
+-        }
+-        specie
+-        {
+-            molWeight       55.0;
+-        }
+-        transport
+-        {
+-            mu              0;              // Viscosity
+-            Pr              1;              // Prandtl number
+-        }
+-        thermodynamics
+-        {
+-            Cv              815;           // Heat capacity
+-            Hf              0.0;
+-        }
++        thermoType { transport const; thermo eConst; equationOfState BirchMurnaghan3; }
++        equationOfState { rho0 1601.0; Gamma 0.25; pRef 101298; K0 8.04e9; K0Prime 7.97; }
++        specie { molWeight 55.0; }
++        transport { mu 0; Pr 1; }
++        thermodynamics { Cv 1400; Hf 0.0; }
+     }
+     products
+     {
+-        thermoType
+-        {
+-            transport   const;
+-            thermo      eConst;
+-            equationOfState JWL;
+-        }
+-        equationOfState
+-        {
+-            rho0      1601;
+-            A         609.77e9;
+-            B         12.95e9;
+-            R1        4.50;
+-            R2        1.4;
+-            omega     0.25;
+-        }
+-        specie
+-        {
+-            molWeight       55.0;
+-        }
+-        transport
+-        {
+-            mu              0;              // Viscosity
+-            Pr              1;              // Prandtl number
+-        }
+-        thermodynamics
+-        {
+-            Cv              1400;           // Heat capacity
+-            Hf              0.0;
+-        }
++        thermoType { transport const; thermo ePolynomial; equationOfState JWL; }
++        equationOfState { rho0 1601.0; A 6.098e+11; B 1.295e+10; R1 4.5; R2 1.4; omega 0.25; }
++        specie { molWeight 55.0; }
++        transport { mu 0; Pr 1; }
++        thermodynamics { CvCoeffs<8> (413.15 2.1538 0 0 0 0 0 0); Sf 0.0; Hf 0.0; }
+     }
+-
+-    activationModel linear;
++    activationModel pressureBased;
+     initiation
+     {
+-        E0          9.0e9;
+-        points
+-        (
+-            (0.125 0.125 0.125)
+-            (0.375 0.125 0.125)
+-        );
+-        vDet       7850;
++        E0 9000000000.0; I 4.0e6; a 0.0367; b 0.667; x 7.0; maxLambdaI 0.022;
++        G1 1.4997e-7; c 0.667; d 0.33; y 2.0; minLambda1 0.022;
++        G2 0.0; e 0.667; f 0.667; z 3.0; minLambda2 0.022;
++        pMin 101298.0;
++        useCOM yes;
++        radius 0.375;
++        vDet 7850;
+     }
+-
+-    residualRho     1e-6;           // Minimum density of the phase
+-    residualAlpha   1e-10;          // Minimum volume fraction used for division
++    residualRho 1e-6; residualAlpha 1e-6;
+ }
+-
+ air
+ {
+     type basic;
+-    thermoType
+-    {
+-        transport   const;
+-        thermo      eConst;
+-        equationOfState idealGas;
+-    }
+-    equationOfState
+-    {
+-        gamma           1.4;            // Heat capactiy ratio
+-    }
+-    specie
+-    {
+-        molWeight       28.97;
+-    }
+-    transport
+-    {
+-        mu              0;
+-        Pr              1;
+-    }
+-    thermodynamics
+-    {
+-        type        eConst;
+-        Cv          718;
+-        Hf          0;
+-    }
+-
+-    residualRho     1e-6;
+-    residualAlpha   1e-10;
++    thermoType { transport const; thermo eConst; equationOfState idealGas; }
++    equationOfState { gamma 1.4; }
++    specie { molWeight 28.97; }
++    transport { mu 0; Pr 1; }
++    thermodynamics { type eConst; Cv 718; Hf 0; }
++    residualRho 1e-6; residualAlpha 1e-6;
+ }
+-
+-// ************************************************************************* //
+=== 0/p.orig ===
+(missing on one side: orig=/home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField/0/p.orig new=/home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI/0/p.orig)
+=== 0/T.orig ===
+(missing on one side: orig=/home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField/0/T.orig new=/home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI/0/T.orig)
+=== 0/U.orig ===
+(missing on one side: orig=/home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField/0/U.orig new=/home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI/0/U.orig)
+=== 0/alpha.c4.orig ===
+(missing on one side: orig=/home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField/0/alpha.c4.orig new=/home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI/0/alpha.c4.orig)
+=== 0/rho.c4.orig ===
+(missing on one side: orig=/home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField/0/rho.c4.orig new=/home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI/0/rho.c4.orig)
+=== 0/rho.air.orig ===
+(missing on one side: orig=/home/naor/OpenFOAM/naor-9/run/blastfoam/tutorials/blastFoam/freeField/0/rho.air.orig new=/home/naor/OpenFOAM/naor-9/run/Work/freeField_GUI/0/rho.air.orig)

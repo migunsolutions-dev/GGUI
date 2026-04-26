@@ -1,0 +1,26 @@
+==== Cloning GUI case ====
+==== decomposeParDict after patch ====
+numberOfSubdomains 4;
+method         scotch;
+==== Pipeline ====
+  surfaceFeatures: .149167068 s
+  blockMesh:       .069333408 s
+  snappyHexMesh:   .686732344 s
+  addEmptyPatch:   .195939214 s
+  setRefinedFields:1.160651655 s (incl. changeDict + checkMesh)
+  decomposePar:    .500678871 s
+==== blastFoam (parallel, 4 cores, GUI-generated dicts) ====
+  blastFoam:       70.849942412 s
+==== Total: 73.618798802 s ====
+
+==== blastFoam log final markers ====
+Time = 0.000590909090909
+ExecutionTime = 69.73 s  ClockTime = 70 s
+Time = 0.000593181818182
+ExecutionTime = 69.85 s  ClockTime = 70 s
+Time = 0.000595454545455
+ExecutionTime = 69.96 s  ClockTime = 70 s
+Time = 0.000597727272727
+ExecutionTime = 70.19 s  ClockTime = 70 s
+Time = 0.0006
+ExecutionTime = 70.37 s  ClockTime = 70 s
