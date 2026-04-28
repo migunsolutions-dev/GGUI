@@ -108,6 +108,7 @@ class CaseInputs3D:
     obstacle_refine_max: Optional[int] = None     # None = use refine_max
     charge_refinement_level: int = 0  # setRefinedFields level; 0 = use setFields
     charge_backup_radius_factor: float = 1.0  # backup radius = factor * charge radius (setRefinedFields)
+    charge_backup_length_override: Optional[float] = None  # absolute backup axial length for cylinder setRefinedFields
     outside_extent: Optional[float] = None    # [m] thickness of outside pre-refinement region; None/0 = use bubble_radius_factor
     
     # --- Charge Geometry (optional, with defaults) ---

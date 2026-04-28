@@ -494,6 +494,7 @@ class TabGeneral3D(QWidget):
         # backup.radius = factor * charge_radius. Larger value -> more robust seeding on
         # coarse base meshes, but seeds field into a larger volume around the charge.
         self._bubble_radius_factor = 1.5
+        self._charge_backup_length_override = None
         # Run-mode tradeoffs (default: FAST). Both default OFF so a fresh run is as
         # fast as building3D's hand-tuned Allrun. Loaders flip them ON when an
         # opened case explicitly contains the corresponding constructs.
@@ -1248,7 +1249,7 @@ class TabGeneral3D(QWidget):
         grp_run = QGroupBox("Run mode (speed vs verification)")
         f_run = QFormLayout(grp_run)
         chk_post_proc = QCheckBox()
-        chk_post_proc.setChecked(getattr(self, "_enable_post_processing", False))
+        chk_post_proc.setChecked(bool(getattr(self, "_enable_post_processing", False)))
         chk_post_proc.setToolTip(
             "Add controlDict 'functions { impulse; overpressure; fieldMinMax; }'.\n"
             "Useful for downstream analysis (max overpressure, impulse fields), but\n"
@@ -1257,7 +1258,7 @@ class TabGeneral3D(QWidget):
         f_run.addRow("Write impulse / overpressure / fieldMinMax", chk_post_proc)
         f_run.addRow("", QLabel("OFF = building3D-style fast solver (no postProcess at writeTime).\nON = adds 'functions {...}' block; useful for analysis but slower."))
         chk_fast = QCheckBox()
-        chk_fast.setChecked(getattr(self, "_fast_run_mode", True))
+        chk_fast.setChecked(bool(getattr(self, "_fast_run_mode", True)))
         chk_fast.setToolTip(
             "Fast Allrun: skip optional verification (stage_check / log.stageVerification\n"
             "/ checkMesh / check_internal_patch). check_alpha_c4.sh still gates the\n"
@@ -1268,41 +1269,31 @@ class TabGeneral3D(QWidget):
         f_run.addRow("", QLabel("ON = ~5-8 s saved per run (no stage_check tee, no checkMesh).\nOFF = full stage logs in log.stageVerification (debugging mode)."))
         v.addWidget(grp_run)
 
-        # Group: Dyn Refine (AMR) – Advanced
-        grp_amr = QGroupBox("Dyn Refine (AMR) – Advanced")
+        # Group: Dyn Refine (AMR) – only core controls
+        grp_amr = QGroupBox("Dyn Refine (AMR)")
         f_amr = QFormLayout(grp_amr)
         spin_ref_int = QSpinBox()
         spin_ref_int.setRange(1, 100)
         spin_ref_int.setValue(self._refine_interval)
-        f_amr.addRow("Refine interval", spin_ref_int)
+        f_amr.addRow("Refine Interval", spin_ref_int)
         f_amr.addRow("", QLabel("How often to refine (building3D: 3)."))
         spin_lower = QDoubleSpinBox()
         spin_lower.setRange(0.01, 1.0)
         spin_lower.setValue(self._lower_refine_threshold)
         spin_lower.setDecimals(3)
-        f_amr.addRow("Refine threshold", spin_lower)
+        f_amr.addRow("Refine Threshold", spin_lower)
         f_amr.addRow("", QLabel("lowerRefineLevel: refine field in range (building3D: 0.1)."))
         spin_unref = QDoubleSpinBox()
         spin_unref.setRange(0.01, 20.0)
         spin_unref.setValue(self._unrefine_threshold)
         spin_unref.setDecimals(3)
-        f_amr.addRow("Unrefine threshold", spin_unref)
+        f_amr.addRow("Unrefine Threshold", spin_unref)
         f_amr.addRow("", QLabel("unrefineLevel: if value &lt; this, unrefine (building3D: 0.1)."))
-        spin_buf = QSpinBox()
-        spin_buf.setRange(0, 10)
-        spin_buf.setValue(self._n_buffer_layers_dynamic)
-        f_amr.addRow("Buffer layers", spin_buf)
-        f_amr.addRow("", QLabel("nBufferLayers: slower than 2:1 refinement (building3D: 2)."))
-        le_indicator = QComboBox()
-        le_indicator.setEditable(True)
-        le_indicator.addItems(["densityGradient"])
-        le_indicator.setCurrentText(getattr(self, "_refine_indicator_field", "densityGradient"))
-        f_amr.addRow("Refine indicator field", le_indicator)
-        f_amr.addRow("", QLabel("errorEstimator field (building3D: densityGradient)."))
-        chk_bal = QCheckBox()
-        chk_bal.setChecked(self._enable_balancing)
-        f_amr.addRow("Load balancing", chk_bal)
-        f_amr.addRow("", QLabel("enableBalancing (building3D: not set)."))
+        spin_amr_max = QSpinBox()
+        spin_amr_max.setRange(0, 10)
+        spin_amr_max.setValue(int(getattr(self, "_dyn_refine_max", self.spin_refine_max.value())))
+        f_amr.addRow("Max Refinement (AMR)", spin_amr_max)
+        f_amr.addRow("", QLabel("maxRefinement in dynamicMeshDict (building3D: 1)."))
         v.addWidget(grp_amr)
 
         # Group: Obstacle refine – Advanced
@@ -1476,9 +1467,8 @@ class TabGeneral3D(QWidget):
             self._refine_interval = spin_ref_int.value()
             self._lower_refine_threshold = spin_lower.value()
             self._unrefine_threshold = spin_unref.value()
-            self._n_buffer_layers_dynamic = spin_buf.value()
-            self._refine_indicator_field = le_indicator.currentText().strip() or "densityGradient"
-            self._enable_balancing = chk_bal.isChecked()
+            self._dyn_refine_max = spin_amr_max.value()
+            self.spin_refine_max.setValue(self._dyn_refine_max)
             self._obstacle_feature_angle = spin_fa.value()
             self._obstacle_cells_between_levels = spin_cbl.value()
             self._obstacle_snap_iter = spin_snap.value()
@@ -2348,44 +2338,83 @@ class TabGeneral3D(QWidget):
                     self._decomposition_simple_n = (int(n[0]), int(n[1]), int(n[2]))
             if "decomposition_simple_delta" in data and data["decomposition_simple_delta"] is not None:
                 self._decomposition_simple_delta = float(data["decomposition_simple_delta"])
-            for mk, attr in (
-                ("mesh_included_angle", "_mesh_included_angle"),
-                ("mesh_n_smooth_patch", "_mesh_n_smooth_patch"),
-                ("mesh_snap_tolerance", "_mesh_snap_tolerance"),
-                ("mesh_n_solve_iter", "_mesh_n_solve_iter"),
-                ("mesh_n_relax_iter", "_mesh_n_relax_iter"),
-                ("mesh_n_feature_snap_iter", "_mesh_n_feature_snap_iter"),
-                ("mesh_explicit_feature_snap", "_mesh_explicit_feature_snap"),
-                ("mesh_implicit_feature_snap", "_mesh_implicit_feature_snap"),
-                ("mesh_multi_region_feature_snap", "_mesh_multi_region_feature_snap"),
-                ("mesh_n_cells_between_levels", "_mesh_n_cells_between_levels"),
-                ("mesh_resolve_feature_angle", "_mesh_resolve_feature_angle"),
-                ("mesh_max_non_ortho", "_mesh_max_non_ortho"),
-                ("mesh_max_boundary_skewness", "_mesh_max_boundary_skewness"),
-                ("mesh_max_internal_skewness", "_mesh_max_internal_skewness"),
-                ("mesh_max_concave", "_mesh_max_concave"),
-                ("mesh_min_vol", "_mesh_min_vol"),
-                ("mesh_min_tet_quality", "_mesh_min_tet_quality"),
-                ("mesh_min_twist", "_mesh_min_twist"),
-                ("mesh_min_determinant", "_mesh_min_determinant"),
-                ("mesh_min_face_weight", "_mesh_min_face_weight"),
-                ("mesh_min_vol_ratio", "_mesh_min_vol_ratio"),
-                ("mesh_n_smooth_scale", "_mesh_n_smooth_scale"),
-                ("mesh_error_reduction", "_mesh_error_reduction"),
-                ("mesh_relaxed_max_non_ortho", "_mesh_relaxed_max_non_ortho"),
-            ):
-                if mk in data and data[mk] is not None:
-                    setattr(self, attr, data[mk])
+            mesh_int_keys = {
+                "mesh_included_angle",
+                "mesh_n_smooth_patch",
+                "mesh_n_solve_iter",
+                "mesh_n_relax_iter",
+                "mesh_n_feature_snap_iter",
+                "mesh_n_cells_between_levels",
+                "mesh_resolve_feature_angle",
+                "mesh_n_smooth_scale",
+            }
+            mesh_bool_keys = {
+                "mesh_explicit_feature_snap",
+                "mesh_implicit_feature_snap",
+                "mesh_multi_region_feature_snap",
+            }
+            mesh_attr_map = {
+                "mesh_included_angle": "_mesh_included_angle",
+                "mesh_n_smooth_patch": "_mesh_n_smooth_patch",
+                "mesh_snap_tolerance": "_mesh_snap_tolerance",
+                "mesh_n_solve_iter": "_mesh_n_solve_iter",
+                "mesh_n_relax_iter": "_mesh_n_relax_iter",
+                "mesh_n_feature_snap_iter": "_mesh_n_feature_snap_iter",
+                "mesh_explicit_feature_snap": "_mesh_explicit_feature_snap",
+                "mesh_implicit_feature_snap": "_mesh_implicit_feature_snap",
+                "mesh_multi_region_feature_snap": "_mesh_multi_region_feature_snap",
+                "mesh_n_cells_between_levels": "_mesh_n_cells_between_levels",
+                "mesh_resolve_feature_angle": "_mesh_resolve_feature_angle",
+                "mesh_max_non_ortho": "_mesh_max_non_ortho",
+                "mesh_max_boundary_skewness": "_mesh_max_boundary_skewness",
+                "mesh_max_internal_skewness": "_mesh_max_internal_skewness",
+                "mesh_max_concave": "_mesh_max_concave",
+                "mesh_min_vol": "_mesh_min_vol",
+                "mesh_min_tet_quality": "_mesh_min_tet_quality",
+                "mesh_min_twist": "_mesh_min_twist",
+                "mesh_min_determinant": "_mesh_min_determinant",
+                "mesh_min_face_weight": "_mesh_min_face_weight",
+                "mesh_min_vol_ratio": "_mesh_min_vol_ratio",
+                "mesh_n_smooth_scale": "_mesh_n_smooth_scale",
+                "mesh_error_reduction": "_mesh_error_reduction",
+                "mesh_relaxed_max_non_ortho": "_mesh_relaxed_max_non_ortho",
+            }
+            for mk, attr in mesh_attr_map.items():
+                if mk not in data or data[mk] is None:
+                    continue
+                raw = data[mk]
+                try:
+                    if mk in mesh_bool_keys:
+                        if isinstance(raw, str):
+                            val = raw.strip().lower() in ("1", "true", "yes", "on")
+                        else:
+                            val = bool(raw)
+                    elif mk in mesh_int_keys:
+                        val = int(float(raw))
+                    else:
+                        val = float(raw)
+                except (TypeError, ValueError):
+                    # Ignore malformed values from imported cases and keep current defaults.
+                    continue
+                setattr(self, attr, val)
             if "charge_refinement_level" in data:
                 self.spin_charge_refine.setValue(data["charge_refinement_level"])
-            if "charge_outer_refine_min" in data:
-                self.spin_charge_outer_min.setValue(data["charge_outer_refine_min"])
+            has_outside = any(
+                k in data for k in ("charge_outer_refine_min", "charge_outer_refine_max", "charge_outer_refine_enable")
+            )
+            if has_outside:
+                if "charge_outer_refine_min" in data:
+                    self.spin_charge_outer_min.setValue(data["charge_outer_refine_min"])
+                else:
+                    self.spin_charge_outer_min.setValue(0)
+                if "charge_outer_refine_max" in data:
+                    self.spin_charge_outer_max.setValue(data["charge_outer_refine_max"])
+                else:
+                    self.spin_charge_outer_max.setValue(0)
             else:
-                self.spin_charge_outer_min.setValue(self.spin_refine_min.value())
-            if "charge_outer_refine_max" in data:
-                self.spin_charge_outer_max.setValue(data["charge_outer_refine_max"])
-            else:
-                self.spin_charge_outer_max.setValue(self.spin_refine_max.value())
+                # Explicit load rule: when outside is not defined in file, keep 0/0.
+                self.spin_charge_outer_min.setValue(0)
+                self.spin_charge_outer_max.setValue(0)
             if data.get("charge_outer_refine_enable") is False:
                 self.spin_charge_outer_min.setValue(0)
                 self.spin_charge_outer_max.setValue(0)
@@ -2398,6 +2427,11 @@ class TabGeneral3D(QWidget):
                 self._bubble_radius_factor = float(data["charge_backup_radius_factor"])
             if "bubble_radius_factor" in data:
                 self._bubble_radius_factor = float(data["bubble_radius_factor"])
+            if "charge_backup_length_override" in data and data["charge_backup_length_override"] is not None:
+                try:
+                    self._charge_backup_length_override = float(data["charge_backup_length_override"])
+                except (TypeError, ValueError):
+                    self._charge_backup_length_override = None
             if "buffer_layers" in data:
                 self._buffer_layers = int(data["buffer_layers"])
             # Run-mode tradeoffs: load if loader detected them, otherwise leave fast defaults.
@@ -2528,6 +2562,7 @@ class TabGeneral3D(QWidget):
             transition_cells=transition_cells,
             use_seed_bubble=(refine and self.spin_charge_refine.value() > 0),
             charge_backup_radius_factor=self.spin_backup_factor.value(),
+            charge_backup_length_override=getattr(self, "_charge_backup_length_override", None),
             charge_aspect=self.c_aspect.value(),
             charge_length=self.c_length.value(),
             charge_width=self.c_width.value(),
@@ -2546,7 +2581,7 @@ class TabGeneral3D(QWidget):
             bubble_radius_factor=getattr(self, "_bubble_radius_factor", 1.5),
             enable_post_processing=getattr(self, "_enable_post_processing", False),
             fast_run_mode=getattr(self, "_fast_run_mode", True),
-            enable_balancing=getattr(self, "_enable_balancing", False),
+            enable_balancing=bool(getattr(self, "_enable_balancing", False)),
             dynamic_max_cells=getattr(self, "_dynamic_max_cells", 200000000),
             refine_indicator_field=getattr(self, "_refine_indicator_field", "densityGradient"),
             obstacle_feature_angle=getattr(self, "_obstacle_feature_angle", 120),

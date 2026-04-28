@@ -333,15 +333,18 @@ def _parse_setFieldsDict(case_dir: str, out: Dict[str, Any]) -> None:
             out["cylinder_axis"] = "Y"
         elif abs(dvec[2] - 1) < t and abs(dvec[0]) < t and abs(dvec[1]) < t:
             out["cylinder_axis"] = "Z"
-    # Backup geometry: radius (only use as fallback if main radius not found)
+    # Backup geometry: radius + axial length vector L
     backup = _find_block(regions, "backup")
     if backup:
         v = _scalar(backup, "radius")
         if v is not None and "charge_radius" not in out:  # <-- FIX: don't overwrite main radius
             out["charge_radius"] = v
-        v = _scalar(backup, "L")
-        if v is not None:
-            out["charge_length"] = v
+        lvec = _vector3(backup, "L")
+        if lvec is not None:
+            # backup L in setFieldsDict is a vector aligned with cylinder axis.
+            # Preserve the absolute entered value so regeneration can keep it.
+            backup_len_abs = math.sqrt(lvec[0] ** 2 + lvec[1] ** 2 + lvec[2] ** 2)
+            out["charge_backup_length_override"] = backup_len_abs
     # Charge refinement level (setRefinedFields)
     iv = _int_val(regions, "level")
     if iv is not None:
@@ -369,6 +372,21 @@ def _parse_setFieldsDict(case_dir: str, out: Dict[str, Any]) -> None:
                         # Store computed main radius if not already set
                         if "charge_radius" not in out or out["charge_radius"] == backup_rad:
                             out["charge_radius"] = main_r
+                        # Compare loaded backup-L against our automatic policy:
+                        # backup_len = max(charge_length, charge_diameter).
+                        backup_len_loaded = out.get("charge_backup_length_override")
+                        if backup_len_loaded is not None:
+                            charge_len = 2.0 * main_r * lbyd
+                            auto_backup_len = max(charge_len, 2.0 * main_r)
+                            delta = abs(float(backup_len_loaded) - auto_backup_len)
+                            tol = max(1e-3, 0.02 * max(abs(auto_backup_len), 1.0))
+                            if delta > tol:
+                                notes = out.setdefault("_load_notes", [])
+                                notes.append(
+                                    "Cylinder backup length from file differs from auto policy: "
+                                    f"loaded={float(backup_len_loaded):.6g}, "
+                                    f"auto(max(length,diameter))={auto_backup_len:.6g}."
+                                )
 
 
 def _parse_phaseProperties(case_dir: str, out: Dict[str, Any]) -> None:
@@ -478,7 +496,6 @@ def _parse_dynamicMeshDict(case_dir: str, out: Dict[str, Any]) -> None:
     v = _int_val(text, "maxRefinement")
     if v is not None:
         out["refine_max"] = v
-        out["charge_outer_refine_max"] = v
         out["dyn_refine_max"] = v
     v = _int_val(text, "refineInterval")
     if v is not None:
@@ -539,6 +556,31 @@ def _parse_snappyHexMeshDict(case_dir: str, out: Dict[str, Any]) -> None:
 
     if stl_files:
         out["stl_obstacles"] = stl_files
+
+    # Charge outer refinement (if present) from refinementRegions.
+    # If not present, default to disabled (0/0) so loading preserves
+    # "no static outer ring" behavior from reference cases.
+    ref_regions = _find_block(text, "refinementRegions")
+    if ref_regions:
+        m_outer = re.search(
+            r"chargeRefineOuter\s*\{[^}]*levels\s*\(\(\s*(\d+)\s+(\d+)\s*\)\)\s*;",
+            ref_regions,
+            re.DOTALL,
+        )
+        if m_outer:
+            out["charge_outer_refine_min"] = int(m_outer.group(1))
+            out["charge_outer_refine_max"] = int(m_outer.group(2))
+            out["charge_outer_refine_enable"] = (
+                int(m_outer.group(1)) != 0 or int(m_outer.group(2)) != 0
+            )
+        else:
+            out["charge_outer_refine_min"] = 0
+            out["charge_outer_refine_max"] = 0
+            out["charge_outer_refine_enable"] = False
+    else:
+        out["charge_outer_refine_min"] = 0
+        out["charge_outer_refine_max"] = 0
+        out["charge_outer_refine_enable"] = False
 
     # Obstacle surface refinement levels from refinementSurfaces (first entry)
     ref_surf = _find_block(text, "refinementSurfaces")
@@ -837,6 +879,7 @@ def load_case(case_dir: str) -> Dict[str, Any]:
         "filled": filled,
         "not_filled": not_filled,
         "unsupported": unsupported,
+        "notes": out.get("_load_notes", []),
     }
 
     log.info("load_case(%s): found=%s, missing=%s, filled=%s",

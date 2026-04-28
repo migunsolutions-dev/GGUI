@@ -1817,11 +1817,14 @@ regions ( );
         # Backup region (mirrors the BlastFoam building3D reference): provides a fallback
         # search domain when the true charge is too small for setRefinedFields to find
         # any cell on the base mesh.  Backup factor = bubble_radius_factor (default 1.5x).
+        # Keep a floor tied to base cell size so seeding can succeed even when
+        # charge outer pre-refinement is disabled (Outside = 0 / 0).
         backup_factor = max(1.0, min(5.0, getattr(inputs, "bubble_radius_factor", 1.5)))
+        base_dx = max(1e-9, float(getattr(inputs, "cell_size", 0.0) or 0.0))
         if use_refined and inputs.charge_shape == "Sphere":
             r = dims["radius"]
             ref_part = f"        refineInternal yes;\n        level {charge_refine};\n        " if apply_refine_in_region else ""
-            backup_radius = r * backup_factor
+            backup_radius = max(r * backup_factor, 1.25 * base_dx)
             backup_block = (
                 f"        backup\n        {{\n"
                 f"            centre ({cx} {cy} {cz});\n"
@@ -1846,11 +1849,25 @@ regions ( );
             dir_map = {"X": "(1 0 0)", "Y": "(0 1 0)", "Z": "(0 0 1)"}
             direction = dir_map.get(inputs.cylinder_axis, "(0 0 1)")
             ref_part = f"        refineInternal yes;\n        level {charge_refine};\n        " if apply_refine_in_region else ""
-            # Backup cylinder: same axis, half-length vector, larger radius
+            # Backup cylinder: same axis, larger radius and robust axial reach.
+            # Policy:
+            #   backup length = max(charge length, charge diameter)
+            # This keeps capture robust for short cylinders and follows the agreed
+            # automatic logic without exposing extra UI inputs.
+            # If a loaded case provided an explicit backup L, preserve it via
+            # charge_backup_length_override.
             axis_idx = {"X": 0, "Y": 1, "Z": 2}.get(getattr(inputs, "cylinder_axis", "Z"), 2)
             l_vec = [0.0, 0.0, 0.0]
-            l_vec[axis_idx] = half_l
-            backup_radius = r * backup_factor
+            loaded_backup_len = getattr(inputs, "charge_backup_length_override", None)
+            if loaded_backup_len is not None:
+                try:
+                    backup_len = max(float(loaded_backup_len), 2.0 * base_dx)
+                except (TypeError, ValueError):
+                    backup_len = max(length, 2.0 * r, 2.0 * base_dx)
+            else:
+                backup_len = max(length, 2.0 * r, 2.0 * base_dx)
+            l_vec[axis_idx] = backup_len
+            backup_radius = max(r * backup_factor, 1.25 * base_dx)
             backup_block = (
                 f"        backup\n        {{\n"
                 f"            centre ({cx} {cy} {cz});\n"

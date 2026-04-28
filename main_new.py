@@ -418,6 +418,7 @@ class BlastFoamApp(QMainWindow):
         filled = load_summary.get("filled", [])
         not_filled = load_summary.get("not_filled", [])
         unsupported = load_summary.get("unsupported", {})
+        notes = load_summary.get("notes", [])
         n_filled = len(filled)
         n_not = len(not_filled)
         lines = [
@@ -441,6 +442,11 @@ class BlastFoamApp(QMainWindow):
                 keys = unsupported[fpath]
                 if keys:
                     lines.append(f"  {fpath}: " + ", ".join(keys))
+        if notes:
+            lines.append("")
+            lines.append("Load notes (seed/backup interpretation):")
+            for note in notes:
+                lines.append(f"  - {note}")
         lines.append("")
         lines.append("Pre-run parity: To verify generated files match this case (no edits), run:")
         lines.append(f"  python verification/parity_building3d.py -r \"{case_dir}\"")
@@ -851,10 +857,16 @@ class BlastFoamApp(QMainWindow):
                             break
                     if not success:
                         self.status_bar.set_status("Init Failed", "#e74c3c")
-                        msg = "Alpha check failed (no explosive mass in domain). "
+                        msg = (
+                            "Charge seeding failed (no explosive mass captured in the mesh).\n\n"
+                            "Recommended fixes:\n"
+                            "1) Increase 'Inside' (Charge pre-refinement).\n"
+                            "2) Increase 'Backup radius factor (bubble)' in Mesh Properties.\n"
+                            "3) Reduce base Cell size if the mesh is too coarse.\n"
+                            "4) As last resort only: temporarily raise Outside Min/Max for initialization.\n"
+                        )
                         if retries_used > 0:
-                            msg += "Retries with higher refinement did not help. "
-                        msg += "Increase Charge refinement level or reduce cell size and try again."
+                            msg += f"\nAutomatic retries already attempted: {retries_used}."
                         QMessageBox.critical(self, "Init Error", msg)
                         return
                 if not success and use_remap:
