@@ -352,6 +352,7 @@ def _parse_setFieldsDict(case_dir: str, out: Dict[str, Any]) -> None:
     # Backup radius factor: backup_radius / computed_charge_radius (when both available)
     backup_rad = _scalar(backup, "radius") if backup else None
     if backup_rad is not None and backup_rad > 1e-9:
+        out["charge_backup_radius_override"] = backup_rad
         mass_val = out.get("mass_kg")
         rho_val = out.get("rho_charge")
         if mass_val and rho_val and rho_val > 0:
@@ -399,6 +400,12 @@ def _parse_phaseProperties(case_dir: str, out: Dict[str, Any]) -> None:
     if am is not None:
         out["activation_model"] = am
         out["activation_model_ui"] = am
+    # initiation radius
+    init_block = _find_block(text, "initiation")
+    if init_block:
+        rv = _scalar(init_block, "radius")
+        if rv is not None:
+            out["ignition_radius"] = rv
 
     # Products: equationOfState model name and thermo (thermoType { equationOfState X; thermo Y; } or equationOfState { ... })
     products = _find_block(text, "products")
@@ -764,13 +771,14 @@ UI_FIELD_KEYS = [
     "material_name", "custom_material_props",
     "charge_shape", "mass_kg", "rho_charge", "charge_radius", "charge_lbyd", "charge_length", "charge_width", "charge_height", "charge_center",
     "initiation_point", "ignition_mode",
+    "ignition_radius",
     "p_atm", "t_atm",
     "refine_max", "refine_min", "enable_local_refinement", "cores",
     "enable_dyn_refine", "dyn_refine_min", "dyn_refine_max",
     "enable_obstacle_refine", "obstacle_refine_min", "obstacle_refine_max",
     "outside_extent", "transition_cells",
     "charge_refinement_level", "charge_outer_refine_min", "charge_outer_refine_max", "charge_outer_refine_enable",
-    "cylinder_axis", "charge_backup_radius_factor", "buffer_layers",
+    "cylinder_axis", "charge_backup_radius_factor", "charge_backup_radius_override", "buffer_layers",
     "enable_post_processing",
     "refine_interval", "lower_refine_threshold", "unrefine_threshold", "n_buffer_layers_dynamic", "refine_indicator_field", "enable_balancing",
     "obstacle_feature_angle", "obstacle_cells_between_levels", "obstacle_snap_iter", "obstacle_feature_snap_iter",

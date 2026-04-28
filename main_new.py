@@ -698,7 +698,7 @@ class BlastFoamApp(QMainWindow):
             try:
                 self.status_bar.set_status("Generating 3D Case...", "#f39c12")
                 QApplication.processEvents()
-                
+
                 prefix = "Case_3D"
                 case_name = self.service.make_case_name(prefix)
                 case_dir = self.service.generate_case(case_name, inputs)

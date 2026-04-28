@@ -346,9 +346,9 @@ class TabGeneral3D(QWidget):
         self.c_shape.setMaximumWidth(184)
         self.c_shape.currentTextChanged.connect(self._on_shape_changed)
 
-        # --- Geometry fields: Radius (computed for Sphere/Cylinder), Aspect (L/D), Length, Width, Height ---
+        # --- Geometry fields: Radius, Aspect (L/D), Length, Width, Height ---
         self.c_radius = self._spin(0.001, 100, 0.1, 0.01, 4)
-        self.c_radius.setToolTip("Computed from mass and density (and Aspect for Cylinder). Read-only for Sphere and Cylinder.")
+        self.c_radius.setToolTip("Charge radius [m]. Editable for Cylinder.")
         self.c_aspect = self._spin(0.1, 20, 2.5, 0.1, 2)
         self.c_aspect.setToolTip("Length-to-Diameter ratio (L/D). Only for Cylinder shape.")
         self.c_length = self._spin(0.001, 100, 0.5, 0.01, 4)
@@ -371,6 +371,7 @@ class TabGeneral3D(QWidget):
 
         self.c_mass = self._spin(0.01, 1e4, 5, 0.5, 2)
         self.c_rho = self._spin(1, 1e4, 1630, 10, 1)
+        self.c_rho.setToolTip("Density is locked to selected explosive material.")
         self.cx = self._spin(-100,100,0,0.1,2, max_width=116)
         self.cy = self._spin(-100,100,0,0.1,2, max_width=116)
         self.cz = self._spin(-100,100,0,0.1,2, max_width=116)
@@ -402,6 +403,7 @@ class TabGeneral3D(QWidget):
         mass_lbl.setMinimumWidth(LABEL_MINW)
         density_lbl = self._lbl("Density")
         density_lbl.setMinimumWidth(LABEL_MINW)
+        self.lbl_density = density_lbl
 
         wrap_geom = QWidget()
         f2a = QFormLayout(wrap_geom)
@@ -478,6 +480,9 @@ class TabGeneral3D(QWidget):
         init_h.addStretch()
         f2b.addRow(self.init_wrap)
         self._on_ignition_mode_changed(self.combo_ignition_mode.currentText())
+        # Density follows selected material; keep field read-only in UI.
+        self.c_rho.setEnabled(False)
+        self.lbl_density.setEnabled(False)
         self.spin_backup_factor = self._spin(0.1, 20.0, 1.0, 0.1, 2)
         self.spin_backup_factor.setToolTip("Internal: backup radius factor (not user-facing).")
         self.lbl_backup_factor = self._lbl("Backup radius factor")
@@ -494,7 +499,12 @@ class TabGeneral3D(QWidget):
         # backup.radius = factor * charge_radius. Larger value -> more robust seeding on
         # coarse base meshes, but seeds field into a larger volume around the charge.
         self._bubble_radius_factor = 1.5
+        self._charge_backup_radius_override = None
+        self._backup_radius_manual = False
         self._charge_backup_length_override = None
+        self._ignition_radius = None
+        self._ignition_radius_manual = False
+        self._delta_t_loaded = None
         # Run-mode tradeoffs (default: FAST). Both default OFF so a fresh run is as
         # fast as building3D's hand-tuned Allrun. Loaders flip them ON when an
         # opened case explicitly contains the corresponding constructs.
@@ -1017,6 +1027,8 @@ class TabGeneral3D(QWidget):
             self.spin_charge_outer_min.blockSignals(False)
 
     def _compute_safe_dt(self) -> float:
+        if getattr(self, "_delta_t_loaded", None) is not None:
+            return float(self._delta_t_loaded)
         """Compute safe initial delta_t from smallest cell and detonation velocity.
 
         The smallest cell in the mesh is determined by the *larger* of:
@@ -1152,6 +1164,8 @@ class TabGeneral3D(QWidget):
         self.c_mass.valueChanged.connect(self._update_charge_radius)
         self.c_rho.valueChanged.connect(self._update_charge_radius)
         self.c_aspect.valueChanged.connect(self._update_charge_radius)
+        self.c_aspect.valueChanged.connect(self._update_cylinder_height)
+        self.c_radius.valueChanged.connect(self._update_cylinder_height)
         self.c_length.valueChanged.connect(self._update_cuboid_height)
         self.c_width.valueChanged.connect(self._update_cuboid_height)
         
@@ -1228,19 +1242,38 @@ class TabGeneral3D(QWidget):
         spin_buf_setfields.setToolTip("nBufferLayers in setFieldsDict. Default 2 (building3D-style).")
         f_buf.addRow("Buffer layers (setFields)", spin_buf_setfields)
         f_buf.addRow("", QLabel("nBufferLayers for charge/refinement regions (building3D: 2)."))
-        spin_bubble_factor = QDoubleSpinBox()
-        spin_bubble_factor.setRange(1.0, 5.0)
-        spin_bubble_factor.setSingleStep(0.1)
-        spin_bubble_factor.setDecimals(2)
-        spin_bubble_factor.setValue(getattr(self, "_bubble_radius_factor", 1.5))
-        spin_bubble_factor.setToolTip(
-            "Backup radius factor for setRefinedFields backup region.\n"
-            "backup.radius = factor x charge_radius.\n"
-            "Larger = more robust seeding on coarse base meshes; charge field is\n"
-            "placed in a larger volume around the geometric charge."
+        # Backup radius row: single-line checkbox + label + value.
+        backup_row = QWidget()
+        backup_h = QHBoxLayout(backup_row)
+        backup_h.setContentsMargins(0, 0, 0, 0)
+        chk_backup_manual = QCheckBox()
+        chk_backup_manual.setChecked(bool(getattr(self, "_backup_radius_manual", False)))
+        lbl_backup_radius = QLabel("Backup radius")
+        spin_backup_radius = QDoubleSpinBox()
+        spin_backup_radius.setRange(1e-4, 1000.0)
+        spin_backup_radius.setDecimals(6)
+        spin_backup_radius.setSingleStep(0.01)
+        # Auto value follows current charge radius and backup factor.
+        try:
+            auto_backup = max(1e-6, float(self.c_radius.value()) * float(getattr(self, "_bubble_radius_factor", 1.5)))
+        except Exception:
+            auto_backup = 0.15
+        spin_backup_radius.setValue(
+            float(getattr(self, "_charge_backup_radius_override", auto_backup) or auto_backup)
         )
-        f_buf.addRow("Backup radius factor (bubble)", spin_bubble_factor)
-        f_buf.addRow("", QLabel("backup.radius = factor x charge radius. 1.5 matches building3D-style robust seeding; use 1.0 for tight backup."))
+        def _update_backup_row_style() -> None:
+            manual = chk_backup_manual.isChecked()
+            lbl_backup_radius.setStyleSheet("color: black;" if manual else "color: gray;")
+            spin_backup_radius.setEnabled(manual)
+            if not manual:
+                spin_backup_radius.setValue(auto_backup)
+        _update_backup_row_style()
+        chk_backup_manual.toggled.connect(lambda _v: _update_backup_row_style())
+        backup_h.addWidget(chk_backup_manual)
+        backup_h.addWidget(lbl_backup_radius)
+        backup_h.addWidget(spin_backup_radius)
+        backup_h.addStretch()
+        f_buf.addRow(backup_row)
         v.addWidget(grp_buf)
 
         # Run mode (Allrun + controlDict) — tradeoffs between speed and verification.
@@ -1295,6 +1328,36 @@ class TabGeneral3D(QWidget):
         f_amr.addRow("Max Refinement (AMR)", spin_amr_max)
         f_amr.addRow("", QLabel("maxRefinement in dynamicMeshDict (building3D: 1)."))
         v.addWidget(grp_amr)
+
+        # Seeding and Initiation
+        grp_seed = QGroupBox("Seeding and Initiation")
+        f_seed = QFormLayout(grp_seed)
+        ign_row = QWidget()
+        ign_h = QHBoxLayout(ign_row)
+        ign_h.setContentsMargins(0, 0, 0, 0)
+        chk_ign_manual = QCheckBox()
+        chk_ign_manual.setChecked(bool(getattr(self, "_ignition_radius_manual", False)))
+        lbl_ign_radius = QLabel("Ignition radius")
+        spin_ign_radius = QDoubleSpinBox()
+        spin_ign_radius.setRange(1e-4, 1.0)
+        spin_ign_radius.setDecimals(6)
+        spin_ign_radius.setSingleStep(0.001)
+        auto_ign = 0.05
+        if getattr(self, "_ignition_radius", None) is not None:
+            auto_ign = float(self._ignition_radius)
+        spin_ign_radius.setValue(auto_ign)
+        def _update_ign_row_style() -> None:
+            manual = chk_ign_manual.isChecked()
+            lbl_ign_radius.setStyleSheet("color: black;" if manual else "color: gray;")
+            spin_ign_radius.setEnabled(manual)
+        _update_ign_row_style()
+        chk_ign_manual.toggled.connect(lambda _v: _update_ign_row_style())
+        ign_h.addWidget(chk_ign_manual)
+        ign_h.addWidget(lbl_ign_radius)
+        ign_h.addWidget(spin_ign_radius)
+        ign_h.addStretch()
+        f_seed.addRow(ign_row)
+        v.addWidget(grp_seed)
 
         # Group: Obstacle refine – Advanced
         grp_obs = QGroupBox("Obstacle refine – Advanced")
@@ -1461,7 +1524,16 @@ class TabGeneral3D(QWidget):
         layout.addWidget(bb)
         if d.exec_() == QDialog.Accepted:
             self._buffer_layers = spin_buf_setfields.value()
-            self._bubble_radius_factor = spin_bubble_factor.value()
+            self._backup_radius_manual = chk_backup_manual.isChecked()
+            if self._backup_radius_manual:
+                self._charge_backup_radius_override = spin_backup_radius.value()
+                try:
+                    cr = max(1e-9, float(self.c_radius.value()))
+                    self._bubble_radius_factor = max(0.1, float(self._charge_backup_radius_override) / cr)
+                except Exception:
+                    pass
+            else:
+                self._charge_backup_radius_override = None
             self._enable_post_processing = chk_post_proc.isChecked()
             self._fast_run_mode = chk_fast.isChecked()
             self._refine_interval = spin_ref_int.value()
@@ -1469,6 +1541,11 @@ class TabGeneral3D(QWidget):
             self._unrefine_threshold = spin_unref.value()
             self._dyn_refine_max = spin_amr_max.value()
             self.spin_refine_max.setValue(self._dyn_refine_max)
+            self._ignition_radius_manual = chk_ign_manual.isChecked()
+            if self._ignition_radius_manual:
+                self._ignition_radius = spin_ign_radius.value()
+            else:
+                self._ignition_radius = None
             self._obstacle_feature_angle = spin_fa.value()
             self._obstacle_cells_between_levels = spin_cbl.value()
             self._obstacle_snap_iter = spin_snap.value()
@@ -1584,10 +1661,9 @@ class TabGeneral3D(QWidget):
                 self._set_provenance_user(k)
 
     def _update_charge_radius(self):
-        """Compute and display radius/side from mass, density and (for Cylinder) Aspect. 
-        Used for Sphere, Cylinder, and Cuboid (shows computed side length)."""
+        """Compute and display geometry for shapes driven by mass/density."""
         shape = self.c_shape.currentText()
-        if shape not in ("Sphere", "Cylinder", "Cuboid"):
+        if shape not in ("Sphere", "Cuboid"):
             return
         mass = max(1e-9, self.c_mass.value())
         rho = max(1e-9, self.c_rho.value())
@@ -1598,12 +1674,21 @@ class TabGeneral3D(QWidget):
             # Cube: side = vol^(1/3) (mass-driven geometry)
             r = vol ** (1.0 / 3.0)
             self._update_cuboid_height()
-        else:  # Cylinder
-            aspect = max(0.1, self.c_aspect.value())
-            r = (vol / (2.0 * math.pi * aspect)) ** (1.0 / 3.0)
         self.c_radius.blockSignals(True)
         self.c_radius.setValue(r)
         self.c_radius.blockSignals(False)
+        self._update_preview()
+
+    def _update_cylinder_height(self):
+        """For Cylinder: keep displayed height coupled to Radius and L/D."""
+        if self.c_shape.currentText() != "Cylinder":
+            return
+        r = max(1e-9, self.c_radius.value())
+        aspect = max(0.1, self.c_aspect.value())
+        L = 2.0 * r * aspect
+        self.c_length.blockSignals(True)
+        self.c_length.setValue(round(L, 6) if L < 1000 else L)
+        self.c_length.blockSignals(False)
         self._update_preview()
 
     def _update_cuboid_height(self):
@@ -1622,13 +1707,13 @@ class TabGeneral3D(QWidget):
         self._update_preview()
 
     def _on_shape_changed(self, shape_name):
-        """Enable/disable geometry fields based on selected charge shape. Radius is read-only (computed) for Sphere/Cylinder/Cuboid."""
+        """Enable/disable geometry fields based on selected charge shape."""
         is_sphere = (shape_name == "Sphere")
         is_cylinder = (shape_name == "Cylinder")
         is_cuboid = (shape_name == "Cuboid")
 
-        # Radius/Side: Sphere, Cylinder, Cuboid — read-only, gray, value computed from mass/density/(aspect)
-        if is_sphere or is_cylinder or is_cuboid:
+        # Sphere/Cuboid: computed radius/side shown as read-only.
+        if is_sphere or is_cuboid:
             self.c_radius.setReadOnly(True)
             for w in (self.c_radius, self.lbl_radius):
                 w.setEnabled(False)  # gray, display-only
@@ -1645,6 +1730,12 @@ class TabGeneral3D(QWidget):
             else:
                 self.lbl_radius.setText("Radius [m]")
             self._update_charge_radius()
+        elif is_cylinder:
+            self.lbl_radius.setText("Radius [m]")
+            self.c_radius.setReadOnly(False)
+            for w in (self.c_radius, self.lbl_radius):
+                w.setEnabled(True)
+            self._update_cylinder_height()
         else:
             for w in (self.c_radius, self.lbl_radius):
                 w.setEnabled(False)
@@ -1655,15 +1746,26 @@ class TabGeneral3D(QWidget):
         # Cylinder axis: Cylinder only
         for w in (self.c_cylinder_axis, self.lbl_cylinder_axis):
             w.setEnabled(is_cylinder)
-        # Length, Width, Height: enabled for Cuboid (rectangular prism; height = V/(L×W) to match mass/density)
+        # Length/Width/Height visibility and behavior by shape.
         if is_cuboid:
+            self.lbl_length.setText("Length [m]")
             for w in (self.c_length, self.lbl_length, self.c_width, self.lbl_width, self.c_height, self.lbl_height):
                 w.setEnabled(True)
+                w.setVisible(True)
             self.c_height.setReadOnly(True)
             self._update_cuboid_height()
+        elif is_cylinder:
+            self.lbl_length.setText("Height [m]")
+            for w in (self.c_length, self.lbl_length):
+                w.setEnabled(False)
+                w.setVisible(True)
+            self.c_length.setReadOnly(True)
+            for w in (self.c_width, self.lbl_width, self.c_height, self.lbl_height):
+                w.setVisible(False)
         else:
             for w in (self.c_length, self.lbl_length, self.c_width, self.lbl_width, self.c_height, self.lbl_height):
                 w.setEnabled(False)
+                w.setVisible(False)
             self.c_height.setReadOnly(True)
 
         self._update_preview()
@@ -1672,6 +1774,8 @@ class TabGeneral3D(QWidget):
         if mat_name in self.materials_db:
             props = self.materials_db[mat_name]
             self.c_rho.setValue(props["rho"])
+        self.c_rho.setEnabled(False)
+        self.lbl_density.setEnabled(False)
         self._update_edit_button_visibility()
         self._update_preview()
 
@@ -2425,8 +2529,27 @@ class TabGeneral3D(QWidget):
             if "charge_backup_radius_factor" in data:
                 self.spin_backup_factor.setValue(data["charge_backup_radius_factor"])
                 self._bubble_radius_factor = float(data["charge_backup_radius_factor"])
+            if "charge_backup_radius_override" in data and data["charge_backup_radius_override"] is not None:
+                try:
+                    self._charge_backup_radius_override = float(data["charge_backup_radius_override"])
+                    self._backup_radius_manual = True
+                except (TypeError, ValueError):
+                    self._charge_backup_radius_override = None
+                    self._backup_radius_manual = False
             if "bubble_radius_factor" in data:
                 self._bubble_radius_factor = float(data["bubble_radius_factor"])
+            if "ignition_radius" in data and data["ignition_radius"] is not None:
+                try:
+                    self._ignition_radius = float(data["ignition_radius"])
+                    self._ignition_radius_manual = True
+                except (TypeError, ValueError):
+                    self._ignition_radius = None
+                    self._ignition_radius_manual = False
+            if "delta_t" in data and data["delta_t"] is not None:
+                try:
+                    self._delta_t_loaded = float(data["delta_t"])
+                except (TypeError, ValueError):
+                    self._delta_t_loaded = None
             if "charge_backup_length_override" in data and data["charge_backup_length_override"] is not None:
                 try:
                     self._charge_backup_length_override = float(data["charge_backup_length_override"])
@@ -2484,9 +2607,9 @@ class TabGeneral3D(QWidget):
         self._on_mesh_mode_changed()
         self._update_ui_state()
         self._on_shape_changed(self.c_shape.currentText())
-        # Recompute radius from mass/density only when we have both (setRefinedFields format);
-        # when loading setFields format we have radius but not mass/rho — keep loaded radius
-        if "mass_kg" in data and "rho_charge" in data and data.get("charge_shape") in ("Sphere", "Cylinder"):
+        # Recompute geometry from mass/density only for Sphere.
+        # Cylinder radius stays user-/file-driven; height is derived from radius and L/D.
+        if "mass_kg" in data and "rho_charge" in data and data.get("charge_shape") == "Sphere":
             self._update_charge_radius()
         self._update_edit_button_visibility()
         self._update_preview()
@@ -2562,6 +2685,7 @@ class TabGeneral3D(QWidget):
             transition_cells=transition_cells,
             use_seed_bubble=(refine and self.spin_charge_refine.value() > 0),
             charge_backup_radius_factor=self.spin_backup_factor.value(),
+            charge_backup_radius_override=getattr(self, "_charge_backup_radius_override", None),
             charge_backup_length_override=getattr(self, "_charge_backup_length_override", None),
             charge_aspect=self.c_aspect.value(),
             charge_length=self.c_length.value(),

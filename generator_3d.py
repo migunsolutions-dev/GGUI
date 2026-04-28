@@ -1671,9 +1671,11 @@ dumpLevel      true;
         user_ign = getattr(inputs, "ignition_radius", None)
         if user_ign is None or user_ign <= 0:
             user_ign = min(0.05, max(0.01, 0.2 * R_charge))
+            ign_radius = max(user_ign, 3.0 * smallest_cell)
         else:
-            user_ign = min(0.05, max(0.01, float(user_ign)))
-        ign_radius = max(user_ign, 3.0 * smallest_cell)  # effective >= 3*smallest_cell so at least ~3 cells activated
+            # Explicit loaded/user value gets full priority.
+            user_ign = float(user_ign)
+            ign_radius = user_ign
         ignition_mode = getattr(inputs, "ignition_mode", "Center of Charge")
         use_com = (ignition_mode == "Center of Charge") and not remap_enabled
         if remap_enabled:
@@ -1820,11 +1822,18 @@ regions ( );
         # Keep a floor tied to base cell size so seeding can succeed even when
         # charge outer pre-refinement is disabled (Outside = 0 / 0).
         backup_factor = max(1.0, min(5.0, getattr(inputs, "bubble_radius_factor", 1.5)))
+        backup_radius_override = getattr(inputs, "charge_backup_radius_override", None)
         base_dx = max(1e-9, float(getattr(inputs, "cell_size", 0.0) or 0.0))
         if use_refined and inputs.charge_shape == "Sphere":
             r = dims["radius"]
             ref_part = f"        refineInternal yes;\n        level {charge_refine};\n        " if apply_refine_in_region else ""
-            backup_radius = max(r * backup_factor, 1.25 * base_dx)
+            if backup_radius_override is not None:
+                try:
+                    backup_radius = max(float(backup_radius_override), 1.25 * base_dx)
+                except (TypeError, ValueError):
+                    backup_radius = max(r * backup_factor, 1.25 * base_dx)
+            else:
+                backup_radius = max(r * backup_factor, 1.25 * base_dx)
             backup_block = (
                 f"        backup\n        {{\n"
                 f"            centre ({cx} {cy} {cz});\n"
@@ -1845,7 +1854,10 @@ regions ( );
             else:
                 length = 2.0 * r * 2.5
             half_l = length / 2.0
-            lbyd = (2.0 * half_l) / (2.0 * r) if r > 1e-9 else 2.5
+            if hasattr(inputs, "charge_aspect") and inputs.charge_aspect > 1e-9:
+                lbyd = float(inputs.charge_aspect)
+            else:
+                lbyd = (2.0 * half_l) / (2.0 * r) if r > 1e-9 else 2.5
             dir_map = {"X": "(1 0 0)", "Y": "(0 1 0)", "Z": "(0 0 1)"}
             direction = dir_map.get(inputs.cylinder_axis, "(0 0 1)")
             ref_part = f"        refineInternal yes;\n        level {charge_refine};\n        " if apply_refine_in_region else ""
@@ -1861,13 +1873,19 @@ regions ( );
             loaded_backup_len = getattr(inputs, "charge_backup_length_override", None)
             if loaded_backup_len is not None:
                 try:
-                    backup_len = max(float(loaded_backup_len), 2.0 * base_dx)
+                    backup_len = float(loaded_backup_len)
                 except (TypeError, ValueError):
-                    backup_len = max(length, 2.0 * r, 2.0 * base_dx)
+                    backup_len = max(length, 2.0 * r)
             else:
-                backup_len = max(length, 2.0 * r, 2.0 * base_dx)
+                backup_len = max(length, 2.0 * r)
             l_vec[axis_idx] = backup_len
-            backup_radius = max(r * backup_factor, 1.25 * base_dx)
+            if backup_radius_override is not None:
+                try:
+                    backup_radius = max(float(backup_radius_override), 1.25 * base_dx)
+                except (TypeError, ValueError):
+                    backup_radius = max(r * backup_factor, 1.25 * base_dx)
+            else:
+                backup_radius = max(r * backup_factor, 1.25 * base_dx)
             backup_block = (
                 f"        backup\n        {{\n"
                 f"            centre ({cx} {cy} {cz});\n"
@@ -1877,7 +1895,7 @@ regions ( );
             )
             region_str = (
                 f"cylindericalMassToCell\n    {{\n        rho {rho:.6g};\n        mass {mass:.6g};\n        centre ({cx} {cy} {cz});\n"
-                f"        direction {direction};\n        LbyD {lbyd:.6g};\n"
+                f"        direction {direction};\n        LbyD {lbyd};\n"
                 f"{backup_block}"
                 f"{ref_part}fieldValues ( volScalarFieldValue alpha.c4 1 );\n    }}"
             )
