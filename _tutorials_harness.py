@@ -84,7 +84,15 @@ def build_inputs_from_loaded(loaded: Dict[str, Any], original_case_dir_win: str)
 
     # setRefinedFields charge level (level X in setFieldsDict regions)
     charge_lvl = int(loaded.get("charge_refinement_level") or 3)
-    backup_factor = float(loaded.get("charge_backup_radius_factor") or 1.5)
+    transition_seed = float(
+        loaded.get("bubble_radius_factor") or loaded.get("charge_backup_radius_factor") or 1.5
+    )
+    cc_r = loaded.get("charge_capture_radius")
+    if cc_r is not None:
+        try:
+            cc_r = float(cc_r)
+        except (TypeError, ValueError):
+            cc_r = None
 
     inputs = CaseInputs3D(
         # Geometry & Grid
@@ -127,7 +135,11 @@ def build_inputs_from_loaded(loaded: Dict[str, Any], original_case_dir_win: str)
         obstacle_refine_min=int(loaded.get("obstacle_refine_min") or 1),
         obstacle_refine_max=int(loaded.get("obstacle_refine_max") or 2),
         charge_refinement_level=charge_lvl,
-        charge_backup_radius_factor=backup_factor,
+        charge_capture_mode=str(loaded.get("charge_capture_mode") or "auto"),
+        charge_capture_factor=float(loaded.get("charge_capture_factor") or 1.0),
+        charge_capture_radius=cc_r,
+        charge_backup_radius_factor=1.0,
+        bubble_radius_factor=transition_seed,
         buffer_layers=int(loaded.get("buffer_layers") or 2),
         # AMR advanced
         refine_interval=int(loaded.get("refine_interval") or 3),

@@ -107,8 +107,13 @@ class CaseInputs3D:
     obstacle_refine_min: Optional[int] = None     # None = use refine_min
     obstacle_refine_max: Optional[int] = None     # None = use refine_max
     charge_refinement_level: int = 0  # setRefinedFields level; 0 = use setFields
-    charge_backup_radius_factor: float = 1.0  # backup radius = factor * charge radius (setRefinedFields)
-    charge_backup_radius_override: Optional[float] = None  # absolute backup radius override for setRefinedFields
+    # --- Charge capture (setRefinedFields backup { radius ... } only; not snappy transition) ---
+    charge_capture_mode: str = "auto"  # "auto" | "manual"
+    charge_capture_factor: float = 1.0  # auto: multiplier on 0.5*sqrt(dx²+dy²+dz²) term
+    charge_capture_radius: Optional[float] = None  # manual: exact radius [m]; no hidden minimum
+    # Legacy keys (loaders / old scripts): still honored in charge_capture.resolve_charge_capture_radius_m
+    charge_backup_radius_factor: float = 1.0  # deprecated; do not use for new cases
+    charge_backup_radius_override: Optional[float] = None  # deprecated alias for manual capture radius
     charge_backup_length_override: Optional[float] = None  # absolute backup axial length for cylinder setRefinedFields
     outside_extent: Optional[float] = None    # [m] thickness of outside pre-refinement region; None/0 = use bubble_radius_factor
     
@@ -136,7 +141,8 @@ class CaseInputs3D:
     initiation_point: Optional[Vec3] = None  # if None or ignition_mode "Center of Charge", use charge_center
     ignition_mode: str = "Center of Charge"   # "Center of Charge" | "Manual" (manual uses initiation_point)
     use_seed_bubble: bool = True             # if True and estimated charge cells low, run topoSet + refineMesh bubble
-    bubble_radius_factor: float = 1.5        # bubble radius = charge_radius * this (for seed refinement)
+    # Snappy outer transition + topoSet seed sphere radius = R_charge * this (independent of charge capture)
+    bubble_radius_factor: float = 1.5
 
     # --- setFields/setRefinedFields ---
     buffer_layers: int = 2                   # nBufferLayers in setFieldsDict (replaces hardcoded 5)

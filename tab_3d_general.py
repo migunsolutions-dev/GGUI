@@ -105,6 +105,12 @@ class TabGeneral3D(QWidget):
         self.lbl_charge_refine_info = QLabel("Charge refine: —")
         self.lbl_charge_refine_info.setStyleSheet(info_font)
         il.addWidget(self.lbl_charge_refine_info)
+        self.lbl_charge_capture_info = QLabel("Charge capture: —")
+        self.lbl_charge_capture_info.setStyleSheet(info_font)
+        self.lbl_charge_capture_info.setToolTip(
+            "Charge capture radius in setFieldsDict (backup region) for setRefinedFields — not the physical charge size."
+        )
+        il.addWidget(self.lbl_charge_capture_info)
         self.lbl_obstacle_refine_info = QLabel("Obstacle refine: —")
         self.lbl_obstacle_refine_info.setStyleSheet(info_font)
         il.addWidget(self.lbl_obstacle_refine_info)
@@ -483,24 +489,19 @@ class TabGeneral3D(QWidget):
         # Density follows selected material; keep field read-only in UI.
         self.c_rho.setEnabled(False)
         self.lbl_density.setEnabled(False)
-        self.spin_backup_factor = self._spin(0.1, 20.0, 1.0, 0.1, 2)
-        self.spin_backup_factor.setToolTip("Internal: backup radius factor (not user-facing).")
-        self.lbl_backup_factor = self._lbl("Backup radius factor")
-        f2b.addRow(self.lbl_backup_factor, self.spin_backup_factor)
-        self.lbl_backup_factor.setVisible(False)
-        self.spin_backup_factor.setVisible(False)
         self._refine_interval = 3
         self._lower_refine_threshold = 0.1
         self._unrefine_threshold = 0.1
         self._n_buffer_layers_dynamic = 2
         self._enable_balancing = False
         self._refine_indicator_field = "densityGradient"
-        # Backup radius factor used by setRefinedFields backup region (sphere/cylinder).
-        # backup.radius = factor * charge_radius. Larger value -> more robust seeding on
-        # coarse base meshes, but seeds field into a larger volume around the charge.
+        # Snappy outer transition + optional topoSet seed: R_seed = R_charge * factor (not setRefinedFields capture).
         self._bubble_radius_factor = 1.5
+        # Charge capture (setFieldsDict ``backup``): separate from transition seed above.
+        self._charge_capture_mode = "auto"
+        self._charge_capture_factor = 1.0
+        self._charge_capture_radius_manual = 0.2
         self._charge_backup_radius_override = None
-        self._backup_radius_manual = False
         self._charge_backup_length_override = None
         self._ignition_radius = None
         self._ignition_radius_manual = False
@@ -1242,38 +1243,59 @@ class TabGeneral3D(QWidget):
         spin_buf_setfields.setToolTip("nBufferLayers in setFieldsDict. Default 2 (building3D-style).")
         f_buf.addRow("Buffer layers (setFields)", spin_buf_setfields)
         f_buf.addRow("", QLabel("nBufferLayers for charge/refinement regions (building3D: 2)."))
-        # Backup radius row: single-line checkbox + label + value.
-        backup_row = QWidget()
-        backup_h = QHBoxLayout(backup_row)
-        backup_h.setContentsMargins(0, 0, 0, 0)
-        chk_backup_manual = QCheckBox()
-        chk_backup_manual.setChecked(bool(getattr(self, "_backup_radius_manual", False)))
-        lbl_backup_radius = QLabel("Backup radius")
-        spin_backup_radius = QDoubleSpinBox()
-        spin_backup_radius.setRange(1e-4, 1000.0)
-        spin_backup_radius.setDecimals(6)
-        spin_backup_radius.setSingleStep(0.01)
-        # Auto value follows current charge radius and backup factor.
-        try:
-            auto_backup = max(1e-6, float(self.c_radius.value()) * float(getattr(self, "_bubble_radius_factor", 1.5)))
-        except Exception:
-            auto_backup = 0.15
-        spin_backup_radius.setValue(
-            float(getattr(self, "_charge_backup_radius_override", auto_backup) or auto_backup)
+        cap_hint = QLabel(
+            "Charge capture radius is used only to seed the explosive on a coarse base mesh "
+            "(setRefinedFields backup region). It is not the physical charge radius and must not "
+            "be treated as a large initial refinement bubble unless you also enlarge outer transition "
+            "or AMR settings explicitly."
         )
-        def _update_backup_row_style() -> None:
-            manual = chk_backup_manual.isChecked()
-            lbl_backup_radius.setStyleSheet("color: black;" if manual else "color: gray;")
-            spin_backup_radius.setEnabled(manual)
-            if not manual:
-                spin_backup_radius.setValue(auto_backup)
-        _update_backup_row_style()
-        chk_backup_manual.toggled.connect(lambda _v: _update_backup_row_style())
-        backup_h.addWidget(chk_backup_manual)
-        backup_h.addWidget(lbl_backup_radius)
-        backup_h.addWidget(spin_backup_radius)
-        backup_h.addStretch()
-        f_buf.addRow(backup_row)
+        cap_hint.setWordWrap(True)
+        f_buf.addRow(cap_hint)
+        rad_cap_auto = QRadioButton("Auto charge capture radius")
+        rad_cap_manual = QRadioButton("Manual charge capture radius [m]")
+        cap_mode = str(getattr(self, "_charge_capture_mode", "auto") or "auto").lower()
+        if cap_mode == "manual":
+            rad_cap_manual.setChecked(True)
+        else:
+            rad_cap_auto.setChecked(True)
+        bg_cap = QButtonGroup(d)
+        bg_cap.addButton(rad_cap_auto)
+        bg_cap.addButton(rad_cap_manual)
+        cap_mode_row = QWidget()
+        cap_mode_h = QHBoxLayout(cap_mode_row)
+        cap_mode_h.setContentsMargins(0, 0, 0, 0)
+        cap_mode_h.addWidget(rad_cap_auto)
+        cap_mode_h.addWidget(rad_cap_manual)
+        cap_mode_h.addStretch()
+        f_buf.addRow("Capture mode", cap_mode_row)
+        spin_cap_factor = QDoubleSpinBox()
+        spin_cap_factor.setRange(0.01, 20.0)
+        spin_cap_factor.setDecimals(4)
+        spin_cap_factor.setSingleStep(0.05)
+        _ccf_dlg = getattr(self, "_charge_capture_factor", None)
+        spin_cap_factor.setValue(float(1.0 if _ccf_dlg is None else _ccf_dlg))
+        spin_cap_factor.setToolTip(
+            "Auto mode: R_capture = max(1.05·R_charge, 0.5·√(dx²+dy²+dz²)·factor). "
+            "Uniform base mesh uses dx = dy = dz = Cell Size."
+        )
+        f_buf.addRow("Charge capture factor (auto)", spin_cap_factor)
+        spin_cap_radius = QDoubleSpinBox()
+        spin_cap_radius.setRange(1e-6, 1000.0)
+        spin_cap_radius.setDecimals(8)
+        spin_cap_radius.setSingleStep(0.01)
+        _mrad_dlg = getattr(self, "_charge_capture_radius_manual", None)
+        spin_cap_radius.setValue(float(0.2 if _mrad_dlg is None else _mrad_dlg))
+        spin_cap_radius.setToolTip("Manual mode: exact radius written to setFieldsDict backup { radius ... } — no hidden minimum.")
+        f_buf.addRow("Capture radius (manual)", spin_cap_radius)
+
+        def _refresh_cap_ctrls() -> None:
+            manual_on = rad_cap_manual.isChecked()
+            spin_cap_radius.setEnabled(manual_on)
+            spin_cap_factor.setEnabled(not manual_on)
+
+        _refresh_cap_ctrls()
+        rad_cap_auto.toggled.connect(lambda _v: _refresh_cap_ctrls())
+        rad_cap_manual.toggled.connect(lambda _v: _refresh_cap_ctrls())
         v.addWidget(grp_buf)
 
         # Run mode (Allrun + controlDict) — tradeoffs between speed and verification.
@@ -1327,6 +1349,12 @@ class TabGeneral3D(QWidget):
         spin_amr_max.setValue(int(getattr(self, "_dyn_refine_max", self.spin_refine_max.value())))
         f_amr.addRow("Max Refinement (AMR)", spin_amr_max)
         f_amr.addRow("", QLabel("maxRefinement in dynamicMeshDict (building3D: 1)."))
+        combo_refine_indicator = QComboBox()
+        combo_refine_indicator.setEditable(True)
+        combo_refine_indicator.addItems(["densityGradient", "pressureGradient"])
+        combo_refine_indicator.setCurrentText(str(getattr(self, "_refine_indicator_field", "densityGradient")))
+        f_amr.addRow("Refine Indicator Field", combo_refine_indicator)
+        f_amr.addRow("", QLabel("dynamicMeshDict errorEstimator (default: densityGradient)."))
         v.addWidget(grp_amr)
 
         # Seeding and Initiation
@@ -1524,14 +1552,11 @@ class TabGeneral3D(QWidget):
         layout.addWidget(bb)
         if d.exec_() == QDialog.Accepted:
             self._buffer_layers = spin_buf_setfields.value()
-            self._backup_radius_manual = chk_backup_manual.isChecked()
-            if self._backup_radius_manual:
-                self._charge_backup_radius_override = spin_backup_radius.value()
-                try:
-                    cr = max(1e-9, float(self.c_radius.value()))
-                    self._bubble_radius_factor = max(0.1, float(self._charge_backup_radius_override) / cr)
-                except Exception:
-                    pass
+            self._charge_capture_mode = "manual" if rad_cap_manual.isChecked() else "auto"
+            self._charge_capture_factor = float(spin_cap_factor.value())
+            self._charge_capture_radius_manual = float(spin_cap_radius.value())
+            if self._charge_capture_mode == "manual":
+                self._charge_backup_radius_override = self._charge_capture_radius_manual
             else:
                 self._charge_backup_radius_override = None
             self._enable_post_processing = chk_post_proc.isChecked()
@@ -1541,6 +1566,7 @@ class TabGeneral3D(QWidget):
             self._unrefine_threshold = spin_unref.value()
             self._dyn_refine_max = spin_amr_max.value()
             self.spin_refine_max.setValue(self._dyn_refine_max)
+            self._refine_indicator_field = combo_refine_indicator.currentText().strip() or "densityGradient"
             self._ignition_radius_manual = chk_ign_manual.isChecked()
             if self._ignition_radius_manual:
                 self._ignition_radius = spin_ign_radius.value()
@@ -1574,6 +1600,8 @@ class TabGeneral3D(QWidget):
             self._mesh_n_smooth_scale = spin_nscale.value()
             self._mesh_error_reduction = spin_err.value()
             self._mesh_relaxed_max_non_ortho = spin_relaxed.value()
+            for k in ("refine_interval", "lower_refine_threshold", "unrefine_threshold", "refine_indicator_field"):
+                self._set_provenance_user(k)
             for k in ("mesh_included_angle", "mesh_n_smooth_patch", "mesh_snap_tolerance", "mesh_n_solve_iter", "mesh_n_relax_iter", "mesh_n_feature_snap_iter", "mesh_explicit_feature_snap", "mesh_implicit_feature_snap", "mesh_multi_region_feature_snap", "mesh_n_cells_between_levels", "mesh_resolve_feature_angle", "mesh_max_non_ortho", "mesh_max_boundary_skewness", "mesh_max_internal_skewness", "mesh_max_concave", "mesh_min_vol", "mesh_min_tet_quality", "mesh_min_twist", "mesh_min_determinant", "mesh_min_face_weight", "mesh_min_vol_ratio", "mesh_n_smooth_scale", "mesh_error_reduction", "mesh_relaxed_max_non_ortho"):
                 self._set_provenance_user(k)
 
@@ -1807,6 +1835,7 @@ class TabGeneral3D(QWidget):
         self.lbl_init_mode.setText("Init: —")
         self.lbl_initiation_radius.setText("Initiation radius: —")
         self.lbl_charge_refine_info.setText("Charge refine: —")
+        self.lbl_charge_capture_info.setText("Charge capture: —")
         self.lbl_obstacle_refine_info.setText("Obstacle refine: —")
         self.lbl_est_charge_cells.setText("Est. charge cells: —")
         self.lbl_smallest_cell.setText("Smallest cell (est.): —")
@@ -1822,6 +1851,7 @@ class TabGeneral3D(QWidget):
             self.lbl_init_mode.setText("Init: —")
             self.lbl_initiation_radius.setText("Initiation radius: —")
             self.lbl_charge_refine_info.setText("Charge refine: —")
+            self.lbl_charge_capture_info.setText("Charge capture: —")
             self.lbl_obstacle_refine_info.setText("Obstacle refine: —")
             self.lbl_smallest_cell.setText("Smallest cell (est.): —")
             self.lbl_cells_in_ignition.setText("Cells in ignition region: —")
@@ -1861,6 +1891,32 @@ class TabGeneral3D(QWidget):
                 self.lbl_charge_refine_info.setToolTip(tip)
         else:
             self.lbl_charge_refine_info.setText("Charge refine: —")
+        cap = mode.get("charge_capture") or {}
+        if cap:
+            r_used = cap.get("charge_capture_radius_used_m")
+            cmode = cap.get("mode", "—")
+            r_phys = cap.get("physical_charge_radius_m")
+            cf = cap.get("charge_capture_factor")
+            ratio = cap.get("ratio_capture_to_physical")
+            parts = [f"mode {cmode}"]
+            if r_used is not None:
+                parts.append(f"R_cap={float(r_used):.4g} m")
+            if r_phys is not None:
+                parts.append(f"R_phys={float(r_phys):.4g} m")
+            if ratio is not None:
+                parts.append(f"ratio={float(ratio):.3g}")
+            if cf is not None:
+                parts.append(f"factor={float(cf):.3g}")
+            self.lbl_charge_capture_info.setText("Charge capture: " + ", ".join(parts))
+            desc = (cap.get("formula_description") or "").strip()
+            cap_ws = cap.get("warnings") or []
+            tip_cap = desc
+            if cap_ws:
+                tip_cap = (tip_cap + "\n\n" if tip_cap else "") + "\n".join(cap_ws)
+            if tip_cap:
+                self.lbl_charge_capture_info.setToolTip(tip_cap)
+        else:
+            self.lbl_charge_capture_info.setText("Charge capture: —")
         obs_r = mode.get("obstacle_refinement")
         snap = mode.get("snappy_refinement")
         if obs_r is not None:
@@ -2232,7 +2288,17 @@ class TabGeneral3D(QWidget):
             if idx >= 0:
                 self.c_cylinder_axis.setCurrentIndex(idx)
         elif key == "charge_backup_radius_factor":
-            self.spin_backup_factor.setValue(1.0)
+            self._bubble_radius_factor = 1.5
+            self._charge_capture_mode = "auto"
+            self._charge_capture_factor = 1.0
+            self._charge_backup_radius_override = None
+        elif key == "charge_capture_mode":
+            self._charge_capture_mode = "auto"
+        elif key == "charge_capture_factor":
+            self._charge_capture_factor = 1.0
+        elif key == "charge_capture_radius":
+            self._charge_capture_radius_manual = 0.2
+            self._charge_backup_radius_override = None
         elif key == "buffer_layers":
             self._buffer_layers = 2
         elif key == "activation_model":
@@ -2412,6 +2478,28 @@ class TabGeneral3D(QWidget):
                 self.spin_transition_cells.setEnabled(True)
             if "refine_indicator_field" in data:
                 self._refine_indicator_field = str(data["refine_indicator_field"]) or "densityGradient"
+            if "refine_interval" in data and data["refine_interval"] is not None:
+                try:
+                    self._refine_interval = max(1, int(data["refine_interval"]))
+                except (TypeError, ValueError):
+                    self._refine_interval = 3
+            if "lower_refine_threshold" in data and data["lower_refine_threshold"] is not None:
+                try:
+                    self._lower_refine_threshold = float(data["lower_refine_threshold"])
+                except (TypeError, ValueError):
+                    self._lower_refine_threshold = 0.1
+            if "unrefine_threshold" in data and data["unrefine_threshold"] is not None:
+                try:
+                    self._unrefine_threshold = float(data["unrefine_threshold"])
+                except (TypeError, ValueError):
+                    self._unrefine_threshold = 0.1
+            if "n_buffer_layers_dynamic" in data and data["n_buffer_layers_dynamic"] is not None:
+                try:
+                    self._n_buffer_layers_dynamic = max(0, int(data["n_buffer_layers_dynamic"]))
+                except (TypeError, ValueError):
+                    self._n_buffer_layers_dynamic = 2
+            if "enable_balancing" in data and data["enable_balancing"] is not None:
+                self._enable_balancing = bool(data["enable_balancing"])
             if "obstacle_feature_angle" in data:
                 self._obstacle_feature_angle = int(data["obstacle_feature_angle"])
             if "obstacle_cells_between_levels" in data:
@@ -2526,16 +2614,32 @@ class TabGeneral3D(QWidget):
                 idx = self.c_cylinder_axis.findText(data["cylinder_axis"])
                 if idx >= 0:
                     self.c_cylinder_axis.setCurrentIndex(idx)
+            if "charge_capture_factor" in data and data["charge_capture_factor"] is not None:
+                try:
+                    self._charge_capture_factor = float(data["charge_capture_factor"])
+                except (TypeError, ValueError):
+                    pass
+            if "charge_capture_radius" in data and data["charge_capture_radius"] is not None:
+                try:
+                    self._charge_capture_radius_manual = float(data["charge_capture_radius"])
+                except (TypeError, ValueError):
+                    pass
+            if "charge_capture_mode" in data:
+                cm = str(data["charge_capture_mode"] or "auto").lower()
+                self._charge_capture_mode = cm if cm in ("auto", "manual") else "auto"
             if "charge_backup_radius_factor" in data:
-                self.spin_backup_factor.setValue(data["charge_backup_radius_factor"])
+                # Legacy: was tied to capture; now only updates snappy/topoSet transition seed.
                 self._bubble_radius_factor = float(data["charge_backup_radius_factor"])
             if "charge_backup_radius_override" in data and data["charge_backup_radius_override"] is not None:
                 try:
-                    self._charge_backup_radius_override = float(data["charge_backup_radius_override"])
-                    self._backup_radius_manual = True
+                    o = float(data["charge_backup_radius_override"])
+                    self._charge_backup_radius_override = o
+                    if "charge_capture_mode" not in data:
+                        self._charge_capture_mode = "manual"
+                    if "charge_capture_radius" not in data:
+                        self._charge_capture_radius_manual = o
                 except (TypeError, ValueError):
                     self._charge_backup_radius_override = None
-                    self._backup_radius_manual = False
             if "bubble_radius_factor" in data:
                 self._bubble_radius_factor = float(data["bubble_radius_factor"])
             if "ignition_radius" in data and data["ignition_radius"] is not None:
@@ -2642,6 +2746,13 @@ class TabGeneral3D(QWidget):
         enable_obs = None if prov.get("enable_obstacle_refine") == "UNSET" else obs_refine
         ignition_mode = self.combo_ignition_mode.currentText()
         initiation_point = None if ignition_mode == "Center of Charge" else (self.init_ix.value(), self.init_iy.value(), self.init_iz.value())
+        _ccf_raw = getattr(self, "_charge_capture_factor", None)
+        charge_capture_factor_out = float(1.0 if _ccf_raw is None else _ccf_raw)
+        _cc_mode_l = str(getattr(self, "_charge_capture_mode", "auto") or "auto").lower()
+        _mrad_raw = getattr(self, "_charge_capture_radius_manual", None)
+        charge_capture_radius_out = (
+            float(_mrad_raw) if _cc_mode_l == "manual" and _mrad_raw is not None else None
+        )
         return CaseInputs3D(
             min_point=(self.sx1.value(), self.sy1.value(), self.sz1.value()),
             max_point=(self.sx2.value(), self.sy2.value(), self.sz2.value()),
@@ -2684,7 +2795,10 @@ class TabGeneral3D(QWidget):
             charge_outer_refine_max=self.spin_charge_outer_max.value(),
             transition_cells=transition_cells,
             use_seed_bubble=(refine and self.spin_charge_refine.value() > 0),
-            charge_backup_radius_factor=self.spin_backup_factor.value(),
+            charge_capture_mode=str(getattr(self, "_charge_capture_mode", "auto") or "auto"),
+            charge_capture_factor=charge_capture_factor_out,
+            charge_capture_radius=charge_capture_radius_out,
+            charge_backup_radius_factor=1.0,
             charge_backup_radius_override=getattr(self, "_charge_backup_radius_override", None),
             charge_backup_length_override=getattr(self, "_charge_backup_length_override", None),
             charge_aspect=self.c_aspect.value(),

@@ -9,6 +9,7 @@ except ImportError:
     pv = None
 
 from base_generator import BaseGenerator
+from charge_capture import resolve_charge_capture_radius_m
 from models import CaseInputs3D
 from path_utils import get_latest_time_dir, win_to_wsl_path
 
@@ -801,6 +802,8 @@ class Generator3D(BaseGenerator):
         self.openfoam_bashrc = openfoam_bashrc
         self._charge_clipped_by_domain = False  # Set by validate; used for case_init_mode.json
         self._charge_warnings = []  # List of warning strings for Info panel
+        self._last_charge_capture_meta: Optional[dict] = None
+        self._last_charge_refinement_dict_level: int = 0
 
     def _validate_inputs(self, inputs: CaseInputs3D) -> None:
         """Validate geometry and physical inputs; raise ValueError with clear message on failure."""
@@ -929,14 +932,16 @@ class Generator3D(BaseGenerator):
                 ign_rad_req = getattr(self, "_last_initiation_radius_requested", 0.05)
                 obs_refine = inputs.obstacles[0].refinement_level if inputs.obstacles else 0
                 placement_use_setfields = use_set_refined and getattr(inputs, "charge_shape", "") == "Cuboid"
+                cr_req = int(getattr(inputs, "charge_refinement_level", 0) or 0)
+                cr_dict = int(getattr(self, "_last_charge_refinement_dict_level", cr_req))
                 mode = {
                     "set_cmd": "setFields" if placement_use_setfields else ("setRefinedFields" if use_set_refined else "setFields"),
                     "fallback_reason": None,
                     "initiation_radius_requested": ign_rad_req,
                     "initiation_radius_effective": ign_rad,
                     "smallest_cell_near_charge": getattr(self, "_last_smallest_cell_near_charge", None),
-                    "charge_refinement_requested": getattr(inputs, "charge_refinement_level", 0),
-                    "charge_refinement_effective": charge_level if use_set_refined else 0,
+                    "charge_refinement_requested": cr_req,
+                    "charge_refinement_effective": cr_dict if use_set_refined else 0,
                     "obstacle_refinement": obs_refine,
                     "snappy_refinement": has_obstacles,
                     "charge_clipped_by_domain": getattr(self, "_charge_clipped_by_domain", False),
@@ -961,7 +966,8 @@ class Generator3D(BaseGenerator):
                 mode["base_cell_size"] = float(getattr(inputs, "cell_size", 0.5))
                 mode["charge_shape"] = getattr(inputs, "charge_shape", "Sphere")
                 mode["charge_size_info"] = self._charge_size_info(inputs, dims)
-                mode["user_requested_inside"] = getattr(inputs, "charge_refinement_level", 0) or 0
+                mode["user_requested_inside"] = cr_req
+                mode["charge_capture"] = getattr(self, "_last_charge_capture_meta", None) or {}
                 mode["snappy_charge_pre_level"] = 0
                 mode["internal_capture_levels"] = 0
                 mode["internal_charge_levels"] = 0
@@ -1113,10 +1119,13 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
         return True, f"{rmin} {rmax}"
 
     def _charge_outer_geometry(self, inputs: CaseInputs3D, dims: Dict[str, float]) -> tuple:
-        """Return (cx, cy, cz, outer_radius) for snappy charge refinement region. Outer radius is derived from seed radius so the transition band is consistent (reduces plateau)."""
+        """Return (cx, cy, cz, outer_radius) for snappy charge refinement region.
+
+        The inner seed uses ``bubble_radius_factor * R_charge`` only for the **outer transition
+        band** (chargeRefineOuter). This is not the setRefinedFields charge capture radius.
+        """
         cx, cy, cz = inputs.charge_center
         r = dims.get("radius", 0.05)
-        # Seed radius = same as topoSet chargeBubble (capture/ignition basis)
         factor = max(0.5, min(5.0, getattr(inputs, "bubble_radius_factor", 1.5)))
         seed_radius = r * factor
         cell_size = max(getattr(inputs, "cell_size", 0.1), 1e-9)
@@ -1766,11 +1775,12 @@ air
         the field — works regardless of base-mesh coarseness (matches the BlastFoam
         ``building3D`` reference tutorial).
 
-        ``override_charge_refinement_level`` (retry path) replaces the user level.
+        ``override_charge_refinement_level`` replaces the user level when set (e.g. one-off dict rewrite).
         ``charge_refinement_by_topo_set`` is kept for backward compatibility but
         ignored: the native path is always used now.
         """
         _ = charge_refinement_by_topo_set  # accepted for compatibility, not used
+        self._last_charge_capture_meta = None
         remap_enabled = getattr(inputs, "remap_enabled", False)
         n_buf = getattr(inputs, "buffer_layers", 2)
         if remap_enabled:
@@ -1790,6 +1800,7 @@ regions ( );
             charge_refine = max(0, min(8, remaining_inside_levels))
         else:
             charge_refine = max(0, min(8, getattr(inputs, "charge_refinement_level", 0)))
+        self._last_charge_refinement_dict_level = int(charge_refine)
         apply_refine_in_region = charge_refine > 0
         use_refined = charge_refine > 0 and inputs.charge_shape in ("Sphere", "Cylinder")
         rho = inputs.rho_charge if inputs.rho_charge > 0 else 1600.0
@@ -1816,24 +1827,16 @@ regions ( );
                     side = dims.get("side", 0.1)
                     self._validate_charge_position(inputs, side / 2.0, half_extent_axis=side / 2.0)
 
-        # Backup region (mirrors the BlastFoam building3D reference): provides a fallback
-        # search domain when the true charge is too small for setRefinedFields to find
-        # any cell on the base mesh.  Backup factor = bubble_radius_factor (default 1.5x).
-        # Keep a floor tied to base cell size so seeding can succeed even when
-        # charge outer pre-refinement is disabled (Outside = 0 / 0).
-        backup_factor = max(1.0, min(5.0, getattr(inputs, "bubble_radius_factor", 1.5)))
-        backup_radius_override = getattr(inputs, "charge_backup_radius_override", None)
-        base_dx = max(1e-9, float(getattr(inputs, "cell_size", 0.0) or 0.0))
+        # Charge capture region (setFieldsDict keyword ``backup``): minimal search volume so
+        # setRefinedFields can seed mass on a coarse base mesh. Independent of snappy outer
+        # transition (bubble_radius_factor) — see _charge_outer_geometry / topoSet seed paths.
         if use_refined and inputs.charge_shape == "Sphere":
             r = dims["radius"]
             ref_part = f"        refineInternal yes;\n        level {charge_refine};\n        " if apply_refine_in_region else ""
-            if backup_radius_override is not None:
-                try:
-                    backup_radius = max(float(backup_radius_override), 1.25 * base_dx)
-                except (TypeError, ValueError):
-                    backup_radius = max(r * backup_factor, 1.25 * base_dx)
-            else:
-                backup_radius = max(r * backup_factor, 1.25 * base_dx)
+            backup_radius, cap_report = resolve_charge_capture_radius_m(inputs, r)
+            self._last_charge_capture_meta = cap_report.as_json_dict()
+            for w in cap_report.warnings:
+                self._charge_warnings.append(w)
             backup_block = (
                 f"        backup\n        {{\n"
                 f"            centre ({cx} {cy} {cz});\n"
@@ -1879,13 +1882,10 @@ regions ( );
             else:
                 backup_len = max(length, 2.0 * r)
             l_vec[axis_idx] = backup_len
-            if backup_radius_override is not None:
-                try:
-                    backup_radius = max(float(backup_radius_override), 1.25 * base_dx)
-                except (TypeError, ValueError):
-                    backup_radius = max(r * backup_factor, 1.25 * base_dx)
-            else:
-                backup_radius = max(r * backup_factor, 1.25 * base_dx)
+            backup_radius, cap_report = resolve_charge_capture_radius_m(inputs, r)
+            self._last_charge_capture_meta = cap_report.as_json_dict()
+            for w in cap_report.warnings:
+                self._charge_warnings.append(w)
             backup_block = (
                 f"        backup\n        {{\n"
                 f"            centre ({cx} {cy} {cz});\n"
@@ -1965,7 +1965,7 @@ regions ( {region_str} );
         self._write_text(os.path.join(case_dir, "system", "setFieldsDict"), content)
 
     def _write_topo_set_dict_3d(self, case_dir: str, inputs: CaseInputs3D, dims: Dict[str, float]) -> None:
-        """Write topoSetDict for seed-bubble refinement (charge capture / ignition seed). Radius from bubble_radius_factor only."""
+        """Write topoSetDict for optional seed refinement sphere (legacy path). Radius from bubble_radius_factor only — not setRefinedFields capture."""
         cx, cy, cz = inputs.charge_center
         r = dims.get("radius", 0.05)
         factor = max(0.5, min(5.0, getattr(inputs, "bubble_radius_factor", 1.5)))

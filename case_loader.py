@@ -353,6 +353,9 @@ def _parse_setFieldsDict(case_dir: str, out: Dict[str, Any]) -> None:
     backup_rad = _scalar(backup, "radius") if backup else None
     if backup_rad is not None and backup_rad > 1e-9:
         out["charge_backup_radius_override"] = backup_rad
+        # Preserve exact setFieldsDict backup radius as manual charge capture (new terminology).
+        out["charge_capture_mode"] = "manual"
+        out["charge_capture_radius"] = float(backup_rad)
         mass_val = out.get("mass_kg")
         rho_val = out.get("rho_charge")
         if mass_val and rho_val and rho_val > 0:
@@ -778,7 +781,9 @@ UI_FIELD_KEYS = [
     "enable_obstacle_refine", "obstacle_refine_min", "obstacle_refine_max",
     "outside_extent", "transition_cells",
     "charge_refinement_level", "charge_outer_refine_min", "charge_outer_refine_max", "charge_outer_refine_enable",
-    "cylinder_axis", "charge_backup_radius_factor", "charge_backup_radius_override", "buffer_layers",
+    "cylinder_axis",
+    "charge_capture_mode", "charge_capture_factor", "charge_capture_radius",
+    "charge_backup_radius_factor", "charge_backup_radius_override", "buffer_layers",
     "enable_post_processing",
     "refine_interval", "lower_refine_threshold", "unrefine_threshold", "n_buffer_layers_dynamic", "refine_indicator_field", "enable_balancing",
     "obstacle_feature_angle", "obstacle_cells_between_levels", "obstacle_snap_iter", "obstacle_feature_snap_iter",

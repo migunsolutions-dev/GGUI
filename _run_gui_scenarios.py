@@ -11,6 +11,7 @@ generated case matches what the user configured in the GUI.
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import sys
@@ -163,7 +164,7 @@ def scenario_sphere_b3d(tab: TabGeneral3D) -> None:
     _set_charge(tab, "Sphere", 25.0, 1601.0, (0.0, 0.0, 0.5))
     _select_dyn(tab, refine_max=1, refine_min=2)
     _set_charge_refine(tab, inside=5, outer_min=2, outer_max=3)
-    tab._bubble_radius_factor = 1.5
+    tab._bubble_radius_factor = 1.5  # snappy transition seed; charge capture is separate (auto)
 
 def expect_sphere_b3d(res: Result, case_dir: str) -> None:
     sf = read(case_dir, "system/setFieldsDict")
@@ -173,8 +174,8 @@ def expect_sphere_b3d(res: Result, case_dir: str) -> None:
     assert_in(res, sf, "refineInternal yes", "setFieldsDict uses native refineInternal")
     assert_in(res, sf, "level 5", "setFieldsDict level=5")
     assert_in(res, sf, "backup", "setFieldsDict has backup region")
-    # backup.radius ~ 0.155 * 1.5 = 0.232583 m for 25 kg @ 1601 kg/m3
-    assert_match(res, sf, r"radius\s+0\.23\d+", "backup.radius ~= 1.5 x R")
+    # Auto capture: max(1.05*R, 0.5*sqrt(3)*dx*factor) with dx=0.5, factor=1, R~0.155 m → ~0.433 m
+    assert_match(res, sf, r"radius\s+0\.43[0-9]", "backup.radius matches auto charge capture policy")
     assert_in(res, dm, "adaptiveFvMesh", "dynamicMeshDict adaptive")
     assert_in(res, dm, "maxRefinement   1", "dynamicMeshDict maxRefinement=1")
     assert_in(res, dm, "dumpLevel      true", "dumpLevel true (allows level field decay visualization)")
@@ -268,7 +269,12 @@ def scenario_sphere_factor3(tab: TabGeneral3D) -> None:
     _set_charge(tab, "Sphere", 25.0, 1601.0, (0.0, 0.0, 0.5))
     _select_dyn(tab, refine_max=1, refine_min=2)
     _set_charge_refine(tab, inside=5, outer_min=2, outer_max=3)
-    tab._bubble_radius_factor = 3.0
+    tab._bubble_radius_factor = 1.5
+    vol = 25.0 / 1601.0
+    r_phys = ((3.0 * vol) / (4.0 * math.pi)) ** (1.0 / 3.0)
+    tab._charge_capture_mode = "manual"
+    tab._charge_capture_radius_manual = 3.0 * r_phys
+    tab._charge_backup_radius_override = 3.0 * r_phys
 
 def expect_sphere_factor3(res: Result, case_dir: str) -> None:
     sf = read(case_dir, "system/setFieldsDict")

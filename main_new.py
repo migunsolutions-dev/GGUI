@@ -444,7 +444,7 @@ class BlastFoamApp(QMainWindow):
                     lines.append(f"  {fpath}: " + ", ".join(keys))
         if notes:
             lines.append("")
-            lines.append("Load notes (seed/backup interpretation):")
+            lines.append("Load notes (seed / charge capture interpretation):")
             for note in notes:
                 lines.append(f"  - {note}")
         lines.append("")
@@ -669,6 +669,8 @@ class BlastFoamApp(QMainWindow):
                     f"charge_refinement_effective: {mode.get('charge_refinement_effective', 0)}",
                     f"charge_clipped_by_domain: {mode.get('charge_clipped_by_domain', '—')}",
                     f"cells_inside_charge: {mode.get('cells_inside_charge', '—')}",
+                    f"charge_capture_radius_used_m: {(mode.get('charge_capture') or {}).get('charge_capture_radius_used_m', '—')}",
+                    f"charge_capture_mode: {(mode.get('charge_capture') or {}).get('mode', '—')}",
                 ]
             )
         lines.append(f"Retries used: {retries_used}")
@@ -703,7 +705,23 @@ class BlastFoamApp(QMainWindow):
                 case_name = self.service.make_case_name(prefix)
                 case_dir = self.service.generate_case(case_name, inputs)
                 self.active_case_dir_3d = case_dir
-                
+                if not getattr(inputs, "remap_enabled", False):
+                    _cap_path = os.path.join(case_dir, "case_init_mode.json")
+                    if os.path.isfile(_cap_path):
+                        try:
+                            import json
+                            with open(_cap_path, "r", encoding="utf-8") as _cf:
+                                _cap_mode = json.load(_cf)
+                            _cap_ws = (_cap_mode.get("charge_capture") or {}).get("warnings") or []
+                            if _cap_ws:
+                                QMessageBox.warning(
+                                    self,
+                                    "Charge capture",
+                                    "\n\n".join(_cap_ws),
+                                )
+                        except (OSError, ValueError, KeyError):
+                            pass
+
                 self.status_bar.set_status("Initializing Mesh...", "#f39c12")
                 QApplication.processEvents()
                 
@@ -788,8 +806,8 @@ class BlastFoamApp(QMainWindow):
                     #   → setRefinedFields (refines mesh inside charge AND fills α.c4 in one
                     #   pass via ``refineInternal yes; level N`` in setFieldsDict regions).
                     # No manual topoSet+refineMesh capture/charge stages: setRefinedFields
-                    # handles small charges on coarse base meshes natively (with backup region
-                    # in setFieldsDict as the search fallback).
+                    # uses the setFieldsDict charge capture region (backup {{ ... }}) as the
+                    # mesh search fallback — separate from the snappy outer transition sphere.
                     preflight = " && ( [ ! -f system/expectedFeatureEdges.txt ] || ( while read -r f; do [ -z \"$f\" ] && continue; [ -f \"$f\" ] || { echo \"FATAL: .eMesh required at $f missing\"; exit 1; }; done < system/expectedFeatureEdges.txt ) ) && "
                     init_part1 = (
                         clean_first
@@ -823,52 +841,18 @@ class BlastFoamApp(QMainWindow):
                         return
                     success = self._run_wsl_commands(case_dir, init_part2)
                 retries_used = 0
-                last_retry_level = None
                 if not success and not use_remap:
-                    # If alpha.c4 fill failed, retry setRefinedFields up to 3x with a higher
-                    # internal refinement level (Inside).  Native ``refineInternal`` mechanism:
-                    # higher level → finer subdivision inside the charge region → better chance
-                    # of capturing a small charge on a coarse base mesh.  Allowed only when
-                    # AMR is on (Dyn Mesh) — Fixed Mesh users explicitly opted out of refinement.
-                    allow_retry_refine = bool(getattr(inputs, "enable_dyn_refine", False))
-                    mode_path = os.path.join(case_dir, "case_init_mode.json")
-                    try:
-                        import json
-                        with open(mode_path, "r", encoding="utf-8") as f:
-                            mode = json.load(f)
-                        current_eff = mode.get("charge_refinement_effective", 0) or 0
-                    except (OSError, ValueError, KeyError):
-                        current_eff = effective_charge_refine(inputs)
-                    gen = getattr(self.service, "generator_3d", None)
-                    if gen is None:
-                        from generator_3d import Generator3D
-                        gen = Generator3D(self.service.base_projects_path, self.service.openfoam_bashrc)
-                    for retry in range(1, 4) if allow_retry_refine else []:
-                        next_level = min(current_eff + retry, 8) if (set_cmd == "setRefinedFields" and current_eff > 0) else min(retry, 8)
-                        last_retry_level = next_level
-                        gen.write_set_fields_dict_only(case_dir, inputs, override_charge_refinement_level=next_level)
-                        retry_cmd = (
-                            "rm -rf 0 && cp -r 0.orig 0 && changeDictionary && setRefinedFields && " + alpha_check
-                        )
-                        success = self._run_wsl_commands(case_dir, retry_cmd)
-                        retries_used = retry
-                        if success:
-                            set_cmd = "setRefinedFields"
-                            break
-                    if not success:
-                        self.status_bar.set_status("Init Failed", "#e74c3c")
-                        msg = (
-                            "Charge seeding failed (no explosive mass captured in the mesh).\n\n"
-                            "Recommended fixes:\n"
-                            "1) Increase 'Inside' (Charge pre-refinement).\n"
-                            "2) Increase 'Backup radius factor (bubble)' in Mesh Properties.\n"
-                            "3) Reduce base Cell size if the mesh is too coarse.\n"
-                            "4) As last resort only: temporarily raise Outside Min/Max for initialization.\n"
-                        )
-                        if retries_used > 0:
-                            msg += f"\nAutomatic retries already attempted: {retries_used}."
-                        QMessageBox.critical(self, "Init Error", msg)
-                        return
+                    self.status_bar.set_status("Init Failed", "#e74c3c")
+                    msg = (
+                        "The charge was not captured with the current base mesh and charge-seeding settings.\n\n"
+                        "Suggested actions:\n"
+                        "• Increase charge seed refinement level (Charge pre-refinement / Inside).\n"
+                        "• Increase the charge capture radius (Mesh Properties → Advanced).\n"
+                        "• Reduce base cell size.\n"
+                        "• Check charge location relative to the mesh.\n"
+                    )
+                    QMessageBox.critical(self, "Init Error", msg)
+                    return
                 if not success and use_remap:
                     self.status_bar.set_status("Init Failed", "#e74c3c")
                     QMessageBox.critical(self, "Init Error", "Mesh initialization failed. Check console output for details.")
@@ -883,9 +867,6 @@ class BlastFoamApp(QMainWindow):
                             charge_cells, _ = get_charge_cell_count(case_dir, "0", 0.5)
                             mode["cells_inside_charge"] = charge_cells
                         mode["retries_used"] = retries_used
-                        if retries_used > 0 and last_retry_level is not None:
-                            mode["set_cmd"] = "setRefinedFields"
-                            mode["charge_refinement_effective"] = last_retry_level
                         with open(mode_path, "w", encoding="utf-8") as f:
                             json.dump(mode, f, indent=2)
                     except (OSError, ValueError, KeyError):
