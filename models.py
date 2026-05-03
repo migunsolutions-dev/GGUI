@@ -167,7 +167,11 @@ class CaseInputs3D:
     n_buffer_layers_dynamic: int = 2
     enable_balancing: bool = False
     dynamic_max_cells: int = 200000000
-    refine_indicator_field: str = "densityGradient"  # errorEstimator in dynamicMeshDict
+    refine_indicator_field: str = "densityGradient"  # densityGradient | scaledDelta_p (pressure field p)
+    begin_unrefine: Optional[float] = None  # beginUnrefine in dynamicMeshDict
+    upper_refine_level: Optional[float] = None  # upperRefineLevel
+    upper_unrefine_level: Optional[float] = None  # upperUnrefineLevel
+    balance_interval: Optional[int] = None  # loadBalance { balanceInterval ... }
     # --- Obstacle/snappy advanced (surfaceFeaturesDict + snappyHexMeshDict) ---
     obstacle_feature_angle: int = 120       # includedAngle (building3D: 120)
     obstacle_cells_between_levels: int = 2  # nCellsBetweenLevels (building3D: 2)

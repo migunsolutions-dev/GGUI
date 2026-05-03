@@ -521,7 +521,32 @@ def _parse_dynamicMeshDict(case_dir: str, out: Dict[str, Any]) -> None:
         out["n_buffer_layers_dynamic"] = v
     s = _string_val(text, "errorEstimator")
     if s is not None:
-        out["refine_indicator_field"] = s
+        if s == "scaledDelta":
+            dc = _find_block(text, "deltaCoeffs")
+            field_name = _string_val(dc, "field") if dc else None
+            if field_name == "p":
+                out["refine_indicator_field"] = "scaledDelta_p"
+            else:
+                out["refine_indicator_field"] = "scaledDelta"
+        else:
+            out["refine_indicator_field"] = s
+    v = _int_val(text, "maxCells")
+    if v is not None:
+        out["dynamic_max_cells"] = v
+    v = _scalar(text, "beginUnrefine")
+    if v is not None:
+        out["begin_unrefine"] = v
+    v = _scalar(text, "upperRefineLevel")
+    if v is not None:
+        out["upper_refine_level"] = v
+    v = _scalar(text, "upperUnrefineLevel")
+    if v is not None:
+        out["upper_unrefine_level"] = v
+    lb = _find_block(text, "loadBalance")
+    if lb:
+        bi = _int_val(lb, "balanceInterval")
+        if bi is not None:
+            out["balance_interval"] = bi
     s = _string_val(text, "enableBalancing")
     if s is not None:
         out["enable_balancing"] = s.lower() == "true"
@@ -786,6 +811,7 @@ UI_FIELD_KEYS = [
     "charge_backup_radius_factor", "charge_backup_radius_override", "buffer_layers",
     "enable_post_processing",
     "refine_interval", "lower_refine_threshold", "unrefine_threshold", "n_buffer_layers_dynamic", "refine_indicator_field", "enable_balancing",
+    "dynamic_max_cells", "begin_unrefine", "upper_refine_level", "upper_unrefine_level", "balance_interval",
     "obstacle_feature_angle", "obstacle_cells_between_levels", "obstacle_snap_iter", "obstacle_feature_snap_iter",
     "activation_model", "activation_model_ui",
     "mesh_included_angle", "mesh_n_smooth_patch", "mesh_snap_tolerance", "mesh_n_solve_iter", "mesh_n_relax_iter",
@@ -806,7 +832,7 @@ UNSUPPORTED_KEYS_BY_FILE: Dict[str, List[str]] = {
     "system/setFieldsDict": ["defaultFieldValues", "regions"],
     "constant/phaseProperties": ["phases", "products", "reactants", "air", "activationModel", "initiationPoints", "equationOfState", "thermodynamics"],
     "system/decomposeParDict": ["method", "numberOfSubdomains", "roots", "hierarchicalCoeffs", "manualCoeffs", "scotchCoeffs"],
-    "constant/dynamicMeshDict": ["dynamicFvMesh", "errorEstimator", "refineInterval", "lowerRefineLevel", "unrefineLevel", "nBufferLayers", "maxRefinement", "maxCells", "dumpLevel", "enableBalancing"],
+    "constant/dynamicMeshDict": ["dynamicFvMesh", "deltaCoeffs", "dumpLevel"],
     "system/snappyHexMeshDict": ["castellatedMeshControls", "snapControls", "addLayersControls", "meshQualityControls", "geometry", "features", "refinementSurfaces", "refinementRegions", "locationInMesh", "debug"],
     "0/p": ["internalField", "boundaryField"],
     "0/T": ["internalField", "boundaryField"],

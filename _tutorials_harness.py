@@ -147,6 +147,13 @@ def build_inputs_from_loaded(loaded: Dict[str, Any], original_case_dir_win: str)
         unrefine_threshold=float(loaded.get("unrefine_threshold") or 0.1),
         n_buffer_layers_dynamic=int(loaded.get("n_buffer_layers_dynamic") or 2),
         enable_balancing=bool(loaded.get("enable_balancing") or False),
+        dynamic_max_cells=int(loaded.get("dynamic_max_cells") or 200000000),
+        outside_extent=loaded.get("outside_extent"),
+        begin_unrefine=loaded.get("begin_unrefine"),
+        upper_refine_level=loaded.get("upper_refine_level"),
+        upper_unrefine_level=loaded.get("upper_unrefine_level"),
+        balance_interval=loaded.get("balance_interval"),
+        refine_indicator_field=str(loaded.get("refine_indicator_field") or "densityGradient"),
         # Run mode (default fast)
         enable_post_processing=bool(loaded.get("enable_post_processing") or False),
         fast_run_mode=True,

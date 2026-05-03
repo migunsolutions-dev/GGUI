@@ -497,6 +497,12 @@ class TabGeneral3D(QWidget):
         self._refine_indicator_field = "densityGradient"
         # Snappy outer transition + optional topoSet seed: R_seed = R_charge * factor (not setRefinedFields capture).
         self._bubble_radius_factor = 1.5
+        self._outside_extent = None  # None/0 in Mesh Properties = auto transition shell thickness
+        self._dynamic_max_cells = 200000000
+        self._begin_unrefine = None
+        self._upper_refine_level = None
+        self._upper_unrefine_level = None
+        self._balance_interval = None
         # Charge capture (setFieldsDict ``backup``): separate from transition seed above.
         self._charge_capture_mode = "auto"
         self._charge_capture_factor = 1.0
@@ -1298,6 +1304,20 @@ class TabGeneral3D(QWidget):
         rad_cap_manual.toggled.connect(lambda _v: _refresh_cap_ctrls())
         v.addWidget(grp_buf)
 
+        grp_transition = QGroupBox("Initial dense / transition (charge outer shell)")
+        f_tr = QFormLayout(grp_transition)
+        spin_out_extent = QDoubleSpinBox()
+        spin_out_extent.setRange(0.0, 1e6)
+        spin_out_extent.setDecimals(6)
+        spin_out_extent.setSingleStep(0.01)
+        _oe = getattr(self, "_outside_extent", None)
+        spin_out_extent.setValue(0.0 if _oe is None else float(_oe))
+        spin_out_extent.setToolTip("Physical thickness [m] added to the charge surface for chargeRefineOuter / outsideShell. "
+                                   "0 = Auto (legacy bubble_radius_factor + transition band; see case_init_mode.json).")
+        f_tr.addRow("Outside extent (0 = Auto) [m]", spin_out_extent)
+        f_tr.addRow("", QLabel("Does not set charge capture radius. Transition shape follows charge geometry (sphere / cylinder / box)."))
+        v.addWidget(grp_transition)
+
         # Run mode (Allrun + controlDict) — tradeoffs between speed and verification.
         # Default values are tuned to match building3D's hand-tuned Allrun (~2.5x faster
         # than verbose mode for the same simulated time).
@@ -1349,12 +1369,51 @@ class TabGeneral3D(QWidget):
         spin_amr_max.setValue(int(getattr(self, "_dyn_refine_max", self.spin_refine_max.value())))
         f_amr.addRow("Max Refinement (AMR)", spin_amr_max)
         f_amr.addRow("", QLabel("maxRefinement in dynamicMeshDict (building3D: 1)."))
+        spin_dyn_max_cells = QSpinBox()
+        spin_dyn_max_cells.setRange(1_000, 2_000_000_000)
+        spin_dyn_max_cells.setSingleStep(100_000)
+        spin_dyn_max_cells.setValue(int(getattr(self, "_dynamic_max_cells", 200000000)))
+        f_amr.addRow("Max cells (maxCells)", spin_dyn_max_cells)
+        spin_begin_unref = QDoubleSpinBox()
+        spin_begin_unref.setRange(-1.0, 1.0e12)
+        spin_begin_unref.setDecimals(8)
+        spin_begin_unref.setSpecialValueText("(omit)")
+        _bu = getattr(self, "_begin_unrefine", None)
+        spin_begin_unref.setValue(-1.0 if _bu is None else float(_bu))
+        f_amr.addRow("beginUnrefine (time)", spin_begin_unref)
+        spin_upper_ref = QDoubleSpinBox()
+        spin_upper_ref.setRange(-1.0, 1.0e6)
+        spin_upper_ref.setDecimals(6)
+        spin_upper_ref.setSpecialValueText("(omit)")
+        _ur = getattr(self, "_upper_refine_level", None)
+        spin_upper_ref.setValue(-1.0 if _ur is None else float(_ur))
+        f_amr.addRow("upperRefineLevel", spin_upper_ref)
+        spin_upper_ur = QDoubleSpinBox()
+        spin_upper_ur.setRange(-1.0, 1.0e6)
+        spin_upper_ur.setDecimals(6)
+        spin_upper_ur.setSpecialValueText("(omit)")
+        _uur = getattr(self, "_upper_unrefine_level", None)
+        spin_upper_ur.setValue(-1.0 if _uur is None else float(_uur))
+        f_amr.addRow("upperUnrefineLevel", spin_upper_ur)
+        chk_bal = QCheckBox()
+        chk_bal.setChecked(bool(getattr(self, "_enable_balancing", False)))
+        f_amr.addRow("Enable load balancing", chk_bal)
+        spin_bal_int = QSpinBox()
+        spin_bal_int.setRange(0, 1_000_000)
+        _bi = getattr(self, "_balance_interval", None)
+        spin_bal_int.setValue(0 if _bi is None else int(_bi))
+        spin_bal_int.setToolTip("Written inside loadBalance { balanceInterval ... } when load balancing is on. 0 = omit.")
+        f_amr.addRow("balanceInterval (0 = omit)", spin_bal_int)
         combo_refine_indicator = QComboBox()
-        combo_refine_indicator.setEditable(True)
-        combo_refine_indicator.addItems(["densityGradient", "pressureGradient"])
-        combo_refine_indicator.setCurrentText(str(getattr(self, "_refine_indicator_field", "densityGradient")))
-        f_amr.addRow("Refine Indicator Field", combo_refine_indicator)
-        f_amr.addRow("", QLabel("dynamicMeshDict errorEstimator (default: densityGradient)."))
+        combo_refine_indicator.addItem("densityGradient", "densityGradient")
+        combo_refine_indicator.addItem("scaledDelta (pressure p)", "scaledDelta_p")
+        cur_ri = str(getattr(self, "_refine_indicator_field", "densityGradient") or "densityGradient")
+        if cur_ri.strip().lower() in ("pressuregradient", "pressure", "scaleddelta_p", "scaleddelta"):
+            combo_refine_indicator.setCurrentIndex(1)
+        else:
+            combo_refine_indicator.setCurrentIndex(0)
+        f_amr.addRow("AMR error estimator", combo_refine_indicator)
+        f_amr.addRow("", QLabel("densityGradient = default blast AMR. Pressure mode uses OpenFOAM scaledDelta on field p (not bare pressureGradient)."))
         v.addWidget(grp_amr)
 
         # Seeding and Initiation
@@ -1566,7 +1625,25 @@ class TabGeneral3D(QWidget):
             self._unrefine_threshold = spin_unref.value()
             self._dyn_refine_max = spin_amr_max.value()
             self.spin_refine_max.setValue(self._dyn_refine_max)
-            self._refine_indicator_field = combo_refine_indicator.currentText().strip() or "densityGradient"
+            self._dynamic_max_cells = int(spin_dyn_max_cells.value())
+            self._begin_unrefine = None if spin_begin_unref.value() < -0.5 else float(spin_begin_unref.value())
+            self._upper_refine_level = None if spin_upper_ref.value() < -0.5 else float(spin_upper_ref.value())
+            self._upper_unrefine_level = None if spin_upper_ur.value() < -0.5 else float(spin_upper_ur.value())
+            self._enable_balancing = chk_bal.isChecked()
+            self._balance_interval = None if spin_bal_int.value() <= 0 else int(spin_bal_int.value())
+            v_oe = float(spin_out_extent.value())
+            self._outside_extent = None if v_oe <= 0.0 else v_oe
+            self._refine_indicator_field = str(combo_refine_indicator.currentData() or "densityGradient")
+            for k in (
+                "outside_extent",
+                "dynamic_max_cells",
+                "begin_unrefine",
+                "upper_refine_level",
+                "upper_unrefine_level",
+                "balance_interval",
+                "enable_balancing",
+            ):
+                self._set_provenance_user(k)
             self._ignition_radius_manual = chk_ign_manual.isChecked()
             if self._ignition_radius_manual:
                 self._ignition_radius = spin_ign_radius.value()
@@ -1864,9 +1941,39 @@ class TabGeneral3D(QWidget):
             return
         set_cmd = mode.get("set_cmd") or "—"
         self.lbl_init_mode.setText(f"Init: {set_cmd}")
+        init_tip_lines = []
         fallback = mode.get("fallback_reason")
         if fallback:
-            self.lbl_init_mode.setToolTip(f"Fallback: {fallback}")
+            init_tip_lines.append(f"Fallback: {fallback}")
+        da = mode.get("domain_alignment") or {}
+        if da.get("requested_lengths_m") and da.get("actual_lengths_m"):
+            init_tip_lines.append(
+                f"Domain lengths requested {da.get('requested_lengths_m')} m → actual {da.get('actual_lengths_m')} m "
+                f"(cell {da.get('requested_cell_size_m')} m, n_cells {da.get('n_cells_xyz')})"
+            )
+        tr = mode.get("transition_region") or {}
+        if tr.get("outside_extent_m") is not None:
+            init_tip_lines.append(
+                f"Transition shell: {tr.get('snappy_type') or '—'}, outside_extent≈{tr.get('outside_extent_m'):.4g} m "
+                f"({'auto' if tr.get('outside_extent_auto') else 'user'})"
+            )
+        amr_w = mode.get("amr_written")
+        if isinstance(amr_w, dict) and amr_w.get("errorEstimator_line"):
+            init_tip_lines.append(
+                f"AMR: {amr_w.get('errorEstimator_line')} maxRefinement={amr_w.get('maxRefinement')} "
+                f"refineInterval={amr_w.get('refineInterval')} maxCells={amr_w.get('maxCells')}"
+            )
+            if amr_w.get("enableBalancing"):
+                init_tip_lines.append(
+                    f"Load balance: enableBalancing=true, balanceInterval={amr_w.get('balanceInterval')}"
+                )
+        bc = mode.get("base_cell_count")
+        if bc is not None:
+            init_tip_lines.append(f"Base mesh cell count (blockMesh): {int(bc):,}")
+        if init_tip_lines:
+            self.lbl_init_mode.setToolTip("\n".join(init_tip_lines))
+        else:
+            self.lbl_init_mode.setToolTip("")
         req = mode.get("initiation_radius_requested")
         eff = mode.get("initiation_radius_effective")
         if req is not None and eff is not None:
@@ -2247,7 +2354,7 @@ class TabGeneral3D(QWidget):
         elif key == "obstacle_refine_max":
             self.spin_obstacle_refine_max.setValue(2)
         elif key == "outside_extent":
-            self.spin_transition_cells.setValue(2)
+            self._outside_extent = None
         elif key == "transition_cells":
             self.spin_transition_cells.setValue(2)
         elif key == "refine_interval":
@@ -2264,6 +2371,16 @@ class TabGeneral3D(QWidget):
             self._refine_indicator_field = "densityGradient"
         elif key == "enable_balancing":
             self._enable_balancing = False
+        elif key == "dynamic_max_cells":
+            self._dynamic_max_cells = 200000000
+        elif key == "begin_unrefine":
+            self._begin_unrefine = None
+        elif key == "upper_refine_level":
+            self._upper_refine_level = None
+        elif key == "upper_unrefine_level":
+            self._upper_unrefine_level = None
+        elif key == "balance_interval":
+            self._balance_interval = None
         elif key == "obstacle_feature_angle":
             self._obstacle_feature_angle = 120
         elif key == "obstacle_cells_between_levels":
@@ -2313,7 +2430,7 @@ class TabGeneral3D(QWidget):
         if getattr(self, "_block_signals", False):
             return
         self._provenance[key] = "USER"
-        if key == "outside_extent" or key == "transition_cells":
+        if key == "transition_cells":
             self.spin_transition_cells.setEnabled(True)
         elif key == "enable_dyn_refine":
             self.rad_dyn_mesh.setEnabled(True)
@@ -2323,7 +2440,9 @@ class TabGeneral3D(QWidget):
 
     def _apply_unset_for_key(self, key: str) -> None:
         """Show optional field as UNSET: disable and/or set sentinel so generation does not override loaded case."""
-        if key == "outside_extent" or key == "transition_cells":
+        if key == "outside_extent":
+            self._outside_extent = None
+        elif key == "transition_cells":
             self.spin_transition_cells.setValue(2)
             self.spin_transition_cells.setEnabled(False)
         elif key == "enable_dyn_refine":
@@ -2331,6 +2450,16 @@ class TabGeneral3D(QWidget):
             self.rad_fixed_mesh.setEnabled(False)
         elif key == "enable_obstacle_refine":
             self.chk_obstacle_refine.setEnabled(False)
+        elif key == "dynamic_max_cells":
+            self._dynamic_max_cells = 200000000
+        elif key == "begin_unrefine":
+            self._begin_unrefine = None
+        elif key == "upper_refine_level":
+            self._upper_refine_level = None
+        elif key == "upper_unrefine_level":
+            self._upper_unrefine_level = None
+        elif key == "balance_interval":
+            self._balance_interval = None
         else:
             # eos_model, activation_model_ui, thermo_model, decomposition_*, mesh_*: set internal to None
             attr = "_" + key
@@ -2472,12 +2601,42 @@ class TabGeneral3D(QWidget):
                 self.spin_transition_cells.setEnabled(True)
             if "match_outer_to_seed" in data:
                 self.chk_match_outer_to_seed.setChecked(bool(data["match_outer_to_seed"]))
-            elif "outside_extent" in data:
-                # Migration: old cases with outside_extent -> default Transition Cells 2
-                self.spin_transition_cells.setValue(2)
-                self.spin_transition_cells.setEnabled(True)
+            if "outside_extent" in data and data["outside_extent"] is not None:
+                try:
+                    oe = float(data["outside_extent"])
+                    self._outside_extent = oe if oe > 0 else None
+                except (TypeError, ValueError):
+                    self._outside_extent = None
+            if "dynamic_max_cells" in data and data["dynamic_max_cells"] is not None:
+                try:
+                    self._dynamic_max_cells = max(1, int(data["dynamic_max_cells"]))
+                except (TypeError, ValueError):
+                    pass
+            if "begin_unrefine" in data and data["begin_unrefine"] is not None:
+                try:
+                    self._begin_unrefine = float(data["begin_unrefine"])
+                except (TypeError, ValueError):
+                    self._begin_unrefine = None
+            if "upper_refine_level" in data and data["upper_refine_level"] is not None:
+                try:
+                    self._upper_refine_level = float(data["upper_refine_level"])
+                except (TypeError, ValueError):
+                    self._upper_refine_level = None
+            if "upper_unrefine_level" in data and data["upper_unrefine_level"] is not None:
+                try:
+                    self._upper_unrefine_level = float(data["upper_unrefine_level"])
+                except (TypeError, ValueError):
+                    self._upper_unrefine_level = None
+            if "balance_interval" in data and data["balance_interval"] is not None:
+                try:
+                    self._balance_interval = max(1, int(data["balance_interval"]))
+                except (TypeError, ValueError):
+                    self._balance_interval = None
             if "refine_indicator_field" in data:
-                self._refine_indicator_field = str(data["refine_indicator_field"]) or "densityGradient"
+                ri = str(data["refine_indicator_field"]) or "densityGradient"
+                if ri.strip().lower() in ("pressuregradient", "pressure"):
+                    ri = "scaledDelta_p"
+                self._refine_indicator_field = ri
             if "refine_interval" in data and data["refine_interval"] is not None:
                 try:
                     self._refine_interval = max(1, int(data["refine_interval"]))
@@ -2821,6 +2980,11 @@ class TabGeneral3D(QWidget):
             fast_run_mode=getattr(self, "_fast_run_mode", True),
             enable_balancing=bool(getattr(self, "_enable_balancing", False)),
             dynamic_max_cells=getattr(self, "_dynamic_max_cells", 200000000),
+            outside_extent=getattr(self, "_outside_extent", None),
+            begin_unrefine=getattr(self, "_begin_unrefine", None),
+            upper_refine_level=getattr(self, "_upper_refine_level", None),
+            upper_unrefine_level=getattr(self, "_upper_unrefine_level", None),
+            balance_interval=getattr(self, "_balance_interval", None),
             refine_indicator_field=getattr(self, "_refine_indicator_field", "densityGradient"),
             obstacle_feature_angle=getattr(self, "_obstacle_feature_angle", 120),
             obstacle_cells_between_levels=getattr(self, "_obstacle_cells_between_levels", 2),

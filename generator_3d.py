@@ -1,7 +1,8 @@
 import os
 import math
 import shutil
-from typing import Dict, Any, Optional
+from dataclasses import replace
+from typing import Dict, Any, Optional, Tuple
 
 try:
     import pyvista as pv
@@ -10,6 +11,7 @@ except ImportError:
 
 from base_generator import BaseGenerator
 from charge_capture import resolve_charge_capture_radius_m
+from mesh_domain import align_domain_to_cell_size
 from models import CaseInputs3D
 from path_utils import get_latest_time_dir, win_to_wsl_path
 
@@ -804,9 +806,12 @@ class Generator3D(BaseGenerator):
         self._charge_warnings = []  # List of warning strings for Info panel
         self._last_charge_capture_meta: Optional[dict] = None
         self._last_charge_refinement_dict_level: int = 0
+        self._last_domain_alignment: Optional[dict] = None
+        self._last_transition_region_meta: Optional[dict] = None
+        self._last_amr_written_meta: Optional[dict] = None
 
-    def _validate_inputs(self, inputs: CaseInputs3D) -> None:
-        """Validate geometry and physical inputs; raise ValueError with clear message on failure."""
+    def _validate_inputs_basic(self, inputs: CaseInputs3D) -> None:
+        """Domain order and global physical limits (before domain snap to cell size)."""
         min_p = inputs.min_point
         max_p = inputs.max_point
         if min_p[0] >= max_p[0]:
@@ -821,6 +826,12 @@ class Generator3D(BaseGenerator):
             raise ValueError("Charge mass must be positive.")
         if inputs.rho_charge <= 0:
             raise ValueError("Charge density must be positive.")
+
+    def _validate_inputs(self, inputs: CaseInputs3D) -> None:
+        """Full validation including charge center inside (possibly cell-snapped) domain."""
+        self._validate_inputs_basic(inputs)
+        min_p = inputs.min_point
+        max_p = inputs.max_point
         cx, cy, cz = inputs.charge_center
         if not (min_p[0] <= cx <= max_p[0] and min_p[1] <= cy <= max_p[1] and min_p[2] <= cz <= max_p[2]):
             raise ValueError("Charge center must lie inside the domain bounds.")
@@ -831,8 +842,21 @@ class Generator3D(BaseGenerator):
         """
         self._charge_clipped_by_domain = False
         self._charge_warnings = []
-        
+        self._last_domain_alignment = None
+        self._last_transition_region_meta = None
+        self._last_amr_written_meta = None
+
         try:
+            self._validate_inputs_basic(inputs)
+        except ValueError as e:
+            raise ValueError(f"Invalid 3D inputs: {e}") from e
+
+        try:
+            align = align_domain_to_cell_size(inputs.min_point, inputs.max_point, inputs.cell_size)
+            inputs = replace(inputs, min_point=align.min_point, max_point=align.max_point)
+            self._last_domain_alignment = align.to_case_metadata()
+            for msg in align.info_messages:
+                self._charge_warnings.append(msg)
             self._validate_inputs(inputs)
         except ValueError as e:
             raise ValueError(f"Invalid 3D inputs: {e}") from e
@@ -843,6 +867,17 @@ class Generator3D(BaseGenerator):
             obstacle_patch_names = self._get_obstacle_patch_names(inputs)
 
             remap_enabled = getattr(inputs, "remap_enabled", False)
+            if (
+                not remap_enabled
+                and getattr(inputs, "charge_shape", "") == "Cuboid"
+                and int(getattr(inputs, "charge_refinement_level", 0) or 0) > 0
+            ):
+                self._charge_warnings.append(
+                    "Cuboid with Inside refinement (charge_refinement_level > 0): initialization uses "
+                    "setRefinedFields with boxToCell and refineInternal. Compatibility depends on your blastFoam "
+                    "build; if meshing/init fails, use a finer base mesh or sphere/cylinder charge. "
+                    "The snappy transition region is still a searchableBox sized by outside_extent / auto policy."
+                )
             mapped_source_dir_linux = None
             mapped_source_time = None
             remap_case_path = getattr(inputs, "remap_case_path", "") or ""
@@ -934,6 +969,7 @@ class Generator3D(BaseGenerator):
                 placement_use_setfields = use_set_refined and getattr(inputs, "charge_shape", "") == "Cuboid"
                 cr_req = int(getattr(inputs, "charge_refinement_level", 0) or 0)
                 cr_dict = int(getattr(self, "_last_charge_refinement_dict_level", cr_req))
+                _ref_role_warn = self._refinement_role_warnings(inputs)
                 mode = {
                     "set_cmd": "setFields" if placement_use_setfields else ("setRefinedFields" if use_set_refined else "setFields"),
                     "fallback_reason": None,
@@ -945,7 +981,7 @@ class Generator3D(BaseGenerator):
                     "obstacle_refinement": obs_refine,
                     "snappy_refinement": has_obstacles,
                     "charge_clipped_by_domain": getattr(self, "_charge_clipped_by_domain", False),
-                    "charge_warnings": getattr(self, "_charge_warnings", []),
+                    "charge_warnings": list(getattr(self, "_charge_warnings", [])) + list(_ref_role_warn),
                     "cells_inside_charge": None,
                     "cells_in_ignition_region": None,
                     "expected_eMesh": self._expected_emesh_list(case_dir),
@@ -978,6 +1014,31 @@ class Generator3D(BaseGenerator):
                 mode["cells_in_ignition_region"] = None
                 mode["realization_status"] = "not_run"
                 mode["realization_message"] = None
+                mode["domain_alignment"] = getattr(self, "_last_domain_alignment", None)
+                _da_meta = mode["domain_alignment"] or {}
+                _nc = _da_meta.get("n_cells_xyz")
+                if _nc and len(_nc) == 3:
+                    mode["base_cell_count"] = int(_nc[0]) * int(_nc[1]) * int(_nc[2])
+                else:
+                    mode["base_cell_count"] = None
+                tr_meta = getattr(self, "_last_transition_region_meta", None)
+                if tr_meta is None:
+                    try:
+                        ext, auto, desc = self._resolve_transition_outside_extent_m(
+                            inputs, dims, max(1e-9, float(getattr(inputs, "cell_size", 0.1)))
+                        )
+                        tr_meta = {
+                            "outside_extent_m": ext,
+                            "outside_extent_auto": auto,
+                            "policy_description": desc,
+                            "charge_shape": getattr(inputs, "charge_shape", "Sphere"),
+                            "snappy_type": None,
+                        }
+                    except Exception:
+                        tr_meta = None
+                mode["transition_region"] = tr_meta
+                mode["refinement_role_warnings"] = _ref_role_warn
+                mode["amr_written"] = getattr(self, "_last_amr_written_meta", None)
                 self._write_text(mode_path, json.dumps(mode, indent=2))
 
             # Create case.foam for ParaView compatibility
@@ -1118,27 +1179,208 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
         rmax = max(rmin, rmax)
         return True, f"{rmin} {rmax}"
 
-    def _charge_outer_geometry(self, inputs: CaseInputs3D, dims: Dict[str, float]) -> tuple:
-        """Return (cx, cy, cz, outer_radius) for snappy charge refinement region.
+    def _characteristic_charge_extent_m(self, inputs: CaseInputs3D, dims: Dict[str, float]) -> float:
+        """Single length scale for legacy auto outside_extent (shell beyond charge)."""
+        shape = getattr(inputs, "charge_shape", "Sphere")
+        if shape == "Cuboid":
+            if "length" in dims and "width" in dims and "height" in dims:
+                hx = float(dims["length"]) / 2.0
+                hy = float(dims["width"]) / 2.0
+                hz = float(dims["height"]) / 2.0
+            else:
+                s = float(dims.get("side", 0.1)) / 2.0
+                hx = hy = hz = s
+            return max(hx, hy, hz)
+        if shape == "Cylinder":
+            r = float(dims.get("radius", 0.05))
+            half_l = float(dims.get("length", 0.1)) / 2.0
+            return max(r, half_l)
+        return float(dims.get("radius", 0.05))
 
-        The inner seed uses ``bubble_radius_factor * R_charge`` only for the **outer transition
-        band** (chargeRefineOuter). This is not the setRefinedFields charge capture radius.
+    def _resolve_transition_outside_extent_m(
+        self, inputs: CaseInputs3D, dims: Dict[str, float], cell_size: float,
+    ) -> Tuple[float, bool, str]:
+        """Physical shell thickness beyond the charge surface for the transition region.
+
+        Explicit ``outside_extent`` wins over legacy ``bubble_radius_factor`` auto policy.
         """
-        cx, cy, cz = inputs.charge_center
-        r = dims.get("radius", 0.05)
+        cs = max(1e-9, float(cell_size))
+        r_char = self._characteristic_charge_extent_m(inputs, dims)
+        oe_raw = getattr(inputs, "outside_extent", None)
+        if oe_raw is not None:
+            try:
+                v = float(oe_raw)
+                if v > 0.0:
+                    return v, False, f"user outside_extent = {v:.6g} m (physical shell beyond charge)"
+            except (TypeError, ValueError):
+                pass
         factor = max(0.5, min(5.0, getattr(inputs, "bubble_radius_factor", 1.5)))
-        seed_radius = r * factor
-        cell_size = max(getattr(inputs, "cell_size", 0.1), 1e-9)
+        seed_radius = r_char * factor
         n_cbl = max(1, min(10, getattr(inputs, "transition_cells", 2)))
-        # Outside levels (for band width scaling)
         rmin_outer = getattr(inputs, "charge_outer_refine_min", None)
         rmax_outer = getattr(inputs, "charge_outer_refine_max", None)
         rmin = rmin_outer if rmin_outer is not None else getattr(inputs, "refine_min", 2)
         rmax = rmax_outer if rmax_outer is not None else getattr(inputs, "refine_max", 3)
-        level_span = max(1, rmax - rmin)
-        # outer_radius = seed_radius + transition_cells * level_span * cell_size (deterministic, no plateau mismatch)
-        outer_radius = seed_radius + n_cbl * level_span * cell_size
-        return (cx, cy, cz, outer_radius)
+        level_span = max(1, int(rmax) - int(rmin))
+        legacy_outer_sphere = seed_radius + n_cbl * level_span * cs
+        extent = max(0.0, legacy_outer_sphere - r_char)
+        desc = (
+            f"auto: R_char≈{r_char:.6g} m, bubble_radius_factor={factor:.3g}, "
+            f"+ band {n_cbl}×{level_span}×{cs:.6g} m ⇒ outside_extent≈{extent:.6g} m"
+        )
+        return extent, True, desc
+
+    def _charge_refine_outer_snappy_geometry_entry(self, inputs: CaseInputs3D, dims: Dict[str, float]) -> str:
+        """One geometry{} entry for chargeRefineOuter, matching charge shape (not charge capture)."""
+        cell_size = max(1e-9, float(getattr(inputs, "cell_size", 0.1)))
+        extent_m, is_auto, desc = self._resolve_transition_outside_extent_m(inputs, dims, cell_size)
+        self._last_transition_region_meta = {
+            "outside_extent_m": extent_m,
+            "outside_extent_auto": is_auto,
+            "policy_description": desc,
+            "charge_shape": getattr(inputs, "charge_shape", "Sphere"),
+            "extent_source": "legacy_auto" if is_auto else "user_outside_extent",
+            "charge_capture_radius_not_used_for_transition": True,
+        }
+        shape = getattr(inputs, "charge_shape", "Sphere")
+        cx, cy, cz = inputs.charge_center
+        if shape == "Sphere":
+            r = float(dims.get("radius", 0.05))
+            outer_r = r + extent_m
+            self._last_transition_region_meta["transition_shape"] = "sphere"
+            self._last_transition_region_meta["physical_charge_radius_m"] = r
+            self._last_transition_region_meta["effective_outer_radius_m"] = outer_r
+            self._last_transition_region_meta["snappy_type"] = "searchableSphere"
+            self._last_transition_region_meta["outer_radius_m"] = outer_r
+            return (
+                f"    chargeRefineOuter {{ type searchableSphere; centre ({cx:.6g} {cy:.6g} {cz:.6g}); "
+                f"radius {outer_r:.6g}; }}\n"
+            )
+        if shape == "Cylinder":
+            r = float(dims.get("radius", 0.05))
+            length = float(dims.get("length", 0.1))
+            half_l = length / 2.0
+            half_l_o = half_l + extent_m
+            r_o = r + extent_m
+            p1 = [cx, cy, cz]
+            p2 = [cx, cy, cz]
+            idx = {"X": 0, "Y": 1, "Z": 2}.get(getattr(inputs, "cylinder_axis", "Z"), 2)
+            p1[idx] -= half_l_o
+            p2[idx] += half_l_o
+            self._last_transition_region_meta["transition_shape"] = "cylinder"
+            self._last_transition_region_meta["cylinder_axis"] = getattr(inputs, "cylinder_axis", "Z")
+            self._last_transition_region_meta["physical_inner_radius_m"] = r
+            self._last_transition_region_meta["physical_inner_half_length_m"] = half_l
+            self._last_transition_region_meta["effective_outer_radius_m"] = r_o
+            self._last_transition_region_meta["effective_outer_half_length_m"] = half_l_o
+            self._last_transition_region_meta["snappy_type"] = "searchableCylinder"
+            self._last_transition_region_meta["outer_radius_m"] = r_o
+            self._last_transition_region_meta["outer_half_length_m"] = half_l_o
+            return (
+                f"    chargeRefineOuter {{\n"
+                f"        type searchableCylinder;\n"
+                f"        point1 ({p1[0]:.6g} {p1[1]:.6g} {p1[2]:.6g});\n"
+                f"        point2 ({p2[0]:.6g} {p2[1]:.6g} {p2[2]:.6g});\n"
+                f"        radius {r_o:.6g};\n"
+                f"    }}\n"
+            )
+        if shape == "Cuboid":
+            if "length" in dims and "width" in dims and "height" in dims:
+                hx = float(dims["length"]) / 2.0
+                hy = float(dims["width"]) / 2.0
+                hz = float(dims["height"]) / 2.0
+            else:
+                side = float(dims.get("side", 0.1))
+                hx = hy = hz = side / 2.0
+            x1, x2 = cx - hx - extent_m, cx + hx + extent_m
+            y1, y2 = cy - hy - extent_m, cy + hy + extent_m
+            z1, z2 = cz - hz - extent_m, cz + hz + extent_m
+            self._last_transition_region_meta["transition_shape"] = "box"
+            self._last_transition_region_meta["physical_half_extents_m"] = [hx, hy, hz]
+            self._last_transition_region_meta["effective_box_min_m"] = [x1, y1, z1]
+            self._last_transition_region_meta["effective_box_max_m"] = [x2, y2, z2]
+            self._last_transition_region_meta["snappy_type"] = "searchableBox"
+            self._last_transition_region_meta["box_min"] = [x1, y1, z1]
+            self._last_transition_region_meta["box_max"] = [x2, y2, z2]
+            return (
+                f"    chargeRefineOuter {{\n"
+                f"        type searchableBox;\n"
+                f"        min ({x1:.6g} {y1:.6g} {z1:.6g});\n"
+                f"        max ({x2:.6g} {y2:.6g} {z2:.6g});\n"
+                f"    }}\n"
+            )
+        r = float(dims.get("radius", 0.05))
+        outer_r = r + extent_m
+        self._last_transition_region_meta["transition_shape"] = "sphere"
+        self._last_transition_region_meta["physical_charge_radius_m"] = r
+        self._last_transition_region_meta["effective_outer_radius_m"] = outer_r
+        self._last_transition_region_meta["snappy_type"] = "searchableSphere"
+        self._last_transition_region_meta["outer_radius_m"] = outer_r
+        return (
+            f"    chargeRefineOuter {{ type searchableSphere; centre ({cx:.6g} {cy:.6g} {cz:.6g}); "
+            f"radius {outer_r:.6g}; }}\n"
+        )
+
+    def _refinement_role_warnings(self, inputs: CaseInputs3D) -> list:
+        """Non-fatal hints when charge seed / transition / snappy levels exceed AMR max, etc."""
+        out: list = []
+        seed = int(getattr(inputs, "charge_refinement_level", 0) or 0)
+        amr_max = getattr(inputs, "dyn_refine_max", None)
+        if amr_max is None:
+            amr_max = getattr(inputs, "refine_max", 1)
+        try:
+            amr_max_i = max(1, int(amr_max))
+        except (TypeError, ValueError):
+            amr_max_i = 1
+        if seed > amr_max_i:
+            out.append(
+                f"Charge seed level (charge_refinement_level={seed}) exceeds runtime AMR maxRefinement ({amr_max_i})."
+            )
+        tmax = getattr(inputs, "charge_outer_refine_max", None)
+        if tmax is None:
+            tmax = getattr(inputs, "refine_max", 3)
+        try:
+            tmax_i = int(tmax)
+        except (TypeError, ValueError):
+            tmax_i = 3
+        outer_off = getattr(inputs, "charge_outer_refine_enable", None) is False
+        if not outer_off and tmax_i > amr_max_i:
+            out.append(
+                f"Charge outer / transition snappy max level ({tmax_i}) exceeds AMR maxRefinement ({amr_max_i})."
+            )
+        dyn_on = getattr(inputs, "enable_dyn_refine", None)
+        if dyn_on is None:
+            dyn_on = getattr(inputs, "enable_local_refinement", True)
+        obs_on = getattr(inputs, "enable_obstacle_refine", None)
+        if obs_on is None:
+            obs_on = getattr(inputs, "enable_local_refinement", True)
+        if obs_on and not dyn_on and getattr(inputs, "obstacles", None):
+            out.append(
+                "Obstacle/snappy refinement is on while runtime AMR is off; dynamic refinement applies only when AMR is enabled."
+            )
+        return out
+
+    def _amr_error_estimator_lines(self, inputs: CaseInputs3D) -> Tuple[str, str]:
+        """Return (errorEstimator line, optional deltaCoeffs block) for dynamicMeshDict."""
+        raw = (getattr(inputs, "refine_indicator_field", None) or "densityGradient").strip()
+        key = raw.lower().replace(" ", "").replace("_", "")
+        if key in ("pressuregradient", "pressure", "p"):
+            self._charge_warnings.append(
+                "AMR: legacy GUI value 'pressureGradient' is not a valid blastFoam errorEstimator keyword; "
+                "using OpenFOAM-style scaledDelta on field p instead."
+            )
+            key = "scaleddeltap"
+        if key in ("scaleddeltap", "scaleddelta(p)", "scaledeltap"):
+            return (
+                "errorEstimator  scaledDelta;\n",
+                "deltaCoeffs\n{\n    field           p;\n}\n\n",
+            )
+        if key in ("densitygradient", "density", ""):
+            return ("errorEstimator  densityGradient;\n", "")
+        self._charge_warnings.append(
+            f"AMR: unknown refine_indicator_field '{raw}'; falling back to densityGradient."
+        )
+        return ("errorEstimator  densityGradient;\n", "")
 
     def _location_in_mesh_point(self, inputs: CaseInputs3D) -> tuple:
         """Return a point strictly inside the fluid domain for locationInMesh (snappyHexMesh).
@@ -1241,8 +1483,7 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
         if _snappy_pre_lv > 0 and dims:
             snappy += self._snappy_charge_geometry_block(inputs, dims)
         if add_charge_outer and level_str and dims:
-            cx, cy, cz, outer_rad = self._charge_outer_geometry(inputs, dims)
-            snappy += f'    chargeRefineOuter {{ type searchableSphere; centre ({cx:.6g} {cy:.6g} {cz:.6g}); radius {outer_rad:.6g}; }}\n'
+            snappy += self._charge_refine_outer_snappy_geometry_entry(inputs, dims)
         snappy += "};\n\n"
 
         n_cbl = max(1, min(10, getattr(inputs, "transition_cells", 2)))
@@ -1356,8 +1597,7 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
         if _snappy_pre_lv > 0:
             snappy += self._snappy_charge_geometry_block(inputs, dims)
         if add_charge_outer and level_str:
-            cx, cy, cz, outer_rad = self._charge_outer_geometry(inputs, dims)
-            snappy += f'    chargeRefineOuter {{ type searchableSphere; centre ({cx:.6g} {cy:.6g} {cz:.6g}); radius {outer_rad:.6g}; }}\n'
+            snappy += self._charge_refine_outer_snappy_geometry_entry(inputs, dims)
         snappy += "};\n\n"
         n_cbl = max(1, min(10, getattr(inputs, "transition_cells", 2)))
         snappy += "castellatedMeshControls\n{\n"
@@ -1613,7 +1853,7 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
             n_buf_dyn = getattr(inputs, "n_buffer_layers_dynamic", 2)
             enable_bal = getattr(inputs, "enable_balancing", False)
             max_cells = getattr(inputs, "dynamic_max_cells", 200000000)
-            err_est = getattr(inputs, "refine_indicator_field", "densityGradient") or "densityGradient"
+            err_head, err_extra = self._amr_error_estimator_lines(inputs)
             # Only write maxCells / enableBalancing when they differ from defaults so the generated
             # dict matches the building3D reference (which omits both keys).
             optional_keys = ""
@@ -1621,18 +1861,52 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
                 optional_keys += f"maxCells       {max_cells};\n"
             if enable_bal:
                 optional_keys += f"enableBalancing {str(enable_bal).lower()};\n"
+                # blastFoam user guide: loadBalance { balance yes; balanceInterval N; }
+                bal_int = getattr(inputs, "balance_interval", None)
+                bi = int(bal_int) if bal_int is not None else 10
+                optional_keys += (
+                    "loadBalance\n{\n"
+                    "    balance yes;\n"
+                    f"    balanceInterval {bi};\n"
+                    "}\n"
+                )
+            bu = getattr(inputs, "begin_unrefine", None)
+            if bu is not None:
+                optional_keys += f"beginUnrefine   {float(bu)};\n"
+            url = getattr(inputs, "upper_refine_level", None)
+            if url is not None:
+                optional_keys += f"upperRefineLevel {float(url)};\n"
+            uul = getattr(inputs, "upper_unrefine_level", None)
+            if uul is not None:
+                optional_keys += f"upperUnrefineLevel {float(uul)};\n"
             mesh_content = f"""
 dynamicFvMesh   adaptiveFvMesh;
-errorEstimator  {err_est};
-refineInterval  {ref_int};
+{err_head}{err_extra}refineInterval  {ref_int};
 lowerRefineLevel {lower_ref};
 unrefineLevel   {unref};
 nBufferLayers   {n_buf_dyn};
 maxRefinement   {outer_lvl};
 dumpLevel      true;
 {optional_keys}"""
+            self._last_amr_written_meta = {
+                "errorEstimator_line": err_head.strip(),
+                "maxRefinement": int(outer_lvl),
+                "refineInterval": int(ref_int),
+                "lowerRefineLevel": float(lower_ref),
+                "unrefineLevel": float(unref),
+                "maxCells": int(max_cells),
+                "beginUnrefine": getattr(inputs, "begin_unrefine", None),
+                "upperRefineLevel": getattr(inputs, "upper_refine_level", None),
+                "upperUnrefineLevel": getattr(inputs, "upper_unrefine_level", None),
+                "enableBalancing": bool(enable_bal),
+                "balanceInterval": (
+                    int(getattr(inputs, "balance_interval", None) or 10) if enable_bal else None
+                ),
+                "uses_scaled_delta_pressure": "scaledDelta" in err_head,
+            }
         else:
             mesh_content = "dynamicFvMesh staticFvMesh;\n"
+            self._last_amr_written_meta = None
 
         self._write_text(os.path.join(const_dir, "dynamicMeshDict"),
                          self._foam_header("dynamicMeshDict", "dictionary", "constant") + mesh_content)
@@ -1829,7 +2103,7 @@ regions ( );
 
         # Charge capture region (setFieldsDict keyword ``backup``): minimal search volume so
         # setRefinedFields can seed mass on a coarse base mesh. Independent of snappy outer
-        # transition (bubble_radius_factor) — see _charge_outer_geometry / topoSet seed paths.
+        # transition (outside_extent / bubble_radius_factor auto) — see _resolve_transition_outside_extent_m.
         if use_refined and inputs.charge_shape == "Sphere":
             r = dims["radius"]
             ref_part = f"        refineInternal yes;\n        level {charge_refine};\n        " if apply_refine_in_region else ""
@@ -2544,18 +2818,12 @@ actions
         """Write topoSet_outsideShellDict: outsideShell = outer region minus true charge (shape-consistent: sphere/sphere, cylinder/cylinder, cuboid/box)."""
         cx, cy, cz = inputs.charge_center
         shape = getattr(inputs, "charge_shape", "Sphere")
-        _, _, _, outer_radius = self._charge_outer_geometry(inputs, dims)
         cell_size = max(getattr(inputs, "cell_size", 0.1), 1e-9)
-        n_cbl = max(1, min(10, getattr(inputs, "transition_cells", 2)))
-        rmin_outer = getattr(inputs, "charge_outer_refine_min", None)
-        rmax_outer = getattr(inputs, "charge_outer_refine_max", None)
-        rmin = rmin_outer if rmin_outer is not None else getattr(inputs, "refine_min", 2)
-        rmax = rmax_outer if rmax_outer is not None else getattr(inputs, "refine_max", 3)
-        level_span = max(1, rmax - rmin)
-        margin = n_cbl * level_span * cell_size
+        extent_m, _, _ = self._resolve_transition_outside_extent_m(inputs, dims, cell_size)
 
         if shape == "Sphere":
             r_inner = float(dims.get("radius", 0.05))
+            outer_radius = r_inner + extent_m
             content = self._foam_header("topoSet_outsideShellDict", "dictionary", "system") + f"""
 actions
 (
@@ -2605,13 +2873,19 @@ actions
 """
         elif shape == "Cylinder":
             r_inner = float(dims.get("radius", 0.05))
-            length = dims.get("length", 0.1)
+            length = float(dims.get("length", 0.1))
             half_l = length / 2.0
-            p1 = [cx, cy, cz]
-            p2 = [cx, cy, cz]
+            half_l_o = half_l + extent_m
+            r_outer = r_inner + extent_m
+            p1i = [cx, cy, cz]
+            p2i = [cx, cy, cz]
+            p1o = [cx, cy, cz]
+            p2o = [cx, cy, cz]
             idx = {"X": 0, "Y": 1, "Z": 2}.get(getattr(inputs, "cylinder_axis", "Z"), 2)
-            p1[idx] -= half_l
-            p2[idx] += half_l
+            p1i[idx] -= half_l
+            p2i[idx] += half_l
+            p1o[idx] -= half_l_o
+            p2o[idx] += half_l_o
             content = self._foam_header("topoSet_outsideShellDict", "dictionary", "system") + f"""
 actions
 (
@@ -2622,9 +2896,9 @@ actions
         source  cylinderToCell;
         sourceInfo
         {{
-            p1 ({p1[0]:.6g} {p1[1]:.6g} {p1[2]:.6g});
-            p2 ({p2[0]:.6g} {p2[1]:.6g} {p2[2]:.6g});
-            radius {outer_radius:.6g};
+            p1 ({p1o[0]:.6g} {p1o[1]:.6g} {p1o[2]:.6g});
+            p2 ({p2o[0]:.6g} {p2o[1]:.6g} {p2o[2]:.6g});
+            radius {r_outer:.6g};
         }}
     }}
     {{
@@ -2634,8 +2908,8 @@ actions
         source  cylinderToCell;
         sourceInfo
         {{
-            p1 ({p1[0]:.6g} {p1[1]:.6g} {p1[2]:.6g});
-            p2 ({p2[0]:.6g} {p2[1]:.6g} {p2[2]:.6g});
+            p1 ({p1i[0]:.6g} {p1i[1]:.6g} {p1i[2]:.6g});
+            p2 ({p2i[0]:.6g} {p2i[1]:.6g} {p2i[2]:.6g});
             radius {r_inner:.6g};
         }}
     }}
@@ -2671,9 +2945,9 @@ actions
             x1_inner, x2_inner = cx - half_x, cx + half_x
             y1_inner, y2_inner = cy - half_y, cy + half_y
             z1_inner, z2_inner = cz - half_z, cz + half_z
-            x1_outer, x2_outer = x1_inner - margin, x2_inner + margin
-            y1_outer, y2_outer = y1_inner - margin, y2_inner + margin
-            z1_outer, z2_outer = z1_inner - margin, z2_inner + margin
+            x1_outer, x2_outer = x1_inner - extent_m, x2_inner + extent_m
+            y1_outer, y2_outer = y1_inner - extent_m, y2_inner + extent_m
+            z1_outer, z2_outer = z1_inner - extent_m, z2_inner + extent_m
             content = self._foam_header("topoSet_outsideShellDict", "dictionary", "system") + f"""
 actions
 (

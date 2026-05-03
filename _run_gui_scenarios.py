@@ -235,12 +235,14 @@ def scenario_cylinder_b3d(tab: TabGeneral3D) -> None:
 def expect_cylinder_b3d(res: Result, case_dir: str) -> None:
     sf = read(case_dir, "system/setFieldsDict")
     dm = read(case_dir, "constant/dynamicMeshDict")
+    sn = read(case_dir, "system/snappyHexMeshDict")
     allrun = read(case_dir, "Allrun")
     assert_in(res, sf, "cylindericalMassToCell", "setFieldsDict has cylindericalMassToCell (BlastFoam spelling)")
     assert_in(res, sf, "refineInternal yes", "setFieldsDict uses native refineInternal")
     assert_in(res, sf, "level 5", "setFieldsDict level=5")
     assert_in(res, sf, "backup", "setFieldsDict has backup region")
     assert_in(res, dm, "adaptiveFvMesh", "AMR enabled")
+    assert_in(res, sn, "searchableCylinder", "snappy chargeRefineOuter uses cylinder geometry")
     assert_runs_cmd(res, allrun, "setRefinedFields", "Allrun calls setRefinedFields")
 SCENARIOS.append(("cylinder_b3d_match", scenario_cylinder_b3d, expect_cylinder_b3d))
 
@@ -258,8 +260,10 @@ def scenario_cuboid(tab: TabGeneral3D) -> None:
 def expect_cuboid(res: Result, case_dir: str) -> None:
     sf = read(case_dir, "system/setFieldsDict")
     dm = read(case_dir, "constant/dynamicMeshDict")
+    sn = read(case_dir, "system/snappyHexMeshDict")
     assert_in(res, sf, "boxToCell", "setFieldsDict has boxToCell for Cuboid")
     assert_in(res, dm, "adaptiveFvMesh", "AMR enabled")
+    assert_in(res, sn, "searchableBox", "snappy outer transition uses box for Cuboid charge")
 SCENARIOS.append(("cuboid_standard", scenario_cuboid, expect_cuboid))
 
 
