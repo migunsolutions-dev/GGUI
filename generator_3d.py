@@ -10,7 +10,8 @@ except ImportError:
     pv = None
 
 from base_generator import BaseGenerator
-from charge_capture import resolve_charge_capture_radius_m
+from charge_capture import resolve_charge_capture_radius_m, CAPTURE_CELL_SAFETY
+from startup_mesh_metadata import build_startup_mesh_metadata, flatten_warnings_for_charge_warnings
 from mesh_domain import align_domain_to_cell_size
 from models import CaseInputs3D
 from path_utils import get_latest_time_dir, win_to_wsl_path
@@ -1002,6 +1003,8 @@ class Generator3D(BaseGenerator):
                 mode["base_cell_size"] = float(getattr(inputs, "cell_size", 0.5))
                 mode["charge_shape"] = getattr(inputs, "charge_shape", "Sphere")
                 mode["charge_size_info"] = self._charge_size_info(inputs, dims)
+                if getattr(inputs, "charge_shape", "") == "Cuboid":
+                    mode["charge_geometry"] = self._cuboid_charge_geometry_meta(inputs, dims)
                 mode["user_requested_inside"] = cr_req
                 mode["charge_capture"] = getattr(self, "_last_charge_capture_meta", None) or {}
                 mode["snappy_charge_pre_level"] = 0
@@ -1039,6 +1042,40 @@ class Generator3D(BaseGenerator):
                 mode["transition_region"] = tr_meta
                 mode["refinement_role_warnings"] = _ref_role_warn
                 mode["amr_written"] = getattr(self, "_last_amr_written_meta", None)
+                _add_outer, _level_str = self._charge_outer_refine_levels(inputs)
+                _outer_min = _outer_max = None
+                if _level_str:
+                    _lv_parts = _level_str.split()
+                    if len(_lv_parts) >= 2:
+                        try:
+                            _outer_min = int(_lv_parts[0])
+                            _outer_max = int(_lv_parts[1])
+                        except ValueError:
+                            pass
+                _smm = build_startup_mesh_metadata(
+                    inputs,
+                    dims,
+                    charge_capture=mode.get("charge_capture"),
+                    base_cell_count=mode.get("base_cell_count"),
+                    base_cell_size_m=float(mode.get("base_cell_size") or getattr(inputs, "cell_size", 0.5)),
+                    charge_shape=str(mode.get("charge_shape") or getattr(inputs, "charge_shape", "Sphere")),
+                    seed_requested=int(cr_req),
+                    seed_effective=int(cr_dict) if use_set_refined else 0,
+                    uses_set_refined_fields=bool(use_set_refined),
+                    set_cmd=str(mode.get("set_cmd") or ""),
+                    charge_refine_outer_enabled=bool(_add_outer),
+                    outer_snappy_level_min=_outer_min,
+                    outer_snappy_level_max=_outer_max,
+                    amr_written=mode.get("amr_written"),
+                    transition_region=mode.get("transition_region"),
+                    nominal_mass_kg=float(getattr(inputs, "mass_kg", 0.0) or 0.0),
+                )
+                mode["startup_mesh_metadata"] = _smm
+                _existing_warn = set(mode.get("charge_warnings") or [])
+                for _wflat in flatten_warnings_for_charge_warnings(_smm):
+                    if _wflat not in _existing_warn:
+                        mode["charge_warnings"].append(_wflat)
+                        _existing_warn.add(_wflat)
                 self._write_text(mode_path, json.dumps(mode, indent=2))
 
             # Create case.foam for ParaView compatibility
@@ -1361,19 +1398,24 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
         return out
 
     def _amr_error_estimator_lines(self, inputs: CaseInputs3D) -> Tuple[str, str]:
-        """Return (errorEstimator line, optional deltaCoeffs block) for dynamicMeshDict."""
+        """Return (errorEstimator line, optional scaledDeltaField / follow-up lines) for dynamicMeshDict."""
         raw = (getattr(inputs, "refine_indicator_field", None) or "densityGradient").strip()
         key = raw.lower().replace(" ", "").replace("_", "")
         if key in ("pressuregradient", "pressure", "p"):
             self._charge_warnings.append(
                 "AMR: legacy GUI value 'pressureGradient' is not a valid blastFoam errorEstimator keyword; "
-                "using OpenFOAM-style scaledDelta on field p instead."
+                "using blastFoam scaledDelta with scaledDeltaField p."
             )
             key = "scaleddeltap"
         if key in ("scaleddeltap", "scaleddelta(p)", "scaledeltap"):
             return (
                 "errorEstimator  scaledDelta;\n",
-                "deltaCoeffs\n{\n    field           p;\n}\n\n",
+                "scaledDeltaField p;\n\n",
+            )
+        if key in ("scaleddeltarho", "scaledeltarho"):
+            return (
+                "errorEstimator  scaledDelta;\n",
+                "scaledDeltaField rho;\n\n",
             )
         if key in ("densitygradient", "density", ""):
             return ("errorEstimator  densityGradient;\n", "")
@@ -2147,14 +2189,19 @@ regions ( );
             # charge_backup_length_override.
             axis_idx = {"X": 0, "Y": 1, "Z": 2}.get(getattr(inputs, "cylinder_axis", "Z"), 2)
             l_vec = [0.0, 0.0, 0.0]
+            # Axial floor: the backup half-length must strictly exceed the worst-case
+            # nearest cell-centre axial distance (0.5*cell_size); otherwise a short charge
+            # on a coarse mesh fails capture even when the radial backup is adequate.
+            cell_h = max(1e-9, float(getattr(inputs, "cell_size", 0.1)))
+            axial_floor = CAPTURE_CELL_SAFETY * cell_h
             loaded_backup_len = getattr(inputs, "charge_backup_length_override", None)
             if loaded_backup_len is not None:
                 try:
                     backup_len = float(loaded_backup_len)
                 except (TypeError, ValueError):
-                    backup_len = max(length, 2.0 * r)
+                    backup_len = max(length, 2.0 * r, axial_floor)
             else:
-                backup_len = max(length, 2.0 * r)
+                backup_len = max(length, 2.0 * r, axial_floor)
             l_vec[axis_idx] = backup_len
             backup_radius, cap_report = resolve_charge_capture_radius_m(inputs, r)
             self._last_charge_capture_meta = cap_report.as_json_dict()
@@ -2184,21 +2231,28 @@ regions ( );
                 region_str = f"sphereToCell {{ centre ({cx} {cy} {cz}); radius {r:.6g}; fieldValues ( volScalarFieldValue alpha.c4 1 ); }}"
         elif inputs.charge_shape == "Cuboid":
             if "length" in dims and "width" in dims and "height" in dims:
-                L, W, H = dims["length"], dims["width"], dims["height"]
-                half_x, half_y, half_z = L / 2.0, W / 2.0, H / 2.0
-                x1, x2 = cx - half_x, cx + half_x
-                y1, y2 = cy - half_y, cy + half_y
-                z1, z2 = cz - half_z, cz + half_z
+                half_x, half_y, half_z = dims["length"] / 2.0, dims["width"] / 2.0, dims["height"] / 2.0
             else:
-                side = dims.get("side", 0.1)
-                half = side / 2.0
-                x1, x2 = cx - half, cx + half
-                y1, y2 = cy - half, cy + half
-                z1, z2 = cz - half, cz + half
+                half_x = half_y = half_z = dims.get("side", 0.1) / 2.0
+            x1, x2 = cx - half_x, cx + half_x
+            y1, y2 = cy - half_y, cy + half_y
+            z1, z2 = cz - half_z, cz + half_z
             if apply_refine_in_region:
+                # Backup box: enlarge each half-extent so it strictly encloses the nearest
+                # base-cell centre (worst case 0.5*cell on each axis), guaranteeing
+                # refineInternal can bootstrap for charges smaller than a base cell.
+                # The captured field still uses the physical box, so mass is unchanged.
+                cell_h = max(1e-9, float(getattr(inputs, "cell_size", 0.1)))
+                bhx = max(half_x, CAPTURE_CELL_SAFETY * 0.5 * cell_h)
+                bhy = max(half_y, CAPTURE_CELL_SAFETY * 0.5 * cell_h)
+                bhz = max(half_z, CAPTURE_CELL_SAFETY * 0.5 * cell_h)
+                backup_box = (
+                    f"backup {{ box ({cx - bhx:.6g} {cy - bhy:.6g} {cz - bhz:.6g}) "
+                    f"({cx + bhx:.6g} {cy + bhy:.6g} {cz + bhz:.6g}); }} "
+                )
                 region_str = (
                     f"boxToCell {{ box ({x1:.6g} {y1:.6g} {z1:.6g}) ({x2:.6g} {y2:.6g} {z2:.6g}); "
-                    f"refineInternal yes; level {charge_refine}; fieldValues ( volScalarFieldValue alpha.c4 1 ); }}"
+                    f"{backup_box}refineInternal yes; level {charge_refine}; fieldValues ( volScalarFieldValue alpha.c4 1 ); }}"
                 )
             else:
                 region_str = f"boxToCell {{ box ({x1:.6g} {y1:.6g} {z1:.6g}) ({x2:.6g} {y2:.6g} {z2:.6g}); fieldValues ( volScalarFieldValue alpha.c4 1 ); }}"
@@ -2323,6 +2377,35 @@ writeMesh           no;
 """
         self._write_text(os.path.join(case_dir, "system", "refineMesh_chargeDict"), content)
 
+    def _cuboid_physical_extents_m(self, dims: Dict[str, float]) -> Tuple[float, float, float]:
+        """Return (Lx, Ly, Lz) actually used for cuboid setFields/snappy/transition (matches _build_set_fields_dict_3d)."""
+        if "length" in dims and "width" in dims and "height" in dims:
+            return (float(dims["length"]), float(dims["width"]), float(dims["height"]))
+        side = float(dims.get("side", 0.0))
+        return (side, side, side)
+
+    def _cuboid_charge_geometry_meta(self, inputs: CaseInputs3D, dims: Dict[str, float]) -> dict:
+        """Structured cuboid geometry for case_init_mode.json (same box as OpenFOAM charge regions)."""
+        Lx, Ly, Lz = self._cuboid_physical_extents_m(dims)
+        cx, cy, cz = (float(inputs.charge_center[0]), float(inputs.charge_center[1]), float(inputs.charge_center[2]))
+        hx, hy, hz = Lx / 2.0, Ly / 2.0, Lz / 2.0
+        vol = Lx * Ly * Lz
+        r_eq = ((3.0 * vol) / (4.0 * math.pi)) ** (1.0 / 3.0) if vol > 1e-30 else 0.0
+        volume_from_mass = float(inputs.mass_kg) / max(float(inputs.rho_charge), 1e-30)
+        return {
+            "shape": "cuboid",
+            "length_x_m": Lx,
+            "length_y_m": Ly,
+            "length_z_m": Lz,
+            "volume_m3": vol,
+            "volume_from_mass_m3": volume_from_mass,
+            "equivalent_spherical_radius_m": r_eq,
+            "center_m": [cx, cy, cz],
+            "min_corner_m": [cx - hx, cy - hy, cz - hz],
+            "max_corner_m": [cx + hx, cy + hy, cz + hz],
+            "volume_driven_cube": "side" in dims and "length" not in dims,
+        }
+
     def _charge_size_info(self, inputs: CaseInputs3D, dims: Dict[str, float]) -> str:
         """Return a short human-readable string describing charge dimensions for error messages."""
         shape = getattr(inputs, "charge_shape", "Sphere")
@@ -2335,9 +2418,7 @@ writeMesh           no;
             ax = getattr(inputs, "cylinder_axis", "Z")
             return f"radius={r:.4g} m, length={L:.4g} m, axis={ax}"
         if shape == "Cuboid":
-            Lv = dims.get("length", 0.0)
-            W = dims.get("width", 0.0)
-            H = dims.get("height", 0.0)
+            Lv, W, H = self._cuboid_physical_extents_m(dims)
             return f"length={Lv:.4g} m, width={W:.4g} m, height={H:.4g} m"
         return ""
 

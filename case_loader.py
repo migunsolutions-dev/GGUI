@@ -522,12 +522,20 @@ def _parse_dynamicMeshDict(case_dir: str, out: Dict[str, Any]) -> None:
     s = _string_val(text, "errorEstimator")
     if s is not None:
         if s == "scaledDelta":
-            dc = _find_block(text, "deltaCoeffs")
-            field_name = _string_val(dc, "field") if dc else None
-            if field_name == "p":
+            sdf = _string_val(text, "scaledDeltaField")
+            if sdf == "p":
                 out["refine_indicator_field"] = "scaledDelta_p"
+            elif sdf == "rho":
+                out["refine_indicator_field"] = "scaledDelta_rho"
             else:
-                out["refine_indicator_field"] = "scaledDelta"
+                dc = _find_block(text, "deltaCoeffs")
+                field_name = _string_val(dc, "field") if dc else None
+                if field_name == "p":
+                    out["refine_indicator_field"] = "scaledDelta_p"
+                elif field_name == "rho":
+                    out["refine_indicator_field"] = "scaledDelta_rho"
+                else:
+                    out["refine_indicator_field"] = "scaledDelta"
         else:
             out["refine_indicator_field"] = s
     v = _int_val(text, "maxCells")
@@ -832,7 +840,7 @@ UNSUPPORTED_KEYS_BY_FILE: Dict[str, List[str]] = {
     "system/setFieldsDict": ["defaultFieldValues", "regions"],
     "constant/phaseProperties": ["phases", "products", "reactants", "air", "activationModel", "initiationPoints", "equationOfState", "thermodynamics"],
     "system/decomposeParDict": ["method", "numberOfSubdomains", "roots", "hierarchicalCoeffs", "manualCoeffs", "scotchCoeffs"],
-    "constant/dynamicMeshDict": ["dynamicFvMesh", "deltaCoeffs", "dumpLevel"],
+    "constant/dynamicMeshDict": ["dynamicFvMesh", "scaledDeltaField", "deltaCoeffs", "dumpLevel"],
     "system/snappyHexMeshDict": ["castellatedMeshControls", "snapControls", "addLayersControls", "meshQualityControls", "geometry", "features", "refinementSurfaces", "refinementRegions", "locationInMesh", "debug"],
     "0/p": ["internalField", "boundaryField"],
     "0/T": ["internalField", "boundaryField"],

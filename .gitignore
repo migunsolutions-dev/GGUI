@@ -35,9 +35,28 @@ Case_1D_[0-9]*/
 Case_2D_[0-9]*/
 Case_3D_[0-9]*/
 
+# Local validation / AMR / audit case trees (meshes, processor*, time dirs —
+# often multi-GB). Keep the scripts that *generate* them under tools/; never
+# commit the generated case outputs.
+_val_*/
+_amr_*/
+_audit_*/
+_wsl_*/
+_wsl_*.log
+
+# OpenFOAM runtime debris at repo root only (do not ignore tutorial 0/ dirs)
+/processor*/
+/postProcessing/
+/log.*
+/*.foam
+/core
+/core.*
+
 # --- Transient files used by the agent / scripts --------------------------
 _commit_msg.txt
 _inspect_*.sh
 _test_*.py
 *.bak
 *.tmp
+*.npy
+*.gif

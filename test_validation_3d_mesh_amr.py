@@ -156,6 +156,11 @@ class CuboidTransitionValidation(unittest.TestCase):
         bmin = tr.get("effective_box_min_m") or [0, 0, 0]
         bmax = tr.get("effective_box_max_m") or [0, 0, 0]
         self.assertAlmostEqual(bmax[0] - bmin[0], 2.0 * hx + 2.0 * oe, places=5)
+        geom = mode.get("charge_geometry") or {}
+        self.assertEqual(geom.get("shape"), "cuboid")
+        for k in ("length_x_m", "length_y_m", "length_z_m", "volume_m3"):
+            self.assertGreater(float(geom.get(k, 0.0)), 0.0, msg=f"{k} must be positive for real cuboid metadata")
+        self.assertNotRegex(mode.get("charge_size_info", ""), r"length=0 m")
 
     def test_cuboid_inside_level_warns(self) -> None:
         inp = _case(
@@ -171,6 +176,100 @@ class CuboidTransitionValidation(unittest.TestCase):
             gen = Generator3D(td)
             gen.generate("box_warn", inp)
         self.assertTrue(any("Cuboid with Inside refinement" in w for w in gen._charge_warnings))
+
+
+class CuboidChargeMetadataValidation(unittest.TestCase):
+    """case_init_mode.json charge_size_info / charge_geometry match solver cuboid box (dims)."""
+
+    def test_cuboid_metadata_matches_consistent_dimensions(self) -> None:
+        rho = 1601.0
+        mass_kg = 16.0
+        vol = mass_kg / rho
+        Lx, Ly = 0.2, 0.2
+        Lz = vol / (Lx * Ly)
+        cx, cy, cz = 1.1, 1.2, 1.3
+        inp = _case(
+            charge_shape="Cuboid",
+            mass_kg=mass_kg,
+            rho_charge=rho,
+            charge_length=Lx,
+            charge_width=Ly,
+            charge_height=Lz,
+            charge_center=(cx, cy, cz),
+            charge_refinement_level=0,
+            charge_outer_refine_min=2,
+            charge_outer_refine_max=2,
+            outside_extent=0.05,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            case_dir = Generator3D(td).generate("box_meta_ok", inp)
+            with open(os.path.join(case_dir, "case_init_mode.json"), encoding="utf-8") as f:
+                mode = json.load(f)
+        geom = mode.get("charge_geometry") or {}
+        self.assertEqual(geom.get("shape"), "cuboid")
+        self.assertFalse(geom.get("volume_driven_cube"))
+        self.assertAlmostEqual(geom["length_x_m"], Lx, places=9)
+        self.assertAlmostEqual(geom["length_y_m"], Ly, places=9)
+        self.assertAlmostEqual(geom["length_z_m"], Lz, places=9)
+        self.assertAlmostEqual(geom["volume_m3"], vol, places=9)
+        self.assertAlmostEqual(geom["volume_from_mass_m3"], vol, places=9)
+        self.assertAlmostEqual(geom["center_m"][0], cx, places=9)
+        self.assertAlmostEqual(geom["min_corner_m"][0], cx - Lx / 2.0, places=9)
+        self.assertAlmostEqual(geom["max_corner_m"][0], cx + Lx / 2.0, places=9)
+        r_eq = ((3.0 * vol) / (4.0 * math.pi)) ** (1.0 / 3.0)
+        self.assertAlmostEqual(geom["equivalent_spherical_radius_m"], r_eq, places=9)
+        self.assertNotRegex(mode.get("charge_size_info", ""), r"=\s*0(\.0+)?\s*m")
+        tr = mode.get("transition_region") or {}
+        self.assertEqual(tr.get("transition_shape"), "box")
+
+    def test_cuboid_metadata_volume_cube_when_box_disagrees_with_mass(self) -> None:
+        """When L*W*H volume != mass/rho, generator uses cube of side vol^(1/3); metadata must match."""
+        rho = 1601.0
+        mass_kg = 8.0
+        vol = mass_kg / rho
+        side = vol ** (1.0 / 3.0)
+        inp = _case(
+            charge_shape="Cuboid",
+            mass_kg=mass_kg,
+            rho_charge=rho,
+            charge_length=0.5,
+            charge_width=0.45,
+            charge_height=0.4,
+            charge_refinement_level=0,
+            charge_outer_refine_min=2,
+            charge_outer_refine_max=2,
+            outside_extent=0.12,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            case_dir = Generator3D(td).generate("box_meta_cube", inp)
+            with open(os.path.join(case_dir, "case_init_mode.json"), encoding="utf-8") as f:
+                mode = json.load(f)
+        geom = mode.get("charge_geometry") or {}
+        self.assertTrue(geom.get("volume_driven_cube"))
+        self.assertAlmostEqual(geom["length_x_m"], side, places=6)
+        self.assertAlmostEqual(geom["length_y_m"], side, places=6)
+        self.assertAlmostEqual(geom["length_z_m"], side, places=6)
+        self.assertAlmostEqual(geom["volume_m3"], vol, places=9)
+        self.assertNotIn("length=0 m", mode.get("charge_size_info", ""))
+        tr = mode.get("transition_region") or {}
+        self.assertEqual(tr.get("transition_shape"), "box")
+
+    def test_sphere_case_has_no_charge_geometry_block(self) -> None:
+        inp = _case()
+        with tempfile.TemporaryDirectory() as td:
+            case_dir = Generator3D(td).generate("sph_no_geom", inp)
+            with open(os.path.join(case_dir, "case_init_mode.json"), encoding="utf-8") as f:
+                mode = json.load(f)
+        self.assertNotIn("charge_geometry", mode)
+
+    def test_cylinder_case_has_no_charge_geometry_block(self) -> None:
+        inp = _case(charge_shape="Cylinder", charge_aspect=2.0, cylinder_axis="Z")
+        with tempfile.TemporaryDirectory() as td:
+            case_dir = Generator3D(td).generate("cyl_no_geom", inp)
+            with open(os.path.join(case_dir, "case_init_mode.json"), encoding="utf-8") as f:
+                mode = json.load(f)
+        self.assertNotIn("charge_geometry", mode)
+        self.assertIn("axis=", mode.get("charge_size_info", ""))
 
 
 class OutsideExtentLegacyValidation(unittest.TestCase):
@@ -202,8 +301,8 @@ class AmrDictValidation(unittest.TestCase):
             with open(os.path.join(case_dir, "constant", "dynamicMeshDict"), encoding="utf-8") as f:
                 dm = f.read()
         self.assertIn("errorEstimator  scaledDelta;", dm)
-        self.assertIn("deltaCoeffs", dm)
-        self.assertIn("field           p;", dm)
+        self.assertIn("scaledDeltaField p;", dm)
+        self.assertNotIn("deltaCoeffs", dm)
         self.assertNotIn("errorEstimator  pressureGradient;", dm)
 
     def test_advanced_amr_keys_and_load_balance(self) -> None:
@@ -227,6 +326,68 @@ class AmrDictValidation(unittest.TestCase):
         self.assertIn("loadBalance", dm)
         self.assertIn("balance yes;", dm)
         self.assertIn("balanceInterval 15;", dm)
+
+
+class CaseInitModeTransparencyTests(unittest.TestCase):
+    """Task 10: case_init_mode.json exposes domain, transition, capture, and AMR summaries for Info/tooltip."""
+
+    def test_case_init_mode_metadata_keys(self) -> None:
+        inp = _case(
+            min_point=(0.0, 0.0, 0.0),
+            max_point=(10.03, 2.0, 2.0),
+            cell_size=0.5,
+            charge_center=(5.0, 1.0, 1.0),
+            outside_extent=0.35,
+            bubble_radius_factor=99.0,
+            dynamic_max_cells=8_000_000,
+            begin_unrefine=1e-7,
+            upper_refine_level=0.3,
+            upper_unrefine_level=0.03,
+            enable_balancing=True,
+            balance_interval=11,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            case_dir = Generator3D(td).generate("meta_full", inp)
+            with open(os.path.join(case_dir, "case_init_mode.json"), encoding="utf-8") as f:
+                mode = json.load(f)
+
+        da = mode.get("domain_alignment") or {}
+        self.assertIn("requested_lengths_m", da)
+        self.assertIn("actual_lengths_m", da)
+        self.assertIn("n_cells_xyz", da)
+        self.assertEqual(da.get("requested_cell_size_m"), 0.5)
+        self.assertEqual(da.get("actual_cell_size_m"), 0.5)
+        self.assertTrue(da.get("domain_adjusted_for_cell_fit"))
+        self.assertIsInstance(da.get("info_messages"), list)
+        self.assertIsNotNone(mode.get("base_cell_count"))
+
+        cap = mode.get("charge_capture") or {}
+        self.assertIn("mode", cap)
+        self.assertIn("charge_capture_radius_used_m", cap)
+
+        tr = mode.get("transition_region") or {}
+        self.assertEqual(tr.get("transition_shape"), "sphere")
+        self.assertAlmostEqual(tr.get("outside_extent_m", 0), 0.35, places=5)
+        self.assertFalse(tr.get("outside_extent_auto"))
+        self.assertIn("effective_outer_radius_m", tr)
+
+        self.assertEqual(mode.get("charge_refinement_requested"), 2)
+        self.assertIn("charge_refinement_effective", mode)
+
+        amr = mode.get("amr_written") or {}
+        self.assertIn("densityGradient", amr.get("errorEstimator_line", ""))
+        self.assertEqual(amr.get("maxRefinement"), 1)
+        self.assertEqual(amr.get("refineInterval"), 3)
+        self.assertAlmostEqual(amr.get("lowerRefineLevel"), 0.1, places=5)
+        self.assertAlmostEqual(amr.get("unrefineLevel"), 0.1, places=5)
+        self.assertEqual(amr.get("maxCells"), 8_000_000)
+        self.assertAlmostEqual(amr.get("beginUnrefine"), 1e-7, delta=1e-15)
+        self.assertAlmostEqual(amr.get("upperRefineLevel"), 0.3, places=5)
+        self.assertAlmostEqual(amr.get("upperUnrefineLevel"), 0.03, places=5)
+        self.assertTrue(amr.get("enableBalancing"))
+        self.assertEqual(amr.get("balanceInterval"), 11)
+
+        self.assertIsNotNone(mode.get("charge_size_info"))
 
 
 if __name__ == "__main__":

@@ -167,7 +167,7 @@ class CaseInputs3D:
     n_buffer_layers_dynamic: int = 2
     enable_balancing: bool = False
     dynamic_max_cells: int = 200000000
-    refine_indicator_field: str = "densityGradient"  # densityGradient | scaledDelta_p (pressure field p)
+    refine_indicator_field: str = "densityGradient"  # densityGradient | scaledDelta_p (p) | scaledDelta_rho (rho)
     begin_unrefine: Optional[float] = None  # beginUnrefine in dynamicMeshDict
     upper_refine_level: Optional[float] = None  # upperRefineLevel
     upper_unrefine_level: Optional[float] = None  # upperUnrefineLevel

@@ -27,12 +27,37 @@ class ChargeCaptureTests(unittest.TestCase):
         self.assertEqual(rep.mode, "manual")
 
     def test_auto_formula(self) -> None:
+        from charge_capture import CAPTURE_CELL_SAFETY
         r_phys = 0.1
         dx, dy, dz = 0.4, 0.4, 0.4
         cf = 1.0
-        expect = max(1.05 * r_phys, 0.5 * math.sqrt(dx * dx + dy * dy + dz * dz) * cf)
+        # Geometric term is floored by the safety factor so a sub-cell charge still
+        # encloses at least one cell centre.
+        expect = max(
+            1.05 * r_phys,
+            0.5 * math.sqrt(dx * dx + dy * dy + dz * dz) * max(cf, CAPTURE_CELL_SAFETY),
+        )
         got = auto_charge_capture_radius_m(r_phys, dx, dy, dz, cf)
         self.assertAlmostEqual(got, expect)
+
+    def test_auto_user_factor_above_floor_is_honoured(self) -> None:
+        from charge_capture import CAPTURE_CELL_SAFETY
+        r_phys = 0.01
+        dx = dy = dz = 0.2
+        cf = CAPTURE_CELL_SAFETY + 1.0  # user asks for more than the floor
+        expect = 0.5 * math.sqrt(3 * dx * dx) * cf
+        got = auto_charge_capture_radius_m(r_phys, dx, dy, dz, cf)
+        self.assertAlmostEqual(got, expect)
+
+    def test_auto_radius_strictly_encloses_nearest_cell_centre(self) -> None:
+        # Worst case: charge centred on a cell corner -> nearest cell centre at half the
+        # cell space-diagonal. The auto capture radius MUST strictly exceed that distance
+        # so setRefinedFields' backup region selects >= 1 cell (robust sub-cell capture).
+        for h in (0.2, 0.5, 1.0):
+            r_tiny = 1e-4  # charge far smaller than a cell
+            r_cap = auto_charge_capture_radius_m(r_tiny, h, h, h, 1.0)
+            worst_case_nearest_centre = 0.5 * math.sqrt(3.0) * h
+            self.assertGreater(r_cap, worst_case_nearest_centre)
 
     def test_no_hidden_125_dx_floor_manual(self) -> None:
         """Regression: older code used max(r_user, 1.25*dx); manual must not inflate."""

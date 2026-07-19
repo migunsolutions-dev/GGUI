@@ -2,6 +2,11 @@
 # Optional debug hook: short OpenFOAM pipeline sanity check (run inside WSL from case root).
 # Usage: bash tools/amr_mesh_sanity_wsl.sh [/path/to/case]
 # Does not modify the repo; intended for manual / CI-on-Linux debugging only.
+#
+# Note: blastFoam here expects time directories under 0/ (fields). GUI cases normally use
+# ``bash Allrun`` (cp 0.orig → 0, setRefinedFields/setFields, then blastFoam). This script
+# only runs blockMesh + snappy + blastFoam, so blastFoam may fail with missing 0/U unless
+# you prepare 0/ first. Use Allrun for end-to-end solver validation.
 set -uo pipefail
 CASE="${1:-.}"
 cd "$CASE" || exit 1

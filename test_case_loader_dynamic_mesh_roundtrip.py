@@ -6,7 +6,7 @@ import re
 import tempfile
 import unittest
 
-from case_loader import load_case
+from case_loader import _parse_dynamicMeshDict, load_case
 from generator_3d import Generator3D
 from models import CaseInputs3D
 
@@ -144,8 +144,29 @@ class DynamicMeshRoundTripTests(unittest.TestCase):
             with open(os.path.join(c2, "constant", "dynamicMeshDict"), encoding="utf-8") as f:
                 d2 = f.read()
         self.assertIn("errorEstimator  scaledDelta;", d2)
-        self.assertIn("field           p;", d2)
+        self.assertIn("scaledDeltaField p;", d2)
         self.assertNotRegex(d2, r"errorEstimator\s+pressureGradient\s*;")
+
+    def test_legacy_deltaCoeffs_p_maps_to_scaledDelta_p(self) -> None:
+        """Older generated cases may use OpenFOAM-style deltaCoeffs instead of scaledDeltaField."""
+        legacy = """dynamicFvMesh   adaptiveFvMesh;
+errorEstimator  scaledDelta;
+deltaCoeffs
+{
+    field           p;
+}
+refineInterval  3;
+maxRefinement   2;
+dumpLevel       true;
+"""
+        with tempfile.TemporaryDirectory() as td:
+            cdir = os.path.join(td, "c")
+            os.makedirs(os.path.join(cdir, "constant"), exist_ok=True)
+            with open(os.path.join(cdir, "constant", "dynamicMeshDict"), "w", encoding="utf-8") as f:
+                f.write(legacy)
+            out: dict = {}
+            _parse_dynamicMeshDict(cdir, out)
+        self.assertEqual(out.get("refine_indicator_field"), "scaledDelta_p")
 
 
 if __name__ == "__main__":

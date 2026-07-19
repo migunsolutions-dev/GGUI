@@ -81,7 +81,7 @@ class Generator3DWriteTests(unittest.TestCase):
             with open(os.path.join(case_dir, "constant", "dynamicMeshDict"), encoding="utf-8") as f:
                 dm = f.read()
         self.assertIn("errorEstimator  scaledDelta;", dm)
-        self.assertIn("field           p;", dm)
+        self.assertIn("scaledDeltaField p;", dm)
         self.assertNotIn("errorEstimator  pressureGradient;", dm)
 
     def test_legacy_pressure_gradient_mapped_in_writer(self) -> None:

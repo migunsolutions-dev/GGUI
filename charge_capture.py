@@ -17,6 +17,19 @@ def base_cell_spacings_m(inputs: Any) -> Tuple[float, float, float]:
     return (h, h, h)
 
 
+# Safety multiplier on the half cell-diagonal for the geometric capture term.
+# 0.5*sqrt(dx^2+dy^2+dz^2) is the half cell-diagonal == the WORST-CASE distance from an
+# arbitrary point (e.g. a charge centred on a cell corner) to the nearest base-cell centre.
+# With factor 1.0 the capture sphere's surface passes exactly through that centre, so on a
+# coarse mesh no cell centre is strictly inside and setRefinedFields selects zero cells
+# ("No cells were selected"). A multiplier > 1 guarantees at least one base-cell centre lies
+# strictly inside the capture sphere for ANY charge placement on the grid, which is what the
+# setRefinedFields ``backup`` region needs to bootstrap refineInternal. This does not change
+# the captured mass (sphericalMassToCell/cylindericalMassToCell set mass from the charge
+# radius, not the backup radius); it only guarantees the bootstrap selection is non-empty.
+CAPTURE_CELL_SAFETY = 1.5
+
+
 def auto_charge_capture_radius_m(
     r_charge: float,
     dx: float,
@@ -28,13 +41,18 @@ def auto_charge_capture_radius_m(
 
     R_capture = max(
         1.05 * R_charge,
-        0.5 * sqrt(dx^2 + dy^2 + dz^2) * captureFactor
+        0.5 * sqrt(dx^2 + dy^2 + dz^2) * max(captureFactor, CAPTURE_CELL_SAFETY)
     )
+
+    The geometric term is floored by CAPTURE_CELL_SAFETY (> 1) so the capture sphere
+    strictly encloses at least one base-cell centre even for charges smaller than a base
+    cell that sit on a cell corner (otherwise capture fails on coarse meshes). A user
+    captureFactor larger than the floor is still honoured.
     """
     r_c = max(0.0, float(r_charge))
     cf = max(1e-9, float(capture_factor))
     diag = math.sqrt(max(0.0, float(dx) ** 2 + float(dy) ** 2 + float(dz) ** 2))
-    cell_term = 0.5 * diag * cf
+    cell_term = 0.5 * diag * max(cf, CAPTURE_CELL_SAFETY)
     return max(1.05 * r_c, cell_term)
 
 
@@ -105,7 +123,9 @@ def resolve_charge_capture_radius_m(
         r_cap = auto_charge_capture_radius_m(r_phys, dx, dy, dz, factor)
         desc = (
             "Auto charge capture radius: max(1.05 * R_charge, "
-            "0.5 * sqrt(dx² + dy² + dz²) * charge_capture_factor)."
+            "0.5 * sqrt(dx² + dy² + dz²) * max(charge_capture_factor, "
+            f"{CAPTURE_CELL_SAFETY})). The half cell-diagonal is floored by a safety factor "
+            "so at least one base-cell centre is strictly enclosed (robust sub-cell capture)."
         )
 
     # Manual radius: advisory only (never changes r_cap). Order: physical → marginal → geometric
