@@ -7,7 +7,11 @@ import unittest
 from dataclasses import replace
 
 from generator_3d import Generator3D
-from initialization_plan import build_initialization_plan
+from initialization_plan import (
+    build_initialization_plan,
+    effective_dyn_refine_enabled,
+    outer_band_will_be_applied,
+)
 from models import CaseInputs3D, ObstacleData
 from project_io import (
     ProjectFormatError,
@@ -468,19 +472,116 @@ class RunnerIntentTests(unittest.TestCase):
 
 
 class CaptureGuardTests(unittest.TestCase):
-    def test_unsafe_seed_zero_no_band(self):
-        inputs = case(
+    def _off_centre_subcell(self, **overrides):
+        values = dict(
             min_point=(0, 0, 0),
             max_point=(1, 1, 1),
             cell_size=0.2,
             charge_center=(0.4, 0.4, 0.4),
             mass_kg=0.001,
             charge_outer_refine_enable=False,
+            charge_outer_refine_min=0,
+            charge_outer_refine_max=0,
         )
+        values.update(overrides)
+        return case(**values)
+
+    def test_unsafe_seed_zero_no_band(self):
+        inputs = self._off_centre_subcell(charge_refinement_level=0)
         self.assertFalse(evaluate_unsafe_capture(inputs).safe)
         with self.assertRaises(ValueError) as ctx:
             require_safe_capture(inputs)
         self.assertIn("Initialization is blocked", str(ctx.exception))
+
+    def test_fixed_mesh_positive_seed_does_not_protect(self):
+        """Fixed mesh forces setFields/seed_effective=0 — requested seed is not protection."""
+        inputs = self._off_centre_subcell(
+            enable_dyn_refine=False,
+            charge_refinement_level=2,
+            charge_outer_refine_enable=False,
+        )
+        plan = build_initialization_plan(inputs)
+        self.assertEqual(plan.command, "setFields")
+        self.assertEqual(plan.seed_effective, 0)
+        self.assertFalse(outer_band_will_be_applied(inputs))
+        self.assertFalse(evaluate_unsafe_capture(inputs).safe)
+
+    def test_fixed_mesh_configured_outer_band_does_not_protect(self):
+        inputs = self._off_centre_subcell(
+            enable_dyn_refine=False,
+            charge_refinement_level=0,
+            charge_outer_refine_enable=True,
+            charge_outer_refine_min=2,
+            charge_outer_refine_max=3,
+        )
+        self.assertFalse(outer_band_will_be_applied(inputs))
+        self.assertFalse(evaluate_unsafe_capture(inputs).safe)
+
+    def test_dynamic_mesh_positive_seed_protects(self):
+        inputs = self._off_centre_subcell(
+            enable_dyn_refine=True,
+            charge_refinement_level=2,
+            charge_outer_refine_enable=False,
+        )
+        plan = build_initialization_plan(inputs)
+        self.assertTrue(plan.uses_set_refined_fields)
+        self.assertEqual(plan.seed_effective, 2)
+        self.assertTrue(evaluate_unsafe_capture(inputs).safe)
+
+    def test_dynamic_mesh_applied_outer_band_protects(self):
+        inputs = self._off_centre_subcell(
+            enable_dyn_refine=True,
+            charge_refinement_level=0,
+            charge_outer_refine_enable=True,
+            charge_outer_refine_min=2,
+            charge_outer_refine_max=3,
+        )
+        self.assertTrue(outer_band_will_be_applied(inputs))
+        self.assertTrue(evaluate_unsafe_capture(inputs).safe)
+
+    def test_fixed_mesh_centre_inside_remains_safe(self):
+        inputs = case(
+            min_point=(0, 0, 0),
+            max_point=(1, 1, 1),
+            cell_size=0.2,
+            charge_center=(0.5, 0.5, 0.5),
+            mass_kg=0.02,
+            enable_dyn_refine=False,
+            charge_refinement_level=2,
+            charge_outer_refine_enable=False,
+        )
+        self.assertTrue(evaluate_unsafe_capture(inputs).safe)
+        require_safe_capture(inputs)
+
+    def test_enable_dyn_refine_none_follows_enable_local_refinement(self):
+        local_on = self._off_centre_subcell(
+            enable_dyn_refine=None,
+            enable_local_refinement=True,
+            charge_refinement_level=2,
+            charge_outer_refine_enable=False,
+        )
+        local_off = self._off_centre_subcell(
+            enable_dyn_refine=None,
+            enable_local_refinement=False,
+            charge_refinement_level=2,
+            charge_outer_refine_enable=True,
+            charge_outer_refine_min=2,
+            charge_outer_refine_max=3,
+        )
+        self.assertTrue(effective_dyn_refine_enabled(local_on))
+        self.assertFalse(effective_dyn_refine_enabled(local_off))
+        self.assertEqual(build_initialization_plan(local_on).seed_effective, 2)
+        self.assertEqual(build_initialization_plan(local_off).seed_effective, 0)
+        self.assertTrue(outer_band_will_be_applied(replace(
+            local_on,
+            charge_refinement_level=0,
+            charge_outer_refine_enable=True,
+            charge_outer_refine_min=2,
+            charge_outer_refine_max=3,
+        )))
+        self.assertFalse(outer_band_will_be_applied(local_off))
+        self.assertTrue(evaluate_unsafe_capture(local_on).safe)
+        self.assertFalse(evaluate_unsafe_capture(local_off).safe)
 
     def test_subcell_charge_can_contain_cell_centre(self):
         inputs = case(
@@ -496,25 +597,47 @@ class CaptureGuardTests(unittest.TestCase):
 
     def test_seed_or_band_protects_all_shapes(self):
         for shape in ("Sphere", "Cylinder", "Cuboid"):
-            base = case(charge_shape=shape, mass_kg=0.001)
+            base = case(charge_shape=shape, mass_kg=0.001, enable_dyn_refine=True)
             self.assertTrue(evaluate_unsafe_capture(replace(base, charge_refinement_level=2)).safe)
-            self.assertTrue(evaluate_unsafe_capture(replace(base, charge_outer_refine_enable=True)).safe)
+            self.assertTrue(
+                evaluate_unsafe_capture(
+                    replace(
+                        base,
+                        charge_refinement_level=0,
+                        charge_outer_refine_enable=True,
+                        charge_outer_refine_min=2,
+                        charge_outer_refine_max=3,
+                    )
+                ).safe
+            )
 
     def test_generator_blocks_unsafe_before_writing_case(self):
-        inputs = case(
-            min_point=(0, 0, 0),
-            max_point=(1, 1, 1),
-            cell_size=0.2,
-            charge_center=(0.4, 0.4, 0.4),
-            mass_kg=0.001,
-            charge_outer_refine_enable=False,
-            charge_refinement_level=0,
-        )
+        inputs = self._off_centre_subcell(charge_refinement_level=0)
         with tempfile.TemporaryDirectory() as td:
             with self.assertRaises(ValueError) as ctx:
                 Generator3D(td).generate("unsafe", inputs)
             self.assertEqual(str(ctx.exception), UNSAFE_CAPTURE_MESSAGE)
             self.assertFalse(os.path.isdir(os.path.join(td, "unsafe")))
+
+    def test_generator_blocks_fixed_mesh_seed_and_band_before_writing(self):
+        seed_case = self._off_centre_subcell(
+            enable_dyn_refine=False,
+            charge_refinement_level=2,
+            charge_outer_refine_enable=False,
+        )
+        band_case = self._off_centre_subcell(
+            enable_dyn_refine=False,
+            charge_refinement_level=0,
+            charge_outer_refine_enable=True,
+            charge_outer_refine_min=2,
+            charge_outer_refine_max=3,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            for name, inputs in (("fixed_seed", seed_case), ("fixed_band", band_case)):
+                with self.assertRaises(ValueError) as ctx:
+                    Generator3D(td).generate(name, inputs)
+                self.assertEqual(str(ctx.exception), UNSAFE_CAPTURE_MESSAGE)
+                self.assertFalse(os.path.isdir(os.path.join(td, name)))
 
     def test_generator_allows_safe_centre_inside(self):
         inputs = case(
@@ -546,6 +669,15 @@ class CaptureGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             case_dir = Generator3D(td).generate("remap", inputs)
             self.assertTrue(os.path.isdir(case_dir))
+        # Remap still bypasses even with fixed-mesh + unused seed.
+        fixed_remap = replace(
+            inputs,
+            enable_dyn_refine=False,
+            charge_refinement_level=2,
+        )
+        require_safe_capture(fixed_remap)
+        plan = build_initialization_plan(fixed_remap)
+        self.assertEqual(plan.command, "remap_radial.py")
 
 
 class ProjectPersistenceTests(unittest.TestCase):

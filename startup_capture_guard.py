@@ -5,6 +5,10 @@ import math
 from dataclasses import dataclass
 from typing import Any, Iterable, Tuple
 
+from initialization_plan import (
+    build_initialization_plan,
+    outer_band_will_be_applied,
+)
 from mesh_domain import align_domain_to_cell_size
 
 
@@ -100,15 +104,15 @@ UNSAFE_CAPTURE_MESSAGE = (
 
 
 def evaluate_unsafe_capture(inputs: Any) -> CaptureGuardResult:
-    seed = max(0, int(getattr(inputs, "charge_refinement_level", 0) or 0))
-    band_enabled = bool(getattr(inputs, "charge_outer_refine_enable", False))
-    band_levels = max(
-        int(getattr(inputs, "charge_outer_refine_min", 0) or 0),
-        int(getattr(inputs, "charge_outer_refine_max", 0) or 0),
-    )
-    if seed > 0:
+    """Non-mutating guard using the same Dyn Mesh / init-plan / outer-band rules as generation.
+
+    Requested seed or outer-band UI values protect capture only when they will
+    actually be applied (Dyn Mesh + setRefinedFields / emitted snappy band).
+    """
+    plan = build_initialization_plan(inputs)
+    if plan.uses_set_refined_fields and plan.seed_effective > 0:
         return CaptureGuardResult(True, False, "internal seed protects startup capture")
-    if band_enabled and band_levels > 0:
+    if outer_band_will_be_applied(inputs):
         return CaptureGuardResult(True, False, "outer refinement band protects startup capture")
     inside = aligned_base_cell_centre_inside(inputs)
     return CaptureGuardResult(

@@ -12,7 +12,7 @@ except ImportError:
 from base_generator import BaseGenerator
 from charge_capture import resolve_charge_capture_radius_m, CAPTURE_CELL_SAFETY
 from startup_mesh_metadata import build_startup_mesh_metadata, flatten_warnings_for_charge_warnings
-from initialization_plan import build_initialization_plan
+from initialization_plan import build_initialization_plan, outer_band_level_string
 from mesh_domain import align_domain_to_cell_size
 from models import CaseInputs3D
 from path_utils import get_latest_time_dir, win_to_wsl_path
@@ -1185,23 +1185,14 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
         coexist in snappy refinementRegions — snappy takes the per-cell maximum, so the inner
         region reaches inside_level and the surrounding band reaches outer_max.
         Fixed Mesh: no charge outer refinement.
+
+        Dyn Mesh gating matches initialization_plan.effective_dyn_refine_enabled /
+        outer_band_level_string (shared with the capture guard).
         """
-        if getattr(inputs, "enable_dyn_refine", None) is False:
+        level_str = outer_band_level_string(inputs)
+        if level_str is None:
             return False, None
-        enable = getattr(inputs, "charge_outer_refine_enable", None)
-        if enable is False:
-            return False, None
-        rmin_outer = getattr(inputs, "charge_outer_refine_min", None)
-        rmax_outer = getattr(inputs, "charge_outer_refine_max", None)
-        # Use charge_outer_* when explicitly set (None = fallback to global refine_min/refine_max); 0 is valid
-        rmin = rmin_outer if rmin_outer is not None else getattr(inputs, "refine_min", 2)
-        rmax = rmax_outer if rmax_outer is not None else getattr(inputs, "refine_max", 3)
-        if rmin == 0 and rmax == 0:
-            return False, None
-        if not getattr(inputs, "enable_local_refinement", True):
-            return True, "2 2"
-        rmax = max(rmin, rmax)
-        return True, f"{rmin} {rmax}"
+        return True, level_str
 
     def _characteristic_charge_extent_m(self, inputs: CaseInputs3D, dims: Dict[str, float]) -> float:
         """Single length scale for legacy auto outside_extent (shell beyond charge)."""
