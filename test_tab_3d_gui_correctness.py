@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -10,8 +11,8 @@ from dataclasses import asdict
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
 
-from PyQt5.QtCore import pyqtSignal
-from PyQt5.QtWidgets import QApplication, QWidget
+from PyQt5.QtCore import QObject, Qt, pyqtSignal
+from PyQt5.QtWidgets import QApplication, QLabel, QWidget
 
 import tab_3d_general
 from generator_3d import Generator3D
@@ -292,6 +293,281 @@ class Tab3DGuiCorrectnessTests(unittest.TestCase):
                 with open(os.path.join(case_after, rel), encoding="utf-8") as f:
                     b = f.read()
                 self.assertEqual(a, b, rel)
+
+    def _visible_summary_texts(self, tab) -> list[str]:
+        texts = []
+        for lbl in tab.findChildren(QLabel):
+            if not lbl.isVisible():
+                continue
+            t = (lbl.text() or "").strip()
+            if t:
+                texts.append(t)
+        return texts
+
+    def test_mesh_plan_populated_before_initialize(self):
+        tab = self.make_tab()
+        tab.sx1.setValue(-5)
+        tab.sx2.setValue(5)
+        tab.sy1.setValue(-5)
+        tab.sy2.setValue(5)
+        tab.sz1.setValue(0)
+        tab.sz2.setValue(5)
+        tab.scell.setValue(0.5)
+        tab.rad_dyn_mesh.setChecked(True)
+        tab.spin_refine_max.setValue(2)
+        tab.spin_charge_refine.setValue(4)
+        tab._update_mesh_plan_display()
+
+        plan = tab.lbl_plan_block_mesh.text()
+        self.assertIn("Total cells before refinement:    4,000", plan)
+        self.assertIn("Base grid:    20 × 20 × 10", plan)
+        self.assertNotIn("h0", plan)
+        self.assertNotIn("→", plan)
+        self.assertIn("Mesh mode:    AMR", plan)
+        self.assertIn("Wave AMR level:    2", plan)
+        self.assertIn("Planned initialization:    setRefinedFields", plan)
+        self.assertIn("Charge seed:    On", plan)
+        self.assertIn("Charge seed level:    4", plan)
+        self.assertIn("Charge capture:", plan)
+        self.assertIn("Startup outer region:    On", plan)
+        self.assertIn("Startup outer level:    3", plan)
+        self.assertIn("Initiation location:    Charge center", plan)
+        self.assertIn("Initiation radius:", plan)
+        # First data row is total cells; base grid is second (no duplicate cell-count row).
+        lines = [ln for ln in plan.splitlines() if ln.strip()]
+        self.assertTrue(lines[0].startswith("Total cells before refinement:"))
+        self.assertTrue(lines[1].startswith("Base grid:"))
+        self.assertEqual(sum(1 for ln in lines if "Total cells" in ln), 1)
+        self.assertFalse(tab.grp_init_results.isVisible())
+        # Horizontal scrolling must remain available (not disabled).
+        from PyQt5.QtCore import Qt as _Qt
+        self.assertNotEqual(
+            tab._left_setup_scroll.horizontalScrollBarPolicy(),
+            _Qt.ScrollBarAlwaysOff,
+        )
+        # Title is a separate QLabel with layout gap (not QGroupBox title / newlines).
+        self.assertEqual(tab.lbl_mesh_plan_title.text(), "Mesh Plan — Before Initialize")
+        self.assertIsInstance(tab.lbl_mesh_plan_title, QLabel)
+        self.assertNotIn("Mesh Plan", plan)
+
+    def test_initialization_results_hidden_until_metadata(self):
+        tab = self.make_tab()
+        self.assertTrue(tab.grp_init_results.isHidden())
+        self.assertFalse(tab._init_results_available)
+        for lbl in (
+            tab.lbl_result_total_cells,
+            tab.lbl_result_init_command,
+            tab.lbl_result_charge_cells,
+            tab.lbl_result_ignition_cells,
+        ):
+            self.assertFalse(bool((lbl.text() or "").strip()) and not lbl.isHidden())
+
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "case_init_mode.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "set_cmd": "setFields",
+                        "base_cell_count": 12345,
+                        "cells_inside_charge": 88,
+                        "cells_in_ignition_region": 12,
+                        "charge_clipped_by_domain": False,
+                    },
+                    f,
+                )
+            tab.update_charge_cells_display(td)
+
+        self.assertFalse(tab.grp_init_results.isHidden())
+        self.assertTrue(tab._init_results_available)
+        self.assertIn("12345", tab.lbl_result_total_cells.text().replace(",", ""))
+        self.assertIn("setFields", tab.lbl_result_init_command.text())
+        self.assertIn("88", tab.lbl_result_charge_cells.text())
+        self.assertIn("12", tab.lbl_result_ignition_cells.text())
+
+    def test_duplicate_summary_rows_removed(self):
+        tab = self.make_tab()
+        # Permanent summary texts on Mesh Plan / Results (ignore hidden compatibility labels).
+        permanent = [
+            tab.lbl_plan_base_grid.text(),
+            tab.lbl_plan_mesh_mode.text(),
+            tab.lbl_plan_init_command.text(),
+            tab.lbl_plan_charge_seed.text(),
+            tab.lbl_plan_charge_capture.text(),
+            tab.lbl_plan_startup_outer.text(),
+            tab.lbl_plan_initiation.text(),
+            tab.lbl_result_total_cells.text(),
+            tab.lbl_result_init_command.text(),
+            tab.lbl_result_charge_cells.text(),
+            tab.lbl_result_ignition_cells.text(),
+        ]
+        joined = "\n".join(permanent)
+        for banned in (
+            "Charge fraction (%)",
+            "Cells inside charge (post-refinement)",
+            "Obstacle refine:",
+            "Expected .eMesh",
+            "Charge clipped by domain",
+        ):
+            self.assertNotIn(banned, joined)
+
+    def test_clipping_shown_only_as_warning_when_true(self):
+        tab = self.make_tab()
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "case_init_mode.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "set_cmd": "setFields",
+                        "base_cell_count": 100,
+                        "charge_clipped_by_domain": False,
+                    },
+                    f,
+                )
+            tab.update_charge_cells_display(td)
+        self.assertNotIn("clipped", (tab.lbl_charge_resolution_warning.text() or "").lower())
+        joined = "\n".join(self._visible_summary_texts(tab))
+        self.assertNotIn("Charge clipped by domain", joined)
+
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "case_init_mode.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "set_cmd": "setFields",
+                        "base_cell_count": 100,
+                        "charge_clipped_by_domain": True,
+                    },
+                    f,
+                )
+            tab.update_charge_cells_display(td)
+        self.assertIn("clipped", (tab.lbl_charge_resolution_warning.text() or "").lower())
+        self.assertTrue(tab.lbl_charge_resolution_warning.wordWrap())
+
+    def test_exact_buttons_and_no_visible_run_resume(self):
+        tab = self.make_tab()
+        self.assertEqual(tab.btn_exact_1.text(), "exact 1")
+        self.assertEqual(tab.btn_exact_end.text(), "exact END")
+        self.assertFalse(tab.btn_exact_1.isHidden())
+        self.assertFalse(tab.btn_exact_end.isHidden())
+        self.assertFalse(hasattr(tab, "btn_run"))
+        self.assertFalse(hasattr(tab, "btn_save_remap"))
+        for child in tab.findChildren(QWidget):
+            if hasattr(child, "text") and callable(child.text):
+                t = child.text()
+                if t is None:
+                    continue
+                self.assertNotIn("Run / Resume", t)
+                self.assertNotIn("Save 3D remap", t)
+
+        class Catch(QObject):
+            def __init__(self):
+                super().__init__()
+                self.exact_1 = 0
+                self.exact_end = 0
+
+            def on_1(self):
+                self.exact_1 += 1
+
+            def on_end(self):
+                self.exact_end += 1
+
+        catch = Catch()
+        tab.sig_request_run_exact_1.connect(catch.on_1)
+        tab.sig_request_run_exact_end.connect(catch.on_end)
+        tab.btn_exact_1.click()
+        tab.btn_exact_end.click()
+        self.assertEqual(catch.exact_1, 1)
+        self.assertEqual(catch.exact_end, 1)
+
+    def test_obstacle_refine_and_cycle_write_remain_in_sim_control(self):
+        tab = self.make_tab()
+        self.assertFalse(tab.chk_obstacle_refine.isHidden())
+        self.assertFalse(tab.spin_obstacle_refine_min.isHidden())
+        self.assertFalse(tab.spin_obstacle_refine_max.isHidden())
+        self.assertFalse(tab.spin_cycle_write.isHidden())
+        self.assertEqual(tab.spin_cycle_write.value(), 0)
+        # Mesh Properties moved next to Cell Size (Domain/Grid), not Simulation Control.
+        self.assertFalse(tab.btn_mesh_properties.isHidden())
+        self.assertEqual(tab.btn_mesh_properties.text(), "Mesh Properties…")
+        self.assertIn("Wave AMR", " ".join(
+            lbl.text() for lbl in tab.findChildren(QLabel) if not lbl.isHidden() and lbl.text()
+        ))
+
+    def test_relocated_advanced_mesh_values_survive_project_apply(self):
+        tab = self.make_tab()
+        tab.rad_dyn_mesh.setChecked(True)
+        tab.spin_charge_refine.setValue(3)
+        tab.spin_charge_outer_min.setValue(1)
+        tab.spin_charge_outer_max.setValue(4)
+        tab.spin_transition_cells.setValue(5)
+        tab._enable_post_processing = True
+        tab._fast_run_mode = False
+
+        with tempfile.TemporaryDirectory() as td:
+            probes = ProbesModel()
+            payload = capture_project_payload(tab, probes)
+            path = os.path.join(td, "adv.ggui.json")
+            write_project_atomic(path, payload)
+
+            tab2 = self.make_tab()
+            apply_project_payload(tab2, ProbesModel(), read_project(path))
+            self.assertEqual(tab2.spin_charge_refine.value(), 3)
+            self.assertEqual(tab2.spin_charge_outer_min.value(), 1)
+            self.assertEqual(tab2.spin_charge_outer_max.value(), 4)
+            self.assertEqual(tab2.spin_transition_cells.value(), 5)
+            self.assertTrue(tab2._enable_post_processing)
+            self.assertFalse(tab2._fast_run_mode)
+            inputs = tab2.get_case_inputs()
+            self.assertEqual(inputs.charge_refinement_level, 3)
+            self.assertEqual(inputs.charge_outer_refine_min, 1)
+            self.assertEqual(inputs.charge_outer_refine_max, 4)
+            self.assertEqual(inputs.transition_cells, 5)
+
+    def test_warning_label_uses_word_wrap(self):
+        tab = self.make_tab()
+        self.assertTrue(tab.lbl_charge_resolution_warning.wordWrap())
+        tab.lbl_charge_resolution_warning.setText(
+            "Warning: Charge resolution is too low. Blast may fail. "
+            "This long warning must wrap instead of forcing horizontal scroll."
+        )
+        self.assertTrue(tab.lbl_charge_resolution_warning.wordWrap())
+        self.assertGreaterEqual(tab.lbl_charge_resolution_warning.minimumHeight(), 36)
+
+    def test_relocated_charge_seed_spins_do_not_float_visible(self):
+        """Regression: advanced seed spins must stay hidden hosts, not cover the tab."""
+        tab = self.make_tab()
+        tab.resize(1200, 800)
+        tab.show()
+        self.app.processEvents()
+        host = tab._charge_seed_host
+        self.assertEqual(host.objectName(), "chargeSeedAdvancedHost")
+        self.assertTrue(host.isHidden())
+        self.assertFalse(host.isVisible())
+        self.assertTrue(host.testAttribute(Qt.WA_DontShowOnScreen))
+        for w in (
+            tab.spin_charge_refine,
+            tab.spin_charge_outer_min,
+            tab.spin_charge_outer_max,
+            tab.spin_transition_cells,
+        ):
+            self.assertTrue(host.isAncestorOf(w))
+            self.assertFalse(w.isVisible())
+            self.assertFalse(w.isWindow())
+        # Horizontal scrolling remains enabled (AsNeeded/AlwaysOn — not AlwaysOff).
+        self.assertNotEqual(
+            tab._left_setup_scroll.horizontalScrollBarPolicy(),
+            Qt.ScrollBarAlwaysOff,
+        )
+        # No visible QSpinBox/QAbstractItemView may float as a direct oversized overlay.
+        from PyQt5.QtWidgets import QAbstractItemView, QSpinBox
+
+        for child in tab.findChildren((QSpinBox, QAbstractItemView)):
+            if not child.isVisible():
+                continue
+            if child.parentWidget() is tab:
+                g = child.geometry()
+                if g.width() >= 200 or g.height() >= 200:
+                    self.fail(
+                        f"Visible floating overlay: {type(child).__name__} "
+                        f"geom={g.getRect()} objectName={child.objectName()!r}"
+                    )
 
 
 if __name__ == "__main__":

@@ -6,13 +6,18 @@ from PyQt5.QtWidgets import (
     QTabWidget, QGroupBox, QFormLayout, QGridLayout, QLabel, QPushButton, QDoubleSpinBox,
     QComboBox, QTableWidget, QTableWidgetItem, QFileDialog, QSpinBox,
     QCheckBox, QHeaderView, QRadioButton, QButtonGroup,
-    QDialog, QDialogButtonBox, QMessageBox
+    QDialog, QDialogButtonBox, QMessageBox, QSizePolicy,
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 
 from probes_model import ProbesModel
 from models import CaseInputs3D, ObstacleData
-from initialization_plan import build_initialization_plan
+from initialization_plan import (
+    build_initialization_plan,
+    outer_band_level_string,
+    outer_band_will_be_applied,
+)
+from charge_capture import resolve_charge_capture_radius_m
 from viewer_widget import BlastViewerWidget, ObstacleItem, SectionItem
 from dialogs import RemapConfigDialog
 try:
@@ -88,74 +93,171 @@ class TabGeneral3D(QWidget):
         self.settings_tabs.addTab(self._tab_obs, "Obstacles")
         setup_layout.addWidget(self.settings_tabs)
         
-        # Info Frame (compact, smaller font)
+        # Info panel: Mesh Plan (live, pre-init) + Initialization Results (post-init only)
         info_font = "font-size: 9pt; color: #333;"
         info_frm = QFrame()
         info_frm.setStyleSheet("background:#eef2f6; border:1px solid #c7d0da; border-radius: 4px;")
+        info_frm.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         il = QVBoxLayout(info_frm)
-        self.lbl_cells = QLabel("Cells: -")
-        self.lbl_cells.setStyleSheet("font-weight: bold; font-size: 9pt; color: #333;")
-        il.addWidget(self.lbl_cells)
-        self.lbl_init_mode = QLabel("Init: —")
-        self.lbl_init_mode.setStyleSheet(info_font)
-        self.lbl_init_mode.setToolTip("Init command actually used: setFields or setRefinedFields.")
-        il.addWidget(self.lbl_init_mode)
-        self.lbl_initiation_radius = QLabel("Initiation radius: —")
-        self.lbl_initiation_radius.setStyleSheet(info_font)
-        il.addWidget(self.lbl_initiation_radius)
-        self.lbl_charge_refine_info = QLabel("Charge refine: —")
-        self.lbl_charge_refine_info.setStyleSheet(info_font)
-        il.addWidget(self.lbl_charge_refine_info)
-        self.lbl_charge_capture_info = QLabel("Charge capture: —")
-        self.lbl_charge_capture_info.setStyleSheet(info_font)
-        self.lbl_charge_capture_info.setToolTip(
-            "Charge capture radius in setFieldsDict (backup region) for setRefinedFields — not the physical charge size."
+        il.setContentsMargins(6, 6, 6, 6)
+        il.setSpacing(4)
+
+        # Title is a real QLabel (not QGroupBox::title) so spacing after it is layout-controlled.
+        self.grp_mesh_plan = QFrame()
+        self.grp_mesh_plan.setObjectName("meshPlanGroup")
+        self.grp_mesh_plan.setStyleSheet(
+            "QFrame#meshPlanGroup { border: none; background: transparent; }"
         )
-        il.addWidget(self.lbl_charge_capture_info)
-        self.lbl_obstacle_refine_info = QLabel("Obstacle refine: —")
-        self.lbl_obstacle_refine_info.setStyleSheet(info_font)
-        il.addWidget(self.lbl_obstacle_refine_info)
-        self.lbl_charge_cells = QLabel("Charge cells (alpha.c4>thr): —")
-        self.lbl_charge_cells.setStyleSheet(info_font)
-        self.lbl_charge_cells.setToolTip("Number of cells with alpha.c4 > threshold in 0/ after init. Threshold default 0.5.")
-        il.addWidget(self.lbl_charge_cells)
-        self.lbl_charge_fraction = QLabel("Charge fraction (%): —")
-        self.lbl_charge_fraction.setStyleSheet(info_font)
-        il.addWidget(self.lbl_charge_fraction)
-        self.lbl_cells_inside_charge = QLabel("Cells inside charge (post-refinement): —")
-        self.lbl_cells_inside_charge.setStyleSheet(info_font)
-        self.lbl_cells_inside_charge.setToolTip("Number of cells inside the charge after setFields/setRefinedFields.")
-        il.addWidget(self.lbl_cells_inside_charge)
-        self.lbl_charge_clipped = QLabel("Charge clipped by domain: —")
-        self.lbl_charge_clipped.setStyleSheet(info_font)
-        self.lbl_charge_clipped.setToolTip("Whether the charge geometry extends outside the domain.")
-        il.addWidget(self.lbl_charge_clipped)
-        self.lbl_est_charge_cells = QLabel("Est. charge cells: —")
-        self.lbl_est_charge_cells.setStyleSheet(info_font)
-        self.lbl_est_charge_cells.setToolTip("Pre-flight estimate of cells in charge region (geometry + refinement).")
-        il.addWidget(self.lbl_est_charge_cells)
-        self.lbl_smallest_cell = QLabel("Smallest cell (est.): —")
-        self.lbl_smallest_cell.setStyleSheet(info_font)
-        self.lbl_smallest_cell.setToolTip("Estimated smallest cell size near charge (for ignition radius lower bound).")
-        il.addWidget(self.lbl_smallest_cell)
-        self.lbl_cells_in_ignition = QLabel("Cells in ignition region: —")
-        self.lbl_cells_in_ignition.setStyleSheet(info_font)
-        self.lbl_cells_in_ignition.setToolTip("Cells with alpha.c4>thr in ignition radius (non-remap).")
-        il.addWidget(self.lbl_cells_in_ignition)
-        self.lbl_expected_emesh = QLabel("Expected .eMesh: —")
-        self.lbl_expected_emesh.setStyleSheet(info_font)
-        self.lbl_expected_emesh.setToolTip("Canonical paths constant/extendedFeatureEdgeMesh/<base>.eMesh; missing triggers preflight block.")
-        il.addWidget(self.lbl_expected_emesh)
+        plan_l = QVBoxLayout(self.grp_mesh_plan)
+        plan_l.setContentsMargins(2, 0, 2, 2)
+        plan_l.setSpacing(0)
+
+        def _plan_lbl(tip: str = "", parent: QWidget = None) -> QLabel:
+            lbl = QLabel("", parent)
+            lbl.setStyleSheet(info_font + " background: transparent; border: none;")
+            lbl.setWordWrap(True)
+            lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+            if tip:
+                lbl.setToolTip(tip)
+            return lbl
+
+        self.lbl_mesh_plan_title = QLabel("Mesh Plan — Before Initialize", self.grp_mesh_plan)
+        self.lbl_mesh_plan_title.setStyleSheet(
+            "font-weight: bold; font-size: 9pt; color: #333; background: transparent; border: none;"
+        )
+        self.lbl_mesh_plan_title.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        plan_l.addWidget(self.lbl_mesh_plan_title)
+        # Clear ~10–12 px gap under the title (layout spacing, not newlines).
+        plan_l.addSpacing(11)
+
+        plan_body = QVBoxLayout()
+        plan_body.setContentsMargins(0, 0, 0, 0)
+        plan_body.setSpacing(4)
+
+        # Compact grouped summaries (not a tall stack of bordered rows)
+        self.lbl_plan_block_mesh = _plan_lbl(parent=self.grp_mesh_plan)
+        self.lbl_plan_block_seed = _plan_lbl(parent=self.grp_mesh_plan)
+        self.lbl_plan_block_status = _plan_lbl(parent=self.grp_mesh_plan)
+        plan_body.addWidget(self.lbl_plan_block_mesh)
+        plan_body.addWidget(self.lbl_plan_block_seed)
+        plan_body.addWidget(self.lbl_plan_block_status)
+        # Text holders for tests / tooltips — owned by the plan group, never shown alone
+        self.lbl_plan_base_grid = _plan_lbl(
+            "Base blockMesh grid from domain extents and Cell Size.", parent=self.grp_mesh_plan
+        )
+        self.lbl_plan_mesh_mode = _plan_lbl(
+            "Fixed mesh or runtime AMR (Wave AMR level / finest wave cell).", parent=self.grp_mesh_plan
+        )
+        self.lbl_plan_init_command = _plan_lbl(
+            "Initialization command selected by the current policy.", parent=self.grp_mesh_plan
+        )
+        self.lbl_plan_charge_seed = _plan_lbl(
+            "Requested/effective charge seed level, estimated smallest charge cell, and estimated charge-cell count.",
+            parent=self.grp_mesh_plan,
+        )
+        self.lbl_plan_charge_capture = _plan_lbl(
+            "Charge capture status for setFieldsDict backup region (not the physical charge size).",
+            parent=self.grp_mesh_plan,
+        )
+        self.lbl_plan_startup_outer = _plan_lbl(
+            "Whether the current configuration emits the startup outer refinement region (chargeRefineOuter).",
+            parent=self.grp_mesh_plan,
+        )
+        self.lbl_plan_initiation = _plan_lbl(
+            "Ignition mode, point, and initiation radius.", parent=self.grp_mesh_plan
+        )
+        for w in (
+            self.lbl_plan_base_grid,
+            self.lbl_plan_mesh_mode,
+            self.lbl_plan_init_command,
+            self.lbl_plan_charge_seed,
+            self.lbl_plan_charge_capture,
+            self.lbl_plan_startup_outer,
+            self.lbl_plan_initiation,
+        ):
+            w.hide()
+
         self.lbl_charge_resolution_warning = QLabel("")
-        self.lbl_charge_resolution_warning.setStyleSheet("font-size: 9pt; color: #c00; font-weight: bold;")
+        self.lbl_charge_resolution_warning.setStyleSheet(
+            "font-size: 9pt; color: #c00; font-weight: bold; padding: 2px 0; border: none;"
+        )
         self.lbl_charge_resolution_warning.setWordWrap(True)
-        il.addWidget(self.lbl_charge_resolution_warning)
+        self.lbl_charge_resolution_warning.setMinimumHeight(36)
+        self.lbl_charge_resolution_warning.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        plan_body.addWidget(self.lbl_charge_resolution_warning)
+        plan_l.addLayout(plan_body)
+        il.addWidget(self.grp_mesh_plan)
+
+        self.grp_init_results = QGroupBox("Initialization Results")
+        self.grp_init_results.setStyleSheet(
+            "QGroupBox { font-weight: bold; font-size: 9pt; margin-top: 6px; border: none; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 2px; padding: 0 2px; }"
+        )
+        res_l = QVBoxLayout(self.grp_init_results)
+        res_l.setContentsMargins(2, 10, 2, 2)
+        res_l.setSpacing(2)
+        self.lbl_result_block = _plan_lbl(parent=self.grp_init_results)
+        res_l.addWidget(self.lbl_result_block)
+        self.lbl_result_total_cells = _plan_lbl(
+            "Actual total cell count after initialization.", parent=self.grp_init_results
+        )
+        self.lbl_result_init_command = _plan_lbl(
+            "Initialization command actually executed.", parent=self.grp_init_results
+        )
+        self.lbl_result_charge_cells = _plan_lbl(
+            "Number of cells with alpha.c4 above threshold in 0/ after init.",
+            parent=self.grp_init_results,
+        )
+        self.lbl_result_ignition_cells = _plan_lbl(
+            "Cells with alpha.c4>thr in the ignition region (when available).",
+            parent=self.grp_init_results,
+        )
+        for w in (
+            self.lbl_result_total_cells,
+            self.lbl_result_init_command,
+            self.lbl_result_charge_cells,
+            self.lbl_result_ignition_cells,
+        ):
+            w.hide()
+        self.grp_init_results.hide()
+        il.addWidget(self.grp_init_results)
+
+        # Compatibility aliases / hidden holders (not shown as permanent summary rows)
+        self.lbl_cells = self.lbl_plan_base_grid
+        self.lbl_init_mode = self.lbl_result_init_command
+        self.lbl_charge_cells = self.lbl_result_charge_cells
+        self.lbl_cells_in_ignition = self.lbl_result_ignition_cells
+        self.lbl_charge_capture_info = self.lbl_plan_charge_capture
+        self.lbl_est_charge_cells = self.lbl_plan_charge_seed
+        self.lbl_smallest_cell = QLabel("", self)
+        self.lbl_smallest_cell.hide()
+        self.lbl_initiation_radius = QLabel("", self)
+        self.lbl_initiation_radius.hide()
+        self.lbl_charge_refine_info = QLabel("", self)
+        self.lbl_charge_refine_info.hide()
+        self.lbl_obstacle_refine_info = QLabel("", self)
+        self.lbl_obstacle_refine_info.hide()
+        self.lbl_charge_fraction = QLabel("", self)
+        self.lbl_charge_fraction.hide()
+        self.lbl_cells_inside_charge = QLabel("", self)
+        self.lbl_cells_inside_charge.hide()
+        self.lbl_charge_clipped = QLabel("", self)
+        self.lbl_charge_clipped.hide()
+        self.lbl_expected_emesh = QLabel("", self)
+        self.lbl_expected_emesh.hide()
+        self._init_results_available = False
+
         setup_layout.addWidget(info_frm)
-        
+
         scroll = QScrollArea()
         scroll.setWidget(setup_widget)
         scroll.setWidgetResizable(True)
         scroll.setMinimumWidth(320)
+        # Keep normal horizontal/vertical scrolling (do not force AlwaysOff).
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._left_setup_scroll = scroll
         splitter.addWidget(scroll)
 
         # ===== RIGHT SIDE: Viewport + Execution Controls (stacked vertically) =====
@@ -242,17 +344,28 @@ class TabGeneral3D(QWidget):
         f.addWidget(QLabel("Min Z / Max Z"), 2, 0)
         f.addWidget(self._pair(self.sz1, self.sz2), 2, 1)
 
-        # שורה 3 (Cell Size)
+        # Cell Size
         f.addWidget(QLabel("Cell Size"), 3, 0)
-        cell_row = QWidget(); cell_h = QHBoxLayout(cell_row); cell_h.setContentsMargins(0,0,0,0)
-        cell_h.addWidget(self.scell); cell_h.addStretch() # מצמיד את השדה לשמאל
+        cell_row = QWidget(); cell_h = QHBoxLayout(cell_row); cell_h.setContentsMargins(0, 0, 0, 0)
+        cell_h.addWidget(self.scell)
+        cell_h.addStretch()
         f.addWidget(cell_row, 3, 1)
-        # Mesh mode: Fixed Mesh (default) / Dyn Mesh; Dyn Mesh levels to the right
+        # Mesh Properties near grid/mesh controls (own row so the label is not clipped)
+        self.btn_mesh_properties = QPushButton("Mesh Properties…")
+        self.btn_mesh_properties.setToolTip("Advanced mesh parameters (AMR, charge seed, and obstacle refine).")
+        self.btn_mesh_properties.clicked.connect(self._open_mesh_properties_dialog)
+        mesh_props_row = QWidget()
+        mesh_props_h = QHBoxLayout(mesh_props_row)
+        mesh_props_h.setContentsMargins(0, 0, 0, 0)
+        mesh_props_h.addWidget(self.btn_mesh_properties)
+        mesh_props_h.addStretch()
+        f.addWidget(mesh_props_row, 4, 0, 1, 2)
+        # Mesh mode: Fixed Mesh (default) / Dyn Mesh; Wave AMR level below for narrow panels
         self.rad_fixed_mesh = QRadioButton("Fixed Mesh")
         self.rad_dyn_mesh = QRadioButton("Dyn Mesh (AMR)")
         self.rad_fixed_mesh.setChecked(True)
         self.rad_fixed_mesh.setToolTip("Static mesh (no AMR).")
-        self.rad_dyn_mesh.setToolTip("Dynamic mesh (AMR). Levels control min/max refinement.")
+        self.rad_dyn_mesh.setToolTip("Dynamic mesh (AMR). Wave AMR level controls maxRefinement.")
         mesh_mode_bg = QButtonGroup(self)
         mesh_mode_bg.addButton(self.rad_fixed_mesh)
         mesh_mode_bg.addButton(self.rad_dyn_mesh)
@@ -265,27 +378,33 @@ class TabGeneral3D(QWidget):
         self.spin_refine_max.setRange(0, 10)
         self.spin_refine_max.setValue(1)
         self.spin_refine_max.setMaximumWidth(60)
-        self.spin_refine_max.setToolTip("Runtime AMR: maxRefinement in constant/dynamicMeshDict.")
+        self.spin_refine_max.setToolTip("Runtime AMR: maxRefinement in constant/dynamicMeshDict (Wave AMR level).")
+        self.lbl_wave_amr_cell = QLabel("")
+        self.lbl_wave_amr_cell.setStyleSheet("font-size: 9pt; color: #555;")
+        self.lbl_wave_amr_cell.setToolTip("Finest runtime wave cell size = Cell Size / 2^(Wave AMR level).")
         mesh_mode_col = QWidget()
         mesh_mode_v = QVBoxLayout(mesh_mode_col)
         mesh_mode_v.setContentsMargins(0, 0, 0, 0)
         mesh_mode_v.setSpacing(2)
         mesh_mode_v.addWidget(QLabel("Mesh mode"))
         mesh_mode_v.addWidget(self.rad_fixed_mesh)
-        dyn_row = QWidget()
-        dyn_h = QHBoxLayout(dyn_row)
-        dyn_h.setContentsMargins(0, 0, 0, 0)
-        dyn_h.addWidget(self.rad_dyn_mesh)
-        dyn_h.addWidget(QLabel("Max refinement:"))
-        dyn_h.addWidget(self.spin_refine_max)
-        dyn_h.addStretch()
-        mesh_mode_v.addWidget(dyn_row)
+        mesh_mode_v.addWidget(self.rad_dyn_mesh)
+        wave_row = QWidget()
+        wave_h = QHBoxLayout(wave_row)
+        wave_h.setContentsMargins(18, 0, 0, 0)
+        wave_h.addWidget(QLabel("Wave AMR level"))
+        wave_h.addWidget(self.spin_refine_max)
+        wave_h.addWidget(self.lbl_wave_amr_cell)
+        wave_h.addStretch()
+        mesh_mode_v.addWidget(wave_row)
         self.rad_dyn_mesh.toggled.connect(self._on_mesh_mode_changed)
         self.rad_dyn_mesh.toggled.connect(lambda: self._set_provenance_user("enable_dyn_refine"))
         self.spin_refine_min.valueChanged.connect(self._validate_refine_levels)
         self.spin_refine_max.valueChanged.connect(self._validate_refine_levels)
         self.spin_refine_max.valueChanged.connect(self._on_dyn_refine_max_changed)
-        f.addWidget(mesh_mode_col, 4, 0, 1, 2)
+        self.spin_refine_max.valueChanged.connect(self._update_mesh_plan_display)
+        self.scell.valueChanged.connect(self._update_wave_amr_cell_label)
+        f.addWidget(mesh_mode_col, 5, 0, 1, 2)
 
         # טריק הקסם: עמודה 2 מקבלת את כל המתיחה (Stretch)
         # זה דוחף את עמודות 0 ו-1 שמאלה, צמודות אחת לשנייה
@@ -438,54 +557,80 @@ class TabGeneral3D(QWidget):
         f2a.addRow("", self.btn_charge_advanced)
         charge_main.addWidget(wrap_geom)
 
-        wrap_refine = QWidget()
-        f2b = QFormLayout(wrap_refine)
-        f2b.setHorizontalSpacing(8)
-        f2b.setVerticalSpacing(self.ROW_SPACING)
-        f2b.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
-        self.lbl_charge_refinement = QLabel("Charge pre-refinement")
+        # Charge seed / outer-band controls live in Mesh Properties (Advanced).
+        # Keep permanent value widgets for load/save and get_case_inputs, but host them
+        # in a hidden owned container so they never float in the main tab layout.
+        self.lbl_charge_refinement = QLabel("Charge seed / outer band")
         self.lbl_charge_refinement.setStyleSheet("font-weight: bold;")
-        f2b.addRow(self.lbl_charge_refinement)
-        f2b.addRow(self._lbl("Inside"), self.spin_charge_refine)
-        outside_row = QWidget()
-        outside_h = QHBoxLayout(outside_row)
-        outside_h.setContentsMargins(0, 0, 0, 0)
-        outside_h.addWidget(QLabel("Min"))
-        outside_h.addWidget(self.spin_charge_outer_min)
-        outside_h.addWidget(QLabel("Max"))
-        outside_h.addWidget(self.spin_charge_outer_max)
-        outside_h.addStretch()
-        f2b.addRow(self._lbl("Outside"), outside_row)
         self.spin_transition_cells = QSpinBox()
         self.spin_transition_cells.setRange(1, 10)
         self.spin_transition_cells.setValue(2)
-        self.spin_transition_cells.setToolTip("Cells between refinement levels for charge outside region (nCellsBetweenLevels-style graded transition in snappyHexMesh).")
+        self.spin_transition_cells.setMaximumWidth(60)
+        self.spin_transition_cells.setToolTip(
+            "Cells between refinement levels for charge outside region "
+            "(nCellsBetweenLevels-style graded transition in snappyHexMesh)."
+        )
         self.spin_transition_cells.valueChanged.connect(lambda: self._set_provenance_user("transition_cells"))
-        f2b.addRow(self._lbl("Transition Cells"), self.spin_transition_cells)
-        lbl_center = QLabel("Center (X, Y, Z)")
-        f2b.addRow(lbl_center)
+        self._charge_seed_host = QWidget(self)
+        self._charge_seed_host.setObjectName("chargeSeedAdvancedHost")
+        seed_host_l = QFormLayout(self._charge_seed_host)
+        seed_host_l.setContentsMargins(0, 0, 0, 0)
+        seed_host_l.addRow(self.lbl_charge_refinement)
+        seed_host_l.addRow("Inside", self.spin_charge_refine)
+        outside_host_row = QWidget()
+        outside_host_h = QHBoxLayout(outside_host_row)
+        outside_host_h.setContentsMargins(0, 0, 0, 0)
+        outside_host_h.addWidget(self.spin_charge_outer_min)
+        outside_host_h.addWidget(self.spin_charge_outer_max)
+        seed_host_l.addRow("Outside", outside_host_row)
+        seed_host_l.addRow("Transition Cells", self.spin_transition_cells)
+        # Keep value widgets owned/laid-out, but never painted in the main tab.
+        self._charge_seed_host.setAttribute(Qt.WA_DontShowOnScreen, True)
+        self._charge_seed_host.setFixedSize(0, 0)
+        self._charge_seed_host.hide()
+
+        wrap_geom_center = QWidget()
+        f2b = QFormLayout(wrap_geom_center)
+        f2b.setHorizontalSpacing(8)
+        f2b.setVerticalSpacing(self.ROW_SPACING)
+        f2b.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+        lbl_charge_geom = QLabel("Charge Geometry")
+        lbl_charge_geom.setStyleSheet("font-weight: bold;")
+        f2b.addRow(lbl_charge_geom)
+        f2b.addRow(QLabel("Center (X, Y, Z)"))
         center_wrap = QWidget()
         center_h = QHBoxLayout(center_wrap)
         center_h.setContentsMargins(0, 0, 0, 0)
         center_h.addWidget(self._tri(self.cx, self.cy, self.cz))
         center_h.addStretch()
         f2b.addRow(center_wrap)
-        # Ignition mode: Center of Charge (use center) or Manual (user XYZ)
+
+        wrap_initiation = QWidget()
+        f2c = QFormLayout(wrap_initiation)
+        f2c.setHorizontalSpacing(8)
+        f2c.setVerticalSpacing(self.ROW_SPACING)
+        f2c.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+        lbl_initiation = QLabel("Initiation")
+        lbl_initiation.setStyleSheet("font-weight: bold;")
+        f2c.addRow(lbl_initiation)
         self.combo_ignition_mode = QComboBox()
         self.combo_ignition_mode.addItems(["Center of Charge", "Manual"])
         self.combo_ignition_mode.setToolTip("Center of Charge = use charge center; Manual = use initiation point below.")
         self.combo_ignition_mode.currentTextChanged.connect(self._on_ignition_mode_changed)
-        f2b.addRow(self._lbl("Ignition mode"), self.combo_ignition_mode)
+        self.combo_ignition_mode.currentTextChanged.connect(self._update_mesh_plan_display)
+        f2c.addRow(self._lbl("Ignition mode"), self.combo_ignition_mode)
         self.lbl_init_pt = QLabel("Initiation point (X, Y, Z)")
         self.lbl_init_pt.setToolTip("Detonation initiation point (used when Ignition mode = Manual).")
-        f2b.addRow(self.lbl_init_pt)
+        f2c.addRow(self.lbl_init_pt)
         self.init_wrap = QWidget()
         init_h = QHBoxLayout(self.init_wrap)
         init_h.setContentsMargins(0, 0, 0, 0)
         init_h.addWidget(self._tri(self.init_ix, self.init_iy, self.init_iz))
         init_h.addStretch()
-        f2b.addRow(self.init_wrap)
+        f2c.addRow(self.init_wrap)
         self._on_ignition_mode_changed(self.combo_ignition_mode.currentText())
+        for _w in (self.init_ix, self.init_iy, self.init_iz, self.cx, self.cy, self.cz):
+            _w.valueChanged.connect(self._update_mesh_plan_display)
         # Density follows selected material; keep field read-only in UI.
         self.c_rho.setEnabled(False)
         self.lbl_density.setEnabled(False)
@@ -556,7 +701,8 @@ class TabGeneral3D(QWidget):
         self._decomposition_method = "scotch"
         self._decomposition_simple_n = (2, 2, 1)
         self._decomposition_simple_delta = 0.001
-        charge_main.addWidget(wrap_refine)
+        charge_main.addWidget(wrap_geom_center)
+        charge_main.addWidget(wrap_initiation)
         l.addWidget(c)
         
         a = QGroupBox("Atmosphere"); f3 = QFormLayout(a)
@@ -713,13 +859,204 @@ class TabGeneral3D(QWidget):
             return 0.0
 
     def _update_estimated_charge_cells_display(self) -> None:
-        """Update Info panel with estimated charge cells and red warning if < 8."""
-        est = self._estimate_charge_cells()
-        self.lbl_est_charge_cells.setText(f"Est. charge cells: {int(est):,}" if est > 0 else "Est. charge cells: —")
-        if est > 0 and est < 8:
-            self.lbl_charge_resolution_warning.setText("Warning: Charge resolution is too low. Blast may fail.")
+        """Compatibility wrapper: Mesh Plan owns estimated charge-cell summary."""
+        self._update_mesh_plan_display()
+
+    def _update_wave_amr_cell_label(self) -> None:
+        """Show finest runtime wave cell size next to Wave AMR level."""
+        if not hasattr(self, "lbl_wave_amr_cell"):
+            return
+        dyn = self.rad_dyn_mesh.isChecked() and self.rad_dyn_mesh.isEnabled()
+        if not dyn:
+            self.lbl_wave_amr_cell.setText("")
+            self.lbl_wave_amr_cell.setVisible(False)
+            return
+        h0 = max(1e-12, float(self.scell.value()))
+        level = max(0, int(self.spin_refine_max.value()))
+        h_wave = h0 / (2.0 ** level)
+        self.lbl_wave_amr_cell.setVisible(True)
+        self.lbl_wave_amr_cell.setText(f"{h_wave:g} m")
+
+    def _planned_init_command_label(self, inputs: CaseInputs3D) -> str:
+        plan = build_initialization_plan(inputs)
+        cmd = plan.command
+        if cmd.startswith("remap"):
+            return "remap"
+        return cmd
+
+    def _planned_initiation_radius_m(self, inputs: CaseInputs3D) -> float:
+        """Mirror generator initiation-radius request (display only; no policy change)."""
+        user_ign = getattr(inputs, "ignition_radius", None)
+        if user_ign is not None:
+            try:
+                return float(user_ign)
+            except (TypeError, ValueError):
+                pass
+        r_charge = float(getattr(inputs, "cylinder_radius", 0.05) or 0.05)
+        return min(0.05, max(0.01, 0.2 * r_charge))
+
+    def _mesh_plan_row(self, label: str, value: str) -> str:
+        """One Mesh Plan datum per row (label / value)."""
+        return f"{label}:    {value}"
+
+    def _update_mesh_plan_display(self) -> None:
+        """Live Mesh Plan summaries from current GUI inputs (pre-initialize)."""
+        if not hasattr(self, "lbl_plan_base_grid"):
+            return
+
+        total = None
+        nx = ny = nz = None
+        try:
+            dx = max(1e-6, self.scell.value())
+            nx = max(1, int((self.sx2.value() - self.sx1.value()) / dx))
+            ny = max(1, int((self.sy2.value() - self.sy1.value()) / dx))
+            nz = max(1, int((self.sz2.value() - self.sz1.value()) / dx))
+            total = nx * ny * nz
+            self.lbl_plan_base_grid.setText(self._mesh_plan_row("Base grid", f"{nx} × {ny} × {nz}"))
+        except (TypeError, ValueError, OverflowError):
+            self.lbl_plan_base_grid.setText(self._mesh_plan_row("Base grid", "(invalid)"))
+
+        self._update_wave_amr_cell_label()
+        dyn = self.rad_dyn_mesh.isChecked() and self.rad_dyn_mesh.isEnabled()
+        wave_lvl = max(0, int(self.spin_refine_max.value()))
+        self.lbl_plan_mesh_mode.setText(
+            self._mesh_plan_row("Mesh mode", "AMR" if dyn else "Fixed")
+        )
+
+        try:
+            inputs = self.get_case_inputs()
+        except Exception:
+            # Still show grid rows even if case-input assembly fails.
+            grid_lines = []
+            if total is not None:
+                grid_lines.append(self._mesh_plan_row("Total cells before refinement", f"{total:,}"))
+            if nx is not None:
+                grid_lines.append(self._mesh_plan_row("Base grid", f"{nx} × {ny} × {nz}"))
+            grid_lines.append(self._mesh_plan_row("Mesh mode", "AMR" if dyn else "Fixed"))
+            grid_lines.append(self._mesh_plan_row("Wave AMR level", str(wave_lvl)))
+            self.lbl_plan_block_mesh.setText("\n".join(grid_lines))
+            self.lbl_plan_block_seed.hide()
+            self.lbl_plan_block_status.hide()
+            return
+
+        init_cmd = self._planned_init_command_label(inputs)
+        self.lbl_plan_init_command.setText(self._mesh_plan_row("Planned initialization", init_cmd))
+
+        init_plan = build_initialization_plan(inputs)
+        seed_req = int(init_plan.seed_requested)
+        seed_label = "None" if seed_req <= 0 else "On"
+        self.lbl_plan_charge_seed.setText(
+            self._mesh_plan_row("Charge seed", seed_label)
+            + "\n"
+            + self._mesh_plan_row("Charge seed level", str(seed_req))
+        )
+
+        # Charge capture status (short) + details in tooltip
+        try:
+            r_phys = float(getattr(inputs, "cylinder_radius", 0.05) or 0.05)
+            _r_cap, report = resolve_charge_capture_radius_m(inputs, r_phys)
+            mode = str(report.mode or "auto").lower()
+            warnings = list(report.warnings or [])
+            if mode == "manual":
+                cap_val = "Manual"
+            elif warnings:
+                cap_val = "Warning"
+            else:
+                cap_val = "Safe (Auto)"
+            self.lbl_plan_charge_capture.setText(self._mesh_plan_row("Charge capture", cap_val))
+            tip_parts = [
+                report.formula_description or "",
+                f"R_cap={report.charge_capture_radius_used_m:.4g} m",
+                f"R_phys={report.physical_charge_radius_m:.4g} m",
+                f"ratio={report.ratio_capture_to_physical:.3g}",
+            ]
+            if report.charge_capture_factor is not None:
+                tip_parts.append(f"factor={float(report.charge_capture_factor):.3g}")
+            tip_parts.extend(warnings)
+            self.lbl_plan_charge_capture.setToolTip("\n".join(p for p in tip_parts if p))
+        except Exception:
+            self.lbl_plan_charge_capture.setText(self._mesh_plan_row("Charge capture", "Safe (Auto)"))
+
+        outer_level = None
+        if outer_band_will_be_applied(inputs):
+            level_str = outer_band_level_string(inputs) or ""
+            parts = level_str.split()
+            try:
+                outer_level = max(int(p) for p in parts) if parts else None
+            except ValueError:
+                outer_level = None
+            self.lbl_plan_startup_outer.setText(self._mesh_plan_row("Startup outer region", "On"))
         else:
-            self.lbl_charge_resolution_warning.setText("")
+            self.lbl_plan_startup_outer.setText(self._mesh_plan_row("Startup outer region", "Off"))
+
+        ign_mode = self.combo_ignition_mode.currentText()
+        r_ign = self._planned_initiation_radius_m(inputs)
+        if ign_mode == "Manual":
+            loc = (
+                f"Manual point ({self.init_ix.value():g}, "
+                f"{self.init_iy.value():g}, {self.init_iz.value():g})"
+            )
+        else:
+            loc = "Charge center"
+        self.lbl_plan_initiation.setText(
+            self._mesh_plan_row("Initiation location", loc)
+            + "\n"
+            + self._mesh_plan_row("Initiation radius", f"{r_ign:g} m")
+        )
+
+        est = self._estimate_charge_cells()
+        warn_parts = []
+        if est > 0 and est < 8:
+            warn_parts.append("Warning: Charge resolution is too low. Blast may fail.")
+        self.lbl_charge_resolution_warning.setText("\n".join(warn_parts))
+        if not warn_parts:
+            self.lbl_charge_resolution_warning.setToolTip("")
+
+        # Visible Mesh Plan: one datum per row, fixed order (no h0 / no arrows).
+        plan_lines = []
+        if total is not None:
+            plan_lines.append(self._mesh_plan_row("Total cells before refinement", f"{total:,}"))
+        if nx is not None:
+            plan_lines.append(self._mesh_plan_row("Base grid", f"{nx} × {ny} × {nz}"))
+        plan_lines.append(self._mesh_plan_row("Mesh mode", "AMR" if dyn else "Fixed"))
+        plan_lines.append(self._mesh_plan_row("Wave AMR level", str(wave_lvl)))
+        plan_lines.append(self._mesh_plan_row("Planned initialization", init_cmd))
+        plan_lines.append(self._mesh_plan_row("Charge seed", seed_label))
+        plan_lines.append(self._mesh_plan_row("Charge seed level", str(seed_req)))
+        plan_lines.append(self.lbl_plan_charge_capture.text())
+        plan_lines.append(self.lbl_plan_startup_outer.text())
+        if outer_level is not None:
+            plan_lines.append(self._mesh_plan_row("Startup outer level", str(outer_level)))
+        plan_lines.append(self._mesh_plan_row("Initiation location", loc))
+        plan_lines.append(self._mesh_plan_row("Initiation radius", f"{r_ign:g} m"))
+
+        self.lbl_plan_block_mesh.setText("\n".join(plan_lines))
+        self.lbl_plan_block_mesh.setToolTip(self.lbl_plan_charge_capture.toolTip())
+        self.lbl_plan_block_seed.hide()
+        self.lbl_plan_block_status.hide()
+
+    def _refresh_init_results_block(self) -> None:
+        lines = []
+        for lbl in (
+            self.lbl_result_total_cells,
+            self.lbl_result_init_command,
+            self.lbl_result_charge_cells,
+            self.lbl_result_ignition_cells,
+        ):
+            t = (lbl.text() or "").strip()
+            if t:
+                lines.append(t)
+        self.lbl_result_block.setText("\n".join(lines))
+        self.lbl_result_block.setVisible(bool(lines))
+
+    def _set_init_results_visible(self, visible: bool) -> None:
+        self._init_results_available = bool(visible)
+        self.grp_init_results.setVisible(bool(visible))
+        if visible:
+            self._refresh_init_results_block()
+        else:
+            self.lbl_result_block.setText("")
+            self.lbl_result_block.setVisible(False)
 
     def _pair(self, a, b):
         w = QWidget(); h = QHBoxLayout(w); h.setContentsMargins(0,0,0,0); h.setSpacing(10)
@@ -842,10 +1179,6 @@ class TabGeneral3D(QWidget):
         obst_h.addWidget(self.spin_obstacle_refine_max)
         obst_h.addStretch()
         f1.addRow("Obstacle refine", obstacle_refine_row)
-        self.btn_mesh_properties = QPushButton("Mesh Properties…")
-        self.btn_mesh_properties.setToolTip("Advanced mesh parameters (AMR and obstacle refine).")
-        self.btn_mesh_properties.clicked.connect(self._open_mesh_properties_dialog)
-        f1.addRow("", self.btn_mesh_properties)
         f1.addRow(self._lbl("Write control"), self.combo_write_control)
         wrap_steps = QWidget()
         h_steps = QHBoxLayout(wrap_steps)
@@ -877,24 +1210,21 @@ class TabGeneral3D(QWidget):
         self.btn_exact_1.setToolTip("Run exactly one time step and stop.")
         self.btn_exact_1.clicked.connect(self.sig_request_run_exact_1.emit)
         self.btn_exact_end = QPushButton("exact END")
-        self.btn_exact_end.setToolTip("Continue run until stop or end time.")
+        self.btn_exact_end.setToolTip("Continue run until stop or end time (full run / resume-to-end).")
         self.btn_exact_end.clicked.connect(self.sig_request_run_exact_end.emit)
-        self.btn_save_remap = QPushButton("Save 3D remap…")
-        self.btn_save_remap.setToolTip("Save current 3D state for remap. Still in progress.")
-        self.btn_save_remap.clicked.connect(lambda: QMessageBox.information(self, "Save 3D remap", "Save 3D remap: Still in progress."))
-        self.btn_run = QPushButton("▶ Run / Resume"); self.btn_run.clicked.connect(self.sig_request_run.emit)
         self.btn_stop = QPushButton("⏸ Interrupt"); self.btn_stop.clicked.connect(self.sig_request_stop.emit)
+        self.btn_exec_advanced = QPushButton("Execution / Diagnostics Advanced…")
+        self.btn_exec_advanced.setToolTip("Run-mode tradeoffs: post-processing functions and optional verification skips.")
+        self.btn_exec_advanced.clicked.connect(self._open_execution_advanced_dialog)
         self.btn_init.setStyleSheet("background-color: #3498db; color: white; padding: 5px;")
         self.btn_exact_1.setStyleSheet("background-color: #9b59b6; color: white; padding: 4px;")
         self.btn_exact_end.setStyleSheet("background-color: #1abc9c; color: white; padding: 4px;")
-        self.btn_run.setStyleSheet("background-color: #2ecc71; color: white; font-weight: bold; padding: 5px;")
         self.btn_stop.setStyleSheet("background-color: #e67e22; color: white; padding: 5px;")
         v2.addWidget(self.btn_init)
         v2.addWidget(self.btn_exact_1)
         v2.addWidget(self.btn_exact_end)
-        v2.addWidget(self.btn_save_remap)
-        v2.addWidget(self.btn_run)
         v2.addWidget(self.btn_stop)
+        v2.addWidget(self.btn_exec_advanced)
         v2.addStretch()
         l.addWidget(g2)
         
@@ -942,8 +1272,11 @@ class TabGeneral3D(QWidget):
             self.viewer.refresh_view()
 
     def _on_cell_count_updated(self, count: int):
-        """Update Cells label when viewer loads a new time step (e.g. AMR)."""
-        self.lbl_cells.setText(f"Cells: {count:,}")
+        """Update actual cell count in Initialization Results when a mesh is loaded."""
+        if count is None or int(count) <= 0:
+            return
+        self.lbl_result_total_cells.setText(f"Total cells: {int(count):,}")
+        self._set_init_results_visible(True)
 
     def _on_view_option_changed(self, _checked=None):
         """Sync all Viewport Options from UI to viewer, then refresh (preview or loaded case)."""
@@ -1094,17 +1427,18 @@ class TabGeneral3D(QWidget):
         self.wrap_write_time.setVisible(not is_time_step)
 
     def _on_mesh_mode_changed(self):
-        """Dyn Mesh: enable Dyn Mesh levels and full Charge pre-refinement group. Fixed Mesh: disable all of them."""
+        """Dyn Mesh: enable Wave AMR level and charge-seed Advanced controls. Fixed Mesh: disable them."""
         dyn = self.rad_dyn_mesh.isChecked() and self.rad_dyn_mesh.isEnabled()
         self.spin_refine_min.setEnabled(dyn)
         self.spin_refine_max.setEnabled(dyn)
-        # Charge pre-refinement group (single source of truth for startup charge-region refinement)
         self.lbl_charge_refinement.setEnabled(dyn)
         self.spin_charge_refine.setEnabled(dyn)
         self.spin_charge_outer_min.setEnabled(dyn)
         self.spin_charge_outer_max.setEnabled(dyn)
         self.spin_transition_cells.setEnabled(dyn)
+        self._update_wave_amr_cell_label()
         self._update_calculated_dt_label()
+        self._update_mesh_plan_display()
 
     def _build_view_tab(self, parent):
         l = QHBoxLayout(parent)
@@ -1183,10 +1517,25 @@ class TabGeneral3D(QWidget):
         self.sy2.valueChanged.connect(lambda: self._update_sections_from_table(-1, -1))
         self.sz1.valueChanged.connect(lambda: self._update_sections_from_table(-1, -1))
         self.sz2.valueChanged.connect(lambda: self._update_sections_from_table(-1, -1))
-        # Pre-flight estimated charge cells (and warning when < 8)
-        for w in [self.scell, self.spin_charge_refine, self.c_mass, self.c_rho, self.c_radius, self.c_length, self.c_width, self.c_height, self.c_aspect]:
-            w.valueChanged.connect(self._update_estimated_charge_cells_display)
-        self.c_shape.currentIndexChanged.connect(self._update_estimated_charge_cells_display)
+        # Live Mesh Plan (base grid, seed, capture, outer band, initiation)
+        for w in [
+            self.scell,
+            self.spin_charge_refine,
+            self.spin_charge_outer_min,
+            self.spin_charge_outer_max,
+            self.spin_transition_cells,
+            self.c_mass,
+            self.c_rho,
+            self.c_radius,
+            self.c_length,
+            self.c_width,
+            self.c_height,
+            self.c_aspect,
+        ]:
+            w.valueChanged.connect(self._update_mesh_plan_display)
+        self.c_shape.currentIndexChanged.connect(self._update_mesh_plan_display)
+        self.rad_init_standard.toggled.connect(self._update_mesh_plan_display)
+        self.rad_init_remap.toggled.connect(self._update_mesh_plan_display)
 
     def _update_edit_button_visibility(self):
         is_custom = self.c_mat.currentText() == "Custom"
@@ -1318,31 +1667,47 @@ class TabGeneral3D(QWidget):
         f_tr.addRow("", QLabel("Does not set charge capture radius. Transition shape follows charge geometry (sphere / cylinder / box)."))
         v.addWidget(grp_transition)
 
-        # Run mode (Allrun + controlDict) — tradeoffs between speed and verification.
-        # Default values are tuned to match building3D's hand-tuned Allrun (~2.5x faster
-        # than verbose mode for the same simulated time).
-        grp_run = QGroupBox("Run mode (speed vs verification)")
-        f_run = QFormLayout(grp_run)
-        chk_post_proc = QCheckBox()
-        chk_post_proc.setChecked(bool(getattr(self, "_enable_post_processing", False)))
-        chk_post_proc.setToolTip(
-            "Add controlDict 'functions { impulse; overpressure; fieldMinMax; }'.\n"
-            "Useful for downstream analysis (max overpressure, impulse fields), but\n"
-            "adds work at every writeTime. Default OFF for faster runs."
+        # Charge seed / outer band (relocated from main Charge Properties)
+        grp_charge_seed = QGroupBox("Charge seed / outer band (Advanced)")
+        f_seed_adv = QFormLayout(grp_charge_seed)
+        spin_seed_inside = QSpinBox()
+        spin_seed_inside.setRange(self.spin_charge_refine.minimum(), self.spin_charge_refine.maximum())
+        spin_seed_inside.setValue(self.spin_charge_refine.value())
+        spin_seed_inside.setToolTip(self.spin_charge_refine.toolTip())
+        spin_seed_inside.setEnabled(self.spin_charge_refine.isEnabled())
+        f_seed_adv.addRow("Inside / manual seed level", spin_seed_inside)
+        spin_out_min = QSpinBox()
+        spin_out_min.setRange(self.spin_charge_outer_min.minimum(), self.spin_charge_outer_min.maximum())
+        spin_out_min.setValue(self.spin_charge_outer_min.value())
+        spin_out_min.setToolTip(self.spin_charge_outer_min.toolTip())
+        spin_out_min.setEnabled(self.spin_charge_outer_min.isEnabled())
+        spin_out_max = QSpinBox()
+        spin_out_max.setRange(self.spin_charge_outer_max.minimum(), self.spin_charge_outer_max.maximum())
+        spin_out_max.setValue(self.spin_charge_outer_max.value())
+        spin_out_max.setToolTip(self.spin_charge_outer_max.toolTip())
+        spin_out_max.setEnabled(self.spin_charge_outer_max.isEnabled())
+        outside_row = QWidget()
+        outside_h = QHBoxLayout(outside_row)
+        outside_h.setContentsMargins(0, 0, 0, 0)
+        outside_h.addWidget(QLabel("Min"))
+        outside_h.addWidget(spin_out_min)
+        outside_h.addWidget(QLabel("Max"))
+        outside_h.addWidget(spin_out_max)
+        outside_h.addStretch()
+        f_seed_adv.addRow("Outside", outside_row)
+        spin_trans = QSpinBox()
+        spin_trans.setRange(self.spin_transition_cells.minimum(), self.spin_transition_cells.maximum())
+        spin_trans.setValue(self.spin_transition_cells.value())
+        spin_trans.setToolTip(self.spin_transition_cells.toolTip())
+        spin_trans.setEnabled(self.spin_transition_cells.isEnabled())
+        f_seed_adv.addRow("Transition Cells", spin_trans)
+        hint_seed = QLabel(
+            "These controls are unchanged in meaning; only their location moved out of the main flow. "
+            "Fixed Mesh disables seed/outer band (same as before)."
         )
-        f_run.addRow("Write impulse / overpressure / fieldMinMax", chk_post_proc)
-        f_run.addRow("", QLabel("OFF = building3D-style fast solver (no postProcess at writeTime).\nON = adds 'functions {...}' block; useful for analysis but slower."))
-        chk_fast = QCheckBox()
-        chk_fast.setChecked(bool(getattr(self, "_fast_run_mode", True)))
-        chk_fast.setToolTip(
-            "Fast Allrun: skip optional verification (stage_check / log.stageVerification\n"
-            "/ checkMesh / check_internal_patch). check_alpha_c4.sh still gates the\n"
-            "solver against 'no mass in domain'. Default ON.\n"
-            "Turn OFF only when debugging mesh / charge initialization."
-        )
-        f_run.addRow("Fast Allrun (skip optional verification)", chk_fast)
-        f_run.addRow("", QLabel("ON = ~5-8 s saved per run (no stage_check tee, no checkMesh).\nOFF = full stage logs in log.stageVerification (debugging mode)."))
-        v.addWidget(grp_run)
+        hint_seed.setWordWrap(True)
+        f_seed_adv.addRow(hint_seed)
+        v.addWidget(grp_charge_seed)
 
         # Group: Dyn Refine (AMR) – only core controls
         grp_amr = QGroupBox("Dyn Refine (AMR)")
@@ -1618,8 +1983,14 @@ class TabGeneral3D(QWidget):
                 self._charge_backup_radius_override = self._charge_capture_radius_manual
             else:
                 self._charge_backup_radius_override = None
-            self._enable_post_processing = chk_post_proc.isChecked()
-            self._fast_run_mode = chk_fast.isChecked()
+            self.spin_charge_refine.setValue(int(spin_seed_inside.value()))
+            a_out, b_out = int(spin_out_min.value()), int(spin_out_max.value())
+            if a_out > b_out:
+                a_out, b_out = b_out, a_out
+            self.spin_charge_outer_min.setValue(a_out)
+            self.spin_charge_outer_max.setValue(b_out)
+            self.spin_transition_cells.setValue(int(spin_trans.value()))
+            self._set_provenance_user("transition_cells")
             self._refine_interval = spin_ref_int.value()
             self._lower_refine_threshold = spin_lower.value()
             self._unrefine_threshold = spin_unref.value()
@@ -1681,6 +2052,54 @@ class TabGeneral3D(QWidget):
                 self._set_provenance_user(k)
             for k in ("mesh_included_angle", "mesh_n_smooth_patch", "mesh_snap_tolerance", "mesh_n_solve_iter", "mesh_n_relax_iter", "mesh_n_feature_snap_iter", "mesh_explicit_feature_snap", "mesh_implicit_feature_snap", "mesh_multi_region_feature_snap", "mesh_n_cells_between_levels", "mesh_resolve_feature_angle", "mesh_max_non_ortho", "mesh_max_boundary_skewness", "mesh_max_internal_skewness", "mesh_max_concave", "mesh_min_vol", "mesh_min_tet_quality", "mesh_min_twist", "mesh_min_determinant", "mesh_min_face_weight", "mesh_min_vol_ratio", "mesh_n_smooth_scale", "mesh_error_reduction", "mesh_relaxed_max_non_ortho"):
                 self._set_provenance_user(k)
+            self._update_mesh_plan_display()
+
+    def _open_execution_advanced_dialog(self):
+        """Execution / Diagnostics Advanced: run-mode vs verification tradeoffs."""
+        d = QDialog(self)
+        d.setWindowTitle("Execution / Diagnostics Advanced")
+        layout = QVBoxLayout(d)
+        grp_run = QGroupBox("Run mode (speed vs verification)")
+        f_run = QFormLayout(grp_run)
+        chk_post_proc = QCheckBox()
+        chk_post_proc.setChecked(bool(getattr(self, "_enable_post_processing", False)))
+        chk_post_proc.setToolTip(
+            "Add controlDict 'functions { impulse; overpressure; fieldMinMax; }'.\n"
+            "Useful for downstream analysis (max overpressure, impulse fields), but\n"
+            "adds work at every writeTime. Default OFF for faster runs."
+        )
+        f_run.addRow("Write impulse / overpressure / fieldMinMax", chk_post_proc)
+        f_run.addRow(
+            "",
+            QLabel(
+                "OFF = building3D-style fast solver (no postProcess at writeTime).\n"
+                "ON = adds 'functions {...}' block; useful for analysis but slower."
+            ),
+        )
+        chk_fast = QCheckBox()
+        chk_fast.setChecked(bool(getattr(self, "_fast_run_mode", True)))
+        chk_fast.setToolTip(
+            "Fast Allrun: skip optional verification (stage_check / log.stageVerification\n"
+            "/ checkMesh / check_internal_patch). check_alpha_c4.sh still gates the\n"
+            "solver against 'no mass in domain'. Default ON.\n"
+            "Turn OFF only when debugging mesh / charge initialization."
+        )
+        f_run.addRow("Fast Allrun (skip optional verification)", chk_fast)
+        f_run.addRow(
+            "",
+            QLabel(
+                "ON = ~5-8 s saved per run (no stage_check tee, no checkMesh).\n"
+                "OFF = full stage logs in log.stageVerification (debugging mode)."
+            ),
+        )
+        layout.addWidget(grp_run)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(d.accept)
+        bb.rejected.connect(d.reject)
+        layout.addWidget(bb)
+        if d.exec_() == QDialog.Accepted:
+            self._enable_post_processing = chk_post_proc.isChecked()
+            self._fast_run_mode = chk_fast.isChecked()
 
     def _open_charge_advanced_dialog(self):
         """Advanced…: activation model, thermo/energy model (products + air), single dialog."""
@@ -1885,18 +2304,8 @@ class TabGeneral3D(QWidget):
         self._update_preview()
 
     def _update_preview(self):
-        try:
-            dx = max(1e-6, self.scell.value())
-            nx = int((self.sx2.value() - self.sx1.value()) / dx)
-            ny = int((self.sy2.value() - self.sy1.value()) / dx)
-            nz = int((self.sz2.value() - self.sz1.value()) / dx)
-            total = nx * ny * nz
-            self.lbl_cells.setText(f"Grid: {nx}x{ny}x{nz}  ({total:,} cells)")
-        except (TypeError, ValueError, OverflowError):
-            self.lbl_cells.setText("Grid: Error")
-
         self._clear_charge_cells_display()
-        self._update_estimated_charge_cells_display()
+        self._update_mesh_plan_display()
 
         if not self.viewer: return
         bounds = (self.sx1.value(), self.sx2.value(), self.sy1.value(), self.sy2.value(), self.sz1.value(), self.sz2.value())
@@ -1904,198 +2313,140 @@ class TabGeneral3D(QWidget):
         self.viewer.update_preview(bounds, charge, self.obstacles)
 
     def _clear_charge_cells_display(self):
-        """Reset charge cells info when case is not loaded or before init."""
-        self.lbl_charge_cells.setText("Charge cells (alpha.c4>thr): —")
-        self.lbl_charge_fraction.setText("Charge fraction (%): —")
-        self.lbl_cells_inside_charge.setText("Cells inside charge (post-refinement): —")
-        self.lbl_charge_clipped.setText("Charge clipped by domain: —")
-        self.lbl_init_mode.setText("Init: —")
-        self.lbl_initiation_radius.setText("Initiation radius: —")
-        self.lbl_charge_refine_info.setText("Charge refine: —")
-        self.lbl_charge_capture_info.setText("Charge capture: —")
-        self.lbl_obstacle_refine_info.setText("Obstacle refine: —")
-        self.lbl_est_charge_cells.setText("Est. charge cells: —")
-        self.lbl_smallest_cell.setText("Smallest cell (est.): —")
-        self.lbl_cells_in_ignition.setText("Cells in ignition region: —")
-        self.lbl_expected_emesh.setText("Expected .eMesh: —")
-        self.lbl_charge_resolution_warning.setText("")
+        """Hide Initialization Results until real post-init metadata exists."""
+        self.lbl_result_total_cells.setText("")
+        self.lbl_result_init_command.setText("")
+        self.lbl_result_charge_cells.setText("")
+        self.lbl_result_ignition_cells.setText("")
+        self.lbl_result_block.setText("")
+        self.lbl_charge_fraction.setText("")
+        self.lbl_cells_inside_charge.setText("")
+        self.lbl_charge_clipped.setText("")
+        self.lbl_initiation_radius.setText("")
+        self.lbl_charge_refine_info.setText("")
+        self.lbl_obstacle_refine_info.setText("")
+        self.lbl_smallest_cell.setText("")
+        self.lbl_expected_emesh.setText("")
+        self._set_init_results_visible(False)
 
     def _update_info_from_case_init_mode(self, case_dir: str) -> None:
-        """Read case_init_mode.json and update Init/effective-value labels. 3D non-remap only."""
+        """Read case_init_mode.json and populate Initialization Results (+ warnings)."""
         import json
         path = os.path.join(case_dir, "case_init_mode.json")
         if not os.path.isfile(path):
-            self.lbl_init_mode.setText("Init: —")
-            self.lbl_initiation_radius.setText("Initiation radius: —")
-            self.lbl_charge_refine_info.setText("Charge refine: —")
-            self.lbl_charge_capture_info.setText("Charge capture: —")
-            self.lbl_obstacle_refine_info.setText("Obstacle refine: —")
-            self.lbl_smallest_cell.setText("Smallest cell (est.): —")
-            self.lbl_cells_in_ignition.setText("Cells in ignition region: —")
-            self.lbl_expected_emesh.setText("Expected .eMesh: —")
             return
         try:
             with open(path, "r", encoding="utf-8") as f:
                 mode = json.load(f)
         except (OSError, ValueError):
             return
-        set_cmd = mode.get("set_cmd") or "—"
-        self.lbl_init_mode.setText(f"Init: {set_cmd}")
-        init_tip_lines = []
-        fallback = mode.get("fallback_reason")
-        if fallback:
-            init_tip_lines.append(f"Fallback: {fallback}")
-        da = mode.get("domain_alignment") or {}
-        if da.get("requested_lengths_m") and da.get("actual_lengths_m"):
-            init_tip_lines.append(
-                f"Domain lengths requested {da.get('requested_lengths_m')} m → actual {da.get('actual_lengths_m')} m "
-                f"(cell {da.get('requested_cell_size_m')} m, n_cells {da.get('n_cells_xyz')})"
-            )
-        tr = mode.get("transition_region") or {}
-        if tr.get("outside_extent_m") is not None:
-            init_tip_lines.append(
-                f"Transition shell: {tr.get('snappy_type') or '—'}, outside_extent≈{tr.get('outside_extent_m'):.4g} m "
-                f"({'auto' if tr.get('outside_extent_auto') else 'user'})"
-            )
-        amr_w = mode.get("amr_written")
-        if isinstance(amr_w, dict) and amr_w.get("errorEstimator_line"):
-            init_tip_lines.append(
-                f"AMR: {amr_w.get('errorEstimator_line')} maxRefinement={amr_w.get('maxRefinement')} "
-                f"refineInterval={amr_w.get('refineInterval')} maxCells={amr_w.get('maxCells')}"
-            )
-            if amr_w.get("enableBalancing"):
+
+        any_result = False
+        set_cmd = mode.get("set_cmd")
+        if set_cmd:
+            cmd_show = "remap" if str(set_cmd).startswith("remap") else str(set_cmd)
+            self.lbl_result_init_command.setText(f"Init command: {cmd_show}")
+            any_result = True
+            init_tip_lines = []
+            fallback = mode.get("fallback_reason")
+            if fallback:
+                init_tip_lines.append(f"Fallback: {fallback}")
+            da = mode.get("domain_alignment") or {}
+            if da.get("requested_lengths_m") and da.get("actual_lengths_m"):
                 init_tip_lines.append(
-                    f"Load balance: enableBalancing=true, balanceInterval={amr_w.get('balanceInterval')}"
+                    f"Domain lengths requested {da.get('requested_lengths_m')} m → actual {da.get('actual_lengths_m')} m "
+                    f"(cell {da.get('requested_cell_size_m')} m, n_cells {da.get('n_cells_xyz')})"
                 )
-        bc = mode.get("base_cell_count")
-        if bc is not None:
-            init_tip_lines.append(f"Base mesh cell count (blockMesh): {int(bc):,}")
-        if init_tip_lines:
-            self.lbl_init_mode.setToolTip("\n".join(init_tip_lines))
-        else:
-            self.lbl_init_mode.setToolTip("")
-        req = mode.get("initiation_radius_requested")
-        eff = mode.get("initiation_radius_effective")
-        if req is not None and eff is not None:
-            self.lbl_initiation_radius.setText(f"Initiation radius: {eff:.4g} (req {req:.4g})")
-        else:
-            self.lbl_initiation_radius.setText("Initiation radius: —")
+            tr = mode.get("transition_region") or {}
+            if tr.get("outside_extent_m") is not None:
+                init_tip_lines.append(
+                    f"Transition shell: {tr.get('snappy_type') or '—'}, outside_extent≈{tr.get('outside_extent_m'):.4g} m "
+                    f"({'auto' if tr.get('outside_extent_auto') else 'user'})"
+                )
+            amr_w = mode.get("amr_written")
+            if isinstance(amr_w, dict) and amr_w.get("errorEstimator_line"):
+                init_tip_lines.append(
+                    f"AMR: {amr_w.get('errorEstimator_line')} maxRefinement={amr_w.get('maxRefinement')} "
+                    f"refineInterval={amr_w.get('refineInterval')} maxCells={amr_w.get('maxCells')}"
+                )
+            bc = mode.get("base_cell_count")
+            if bc is not None:
+                init_tip_lines.append(f"Base mesh cell count (blockMesh): {int(bc):,}")
+                self.lbl_result_total_cells.setText(f"Total cells: {int(bc):,}")
+            tip = "\n".join(init_tip_lines) if init_tip_lines else ""
+            self.lbl_result_init_command.setToolTip(tip)
+            self.lbl_result_block.setToolTip(tip)
+
+        # Keep detailed refine/capture notes in tooltips / Mesh Plan, not permanent result rows
         cr_req = mode.get("charge_refinement_requested")
         cr_eff = mode.get("charge_refinement_effective")
-        startup_lv = mode.get("startup_refinement_levels")
-        remaining_lv = mode.get("remaining_inside_levels")
-        auto_adj = mode.get("startup_auto_adjusted", False)
-        msg = mode.get("startup_refinement_message")
         if cr_req is not None and cr_eff is not None:
-            if startup_lv is not None and remaining_lv is not None:
-                self.lbl_charge_refine_info.setText(f"Charge refine: req {cr_req}, eff {cr_eff} (startup {startup_lv} + remaining {remaining_lv})")
-            else:
-                self.lbl_charge_refine_info.setText(f"Charge refine: req {cr_req}, eff {cr_eff}")
-            tip = ""
-            if auto_adj and msg:
-                tip = msg
-            if tip:
-                self.lbl_charge_refine_info.setToolTip(tip)
-        else:
-            self.lbl_charge_refine_info.setText("Charge refine: —")
+            self.lbl_charge_refine_info.setToolTip(f"Charge refine: req {cr_req}, eff {cr_eff}")
+
         cap = mode.get("charge_capture") or {}
         if cap:
-            r_used = cap.get("charge_capture_radius_used_m")
-            cmode = cap.get("mode", "—")
-            r_phys = cap.get("physical_charge_radius_m")
-            cf = cap.get("charge_capture_factor")
-            ratio = cap.get("ratio_capture_to_physical")
-            parts = [f"mode {cmode}"]
-            if r_used is not None:
-                parts.append(f"R_cap={float(r_used):.4g} m")
-            if r_phys is not None:
-                parts.append(f"R_phys={float(r_phys):.4g} m")
-            if ratio is not None:
-                parts.append(f"ratio={float(ratio):.3g}")
-            if cf is not None:
-                parts.append(f"factor={float(cf):.3g}")
-            self.lbl_charge_capture_info.setText("Charge capture: " + ", ".join(parts))
+            tip_parts = []
             desc = (cap.get("formula_description") or "").strip()
-            cap_ws = cap.get("warnings") or []
-            tip_cap = desc
-            if cap_ws:
-                tip_cap = (tip_cap + "\n\n" if tip_cap else "") + "\n".join(cap_ws)
-            if tip_cap:
-                self.lbl_charge_capture_info.setToolTip(tip_cap)
-        else:
-            self.lbl_charge_capture_info.setText("Charge capture: —")
-        obs_r = mode.get("obstacle_refinement")
-        snap = mode.get("snappy_refinement")
-        if obs_r is not None:
-            self.lbl_obstacle_refine_info.setText(f"Obstacle refine: {obs_r}, snappy: {'yes' if snap else 'no'}")
-        else:
-            self.lbl_obstacle_refine_info.setText("Obstacle refine: —")
+            if desc:
+                tip_parts.append(desc)
+            r_used = cap.get("charge_capture_radius_used_m")
+            if r_used is not None:
+                tip_parts.append(f"R_cap={float(r_used):.4g} m")
+            tip_parts.extend(cap.get("warnings") or [])
+            if tip_parts:
+                self.lbl_plan_charge_capture.setToolTip("\n".join(tip_parts))
+                self.lbl_plan_block_seed.setToolTip("\n".join(tip_parts))
+
         cells_inside = mode.get("cells_inside_charge")
         if cells_inside is not None:
-            self.lbl_cells_inside_charge.setText(f"Cells inside charge (post-refinement): {cells_inside:,}")
-        else:
-            self.lbl_cells_inside_charge.setText("Cells inside charge (post-refinement): —")
+            self.lbl_result_charge_cells.setText(f"Charge cells (alpha.c4): {int(cells_inside):,}")
+            any_result = True
+
         clipped = mode.get("charge_clipped_by_domain")
-        warnings = mode.get("charge_warnings") or []
-        tip = "Whether the charge geometry extends outside the domain."
-        if warnings:
-            tip += "\n\n" + "\n".join(warnings)
-        self.lbl_charge_clipped.setToolTip(tip)
+        warnings = list(mode.get("charge_warnings") or [])
+        clipped_true = clipped is True or (isinstance(clipped, str) and clipped.strip().lower() in ("yes", "true", "1"))
+        warn_parts = []
+        if clipped_true:
+            warn_parts.append("Warning: Charge clipped by domain.")
         cap_impossible = mode.get("charge_capture_impossible_message")
         if cap_impossible:
-            self.lbl_charge_resolution_warning.setText("Init will fail: charge capture impossible. Reduce Cell Size or enlarge charge.")
+            warn_parts.append("Init will fail: charge capture impossible. Reduce Cell Size or enlarge charge.")
             self.lbl_charge_resolution_warning.setToolTip(cap_impossible)
-        else:
-            self.lbl_charge_resolution_warning.setText("")
-            self.lbl_charge_resolution_warning.setToolTip("")
-        if clipped is not None:
-            if isinstance(clipped, bool):
-                self.lbl_charge_clipped.setText(f"Charge clipped by domain: {'yes' if clipped else 'no'}")
-            else:
-                self.lbl_charge_clipped.setText(f"Charge clipped by domain: {clipped}")
-        else:
-            self.lbl_charge_clipped.setText("Charge clipped by domain: —")
-        sc = mode.get("smallest_cell_near_charge")
-        if sc is not None:
-            self.lbl_smallest_cell.setText(f"Smallest cell (est.): {sc:.2e} m")
-        else:
-            self.lbl_smallest_cell.setText("Smallest cell (est.): —")
+        warn_parts.extend(warnings)
+        if warn_parts:
+            self.lbl_charge_resolution_warning.setText("\n".join(warn_parts))
+            self.lbl_charge_resolution_warning.setWordWrap(True)
+
         ign_cells = mode.get("cells_in_ignition_region")
         if ign_cells is not None:
-            self.lbl_cells_in_ignition.setText(f"Cells in ignition region: {ign_cells:,}")
-        else:
-            self.lbl_cells_in_ignition.setText("Cells in ignition region: —")
+            self.lbl_result_ignition_cells.setText(f"Cells in ignition region: {int(ign_cells):,}")
+            any_result = True
+
+        # Debug/preflight detail kept off the permanent panel (tooltip only if present)
         emesh_list = mode.get("expected_eMesh") or []
         if emesh_list:
-            present = sum(1 for p in emesh_list if os.path.isfile(os.path.join(case_dir, p)))
-            status = "OK" if present == len(emesh_list) else f"Missing {len(emesh_list) - present}/{len(emesh_list)}"
-            self.lbl_expected_emesh.setText(f"Expected .eMesh: {len(emesh_list)} file(s) — {status}")
-            self.lbl_expected_emesh.setToolTip("Canonical: " + "\n".join(emesh_list[:10]) + ("\n..." if len(emesh_list) > 10 else ""))
-        else:
-            self.lbl_expected_emesh.setText("Expected .eMesh: —")
+            self.lbl_expected_emesh.setToolTip(
+                "Expected .eMesh (preflight):\n" + "\n".join(emesh_list[:10])
+                + ("\n..." if len(emesh_list) > 10 else "")
+            )
+
+        if any_result:
+            self._set_init_results_visible(True)
 
     def update_charge_cells_display(self, case_dir: str, threshold: float = 0.5) -> None:
-        """Update Info panel with charge cell count from 0/alpha.c4 and case_init_mode.json (after init)."""
+        """Update Initialization Results from 0/alpha.c4 and case_init_mode.json (after init)."""
         self._update_info_from_case_init_mode(case_dir)
         try:
             from verification.verify_output import get_charge_cell_count
         except ImportError:
-            self.lbl_charge_cells.setText("Charge cells (alpha.c4>thr): —")
-            self.lbl_charge_fraction.setText("Charge fraction (%): —")
             return
         charge, total = get_charge_cell_count(case_dir, time_dir="0", threshold=threshold)
-        if charge is not None and total is not None and total > 0:
-            self.lbl_charge_cells.setText(f"Charge cells (alpha.c4>{threshold}): {charge:,}")
-            self.lbl_cells_inside_charge.setText(f"Cells inside charge (post-refinement): {charge:,}")
-            pct = 100.0 * charge / total
-            self.lbl_charge_fraction.setText(f"Charge fraction (%): {charge:,} / {total:,} ({pct:.2f}%)")
-        elif charge is not None and total is not None:
-            self.lbl_charge_cells.setText(f"Charge cells (alpha.c4>{threshold}): {charge:,}")
-            self.lbl_cells_inside_charge.setText(f"Cells inside charge (post-refinement): {charge:,}")
-            self.lbl_charge_fraction.setText("Charge fraction (%): —")
-        else:
-            self.lbl_charge_cells.setText("Charge cells (alpha.c4>thr): —")
-            self.lbl_charge_fraction.setText("Charge fraction (%): —")
+        if charge is not None:
+            self.lbl_result_charge_cells.setText(f"Charge cells (alpha.c4>{threshold}): {charge:,}")
+            self._set_init_results_visible(True)
+        if total is not None and total > 0:
+            self.lbl_result_total_cells.setText(f"Total cells: {total:,}")
+            self._set_init_results_visible(True)
 
     def _on_init_clicked(self):
         self.sig_request_init.emit(self.get_case_inputs())
