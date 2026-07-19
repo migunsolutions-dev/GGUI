@@ -404,17 +404,32 @@ class BlastFoamApp(QMainWindow):
             data = asdict(inputs)
             data["charge_radius"] = inputs.cylinder_radius
             self.tab_3d.set_case_inputs(data)
-            self.tab_3d.obstacles = [
-                ObstacleItem(
-                    True,
-                    obstacle.stl_path,
-                    obstacle.scale,
-                    obstacle.offset_x,
-                    obstacle.offset_y,
-                    obstacle.offset_z,
-                )
-                for obstacle in inputs.obstacles
-            ]
+            saved_obstacles = project["gui_state"].get("obstacles")
+            if isinstance(saved_obstacles, list):
+                self.tab_3d.obstacles = [
+                    ObstacleItem(
+                        bool(item.get("enabled", True)),
+                        str(item["path"]),
+                        float(item.get("scale", 1.0)),
+                        float(item.get("ox", 0.0)),
+                        float(item.get("oy", 0.0)),
+                        float(item.get("oz", 0.0)),
+                    )
+                    for item in saved_obstacles
+                    if isinstance(item, dict) and item.get("path")
+                ]
+            else:
+                self.tab_3d.obstacles = [
+                    ObstacleItem(
+                        True,
+                        obstacle.stl_path,
+                        obstacle.scale,
+                        obstacle.offset_x,
+                        obstacle.offset_y,
+                        obstacle.offset_z,
+                    )
+                    for obstacle in inputs.obstacles
+                ]
             self.tab_3d._refresh_table()
             self.probes_model.load_dict(project["probes"])
             self.tab_3d.load_project_gui_state(project["gui_state"])
@@ -563,6 +578,7 @@ class BlastFoamApp(QMainWindow):
                 gui_state={
                     "selected_primary_tab": "General 3D",
                     "sections": [asdict(section) for section in self.tab_3d.sections],
+                    "obstacles": [asdict(obstacle) for obstacle in self.tab_3d.obstacles],
                 },
             )
             write_project_atomic(path, payload)

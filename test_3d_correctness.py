@@ -215,7 +215,19 @@ class ProjectPersistenceTests(unittest.TestCase):
         payload = build_project(
             original,
             probes={"probes": [{"name": "P1", "x": 1, "y": 2, "z": 3}]},
-            gui_state={"sections": [{"name": "cut"}]},
+            gui_state={
+                "sections": [{"name": "cut"}],
+                "obstacles": [
+                    {
+                        "enabled": False,
+                        "path": "disabled-wall.stl",
+                        "scale": 0.001,
+                        "ox": 1.0,
+                        "oy": 2.0,
+                        "oz": 3.0,
+                    }
+                ],
+            },
         )
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "model.ggui.json")
