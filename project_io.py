@@ -6,12 +6,26 @@ import os
 import tempfile
 from dataclasses import MISSING, asdict, fields
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Protocol
 
 from models import CaseInputs3D, ObstacleData
 
 SCHEMA_VERSION = 1
 PROJECT_SUFFIX = ".ggui.json"
+
+
+class _SupportsProjectCapture(Protocol):
+    def get_case_inputs(self) -> CaseInputs3D: ...
+    def set_case_inputs(self, data: dict, load_summary: dict = None) -> None: ...
+    def load_project_gui_state(self, state: dict) -> None: ...
+    def _refresh_table(self) -> None: ...
+    sections: Any
+    obstacles: Any
+
+
+class _SupportsProbesDict(Protocol):
+    def to_dict(self) -> Dict[str, Any]: ...
+    def load_dict(self, data: Dict[str, Any]) -> None: ...
 
 
 class ProjectFormatError(ValueError):
@@ -47,6 +61,66 @@ def build_project(
             "contains_runtime_results": False,
         },
     }
+
+
+def capture_project_payload(tab: _SupportsProjectCapture, probes_model: _SupportsProbesDict) -> Dict[str, Any]:
+    """Capture dialog-independent project JSON from the live 3D GUI state."""
+    return build_project(
+        tab.get_case_inputs(),
+        probes=probes_model.to_dict(),
+        gui_state={
+            "selected_primary_tab": "General 3D",
+            "sections": [asdict(section) for section in tab.sections],
+            "obstacles": [asdict(obstacle) for obstacle in tab.obstacles],
+        },
+    )
+
+
+def apply_project_payload(
+    tab: _SupportsProjectCapture,
+    probes_model: _SupportsProbesDict,
+    project: Dict[str, Any],
+) -> None:
+    """Apply a read_project() result to the 3D tab without file dialogs.
+
+    A GGUI project is authoritative: set_case_inputs is called without load_summary
+    so stale OpenFOAM case-loader provenance is cleared.
+    """
+    from viewer_widget import ObstacleItem
+
+    inputs = project["inputs"]
+    data = asdict(inputs)
+    data["charge_radius"] = inputs.cylinder_radius
+    tab.set_case_inputs(data)
+    saved_obstacles = project["gui_state"].get("obstacles")
+    if isinstance(saved_obstacles, list):
+        tab.obstacles = [
+            ObstacleItem(
+                bool(item.get("enabled", True)),
+                str(item["path"]),
+                float(item.get("scale", 1.0)),
+                float(item.get("ox", 0.0)),
+                float(item.get("oy", 0.0)),
+                float(item.get("oz", 0.0)),
+            )
+            for item in saved_obstacles
+            if isinstance(item, dict) and item.get("path")
+        ]
+    else:
+        tab.obstacles = [
+            ObstacleItem(
+                True,
+                obstacle.stl_path,
+                obstacle.scale,
+                obstacle.offset_x,
+                obstacle.offset_y,
+                obstacle.offset_z,
+            )
+            for obstacle in inputs.obstacles
+        ]
+    tab._refresh_table()
+    probes_model.load_dict(project["probes"])
+    tab.load_project_gui_state(project["gui_state"])
 
 
 def write_project_atomic(path: str, payload: Dict[str, Any]) -> None:

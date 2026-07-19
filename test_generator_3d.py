@@ -35,6 +35,7 @@ def _minimal(**overrides):
         refine_max=3,
         dyn_refine_max=1,
         charge_refinement_level=2,
+        charge_outer_refine_enable=True,
         charge_outer_refine_min=2,
         charge_outer_refine_max=3,
         charge_capture_mode="auto",

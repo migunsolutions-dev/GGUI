@@ -2492,13 +2492,30 @@ class TabGeneral3D(QWidget):
                 setattr(self, attr, None)
 
     def set_case_inputs(self, data: dict, load_summary: dict = None) -> None:
-        """Populate GUI from *data*. If *load_summary*: LOADED keys set from case; not_filled left UNSET (no default)."""
+        """Populate GUI from *data*. If *load_summary*: LOADED keys set from case; not_filled left UNSET (no default).
+
+        Without *load_summary* (GGUI project apply), provenance is reset so stale
+        OpenFOAM case-loader UNSET state cannot override authoritative project values.
+        """
         if load_summary:
             self._provenance.update(data.get("_provenance", {}))
             not_filled = load_summary.get("not_filled", [])
             for key, _reason in not_filled:
                 self._provenance[key] = "UNSET"
                 self._apply_unset_for_key(key)
+        else:
+            # Project / direct apply: drop stale case-loader provenance, then restore
+            # intentional LOADED/USER keys from the project CaseInputs3D.provenance.
+            self._provenance = {}
+            proj_prov = data.get("provenance") or data.get("_provenance") or {}
+            if isinstance(proj_prov, dict):
+                self._provenance.update(
+                    {
+                        k: v
+                        for k, v in proj_prov.items()
+                        if v in ("LOADED", "USER")
+                    }
+                )
         self._block_signals = True
         try:
             # --- Domain Geometry ---
@@ -2540,12 +2557,15 @@ class TabGeneral3D(QWidget):
                 idx = self.c_mat.findText(mat)
                 if idx >= 0:
                     self.c_mat.setCurrentIndex(idx)
-                # If Custom, update the materials_db with parsed JWL params
-                if mat == "Custom" and "custom_material_props" in data:
-                    cprops = data["custom_material_props"]
-                    for k in ("rho", "energy", "A", "B", "R1", "R2", "omega"):
-                        if k in cprops:
-                            self.materials_db["Custom"][k] = cprops[k]
+                # Custom: canonical CaseInputs3D.material_props; legacy custom_material_props
+                if mat == "Custom":
+                    cprops = data.get("material_props")
+                    if not isinstance(cprops, dict) or not cprops:
+                        cprops = data.get("custom_material_props")
+                    if isinstance(cprops, dict):
+                        for k in ("rho", "energy", "A", "B", "R1", "R2", "omega"):
+                            if k in cprops and cprops[k] is not None:
+                                self.materials_db["Custom"][k] = cprops[k]
 
             # --- Charge Properties ---
             shape = data.get("charge_shape")
@@ -2593,33 +2613,33 @@ class TabGeneral3D(QWidget):
                 self.spin_end.setValue(data["end_time_s"])
             if "cores" in data:
                 self.spin_cores.setValue(data["cores"])
-            if "refine_min" in data:
+            if "refine_min" in data and data["refine_min"] is not None:
                 self.spin_refine_min.setValue(int(data["refine_min"]))
-            if "dyn_refine_min" in data:
+            if "dyn_refine_min" in data and data["dyn_refine_min"] is not None:
                 self.spin_refine_min.setValue(int(data["dyn_refine_min"]))
-            if "refine_max" in data:
+            if "refine_max" in data and data["refine_max"] is not None:
                 self.spin_refine_max.setValue(data["refine_max"])
-            if "dyn_refine_max" in data:
+            if "dyn_refine_max" in data and data["dyn_refine_max"] is not None:
                 self._dyn_refine_max = int(data["dyn_refine_max"])
                 self.spin_refine_max.setValue(self._dyn_refine_max)
-            elif "refine_max" in data:
+            elif "refine_max" in data and data["refine_max"] is not None:
                 self._dyn_refine_max = int(data["refine_max"])
-            if "enable_local_refinement" in data:
+            if "enable_local_refinement" in data and data["enable_local_refinement"] is not None:
                 en = bool(data["enable_local_refinement"])
                 self.rad_dyn_mesh.setChecked(en)
                 self.rad_fixed_mesh.setChecked(not en)
-            if "enable_dyn_refine" in data:
+            if "enable_dyn_refine" in data and data["enable_dyn_refine"] is not None:
                 en = bool(data["enable_dyn_refine"])
                 self.rad_dyn_mesh.setChecked(en)
                 self.rad_fixed_mesh.setChecked(not en)
                 self.rad_dyn_mesh.setEnabled(True)
                 self.rad_fixed_mesh.setEnabled(True)
-            if "enable_obstacle_refine" in data:
+            if "enable_obstacle_refine" in data and data["enable_obstacle_refine"] is not None:
                 self.chk_obstacle_refine.setChecked(bool(data["enable_obstacle_refine"]))
                 self.chk_obstacle_refine.setEnabled(True)
-            if "obstacle_refine_min" in data:
+            if "obstacle_refine_min" in data and data["obstacle_refine_min"] is not None:
                 self.spin_obstacle_refine_min.setValue(int(data["obstacle_refine_min"]))
-            if "obstacle_refine_max" in data:
+            if "obstacle_refine_max" in data and data["obstacle_refine_max"] is not None:
                 self.spin_obstacle_refine_max.setValue(int(data["obstacle_refine_max"]))
             if "transition_cells" in data and data["transition_cells"] is not None:
                 self.spin_transition_cells.setValue(max(1, min(10, int(data["transition_cells"]))))
@@ -2773,18 +2793,19 @@ class TabGeneral3D(QWidget):
                     # Ignore malformed values from imported cases and keep current defaults.
                     continue
                 setattr(self, attr, val)
-            if "charge_refinement_level" in data:
-                self.spin_charge_refine.setValue(data["charge_refinement_level"])
+            if "charge_refinement_level" in data and data["charge_refinement_level"] is not None:
+                self.spin_charge_refine.setValue(int(data["charge_refinement_level"]))
             has_outside = any(
-                k in data for k in ("charge_outer_refine_min", "charge_outer_refine_max", "charge_outer_refine_enable")
+                k in data and data[k] is not None
+                for k in ("charge_outer_refine_min", "charge_outer_refine_max", "charge_outer_refine_enable")
             )
             if has_outside:
-                if "charge_outer_refine_min" in data:
-                    self.spin_charge_outer_min.setValue(data["charge_outer_refine_min"])
+                if data.get("charge_outer_refine_min") is not None:
+                    self.spin_charge_outer_min.setValue(int(data["charge_outer_refine_min"]))
                 else:
                     self.spin_charge_outer_min.setValue(0)
-                if "charge_outer_refine_max" in data:
-                    self.spin_charge_outer_max.setValue(data["charge_outer_refine_max"])
+                if data.get("charge_outer_refine_max") is not None:
+                    self.spin_charge_outer_max.setValue(int(data["charge_outer_refine_max"]))
                 else:
                     self.spin_charge_outer_max.setValue(0)
             else:

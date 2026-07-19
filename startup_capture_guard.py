@@ -88,6 +88,17 @@ def aligned_base_cell_centre_inside(inputs: Any) -> bool:
     return False
 
 
+UNSAFE_CAPTURE_MESSAGE = (
+    "Initialization is blocked because no applied internal seed or "
+    "outer refinement band protects capture, and the aligned base mesh "
+    "has no cell centre inside the physical charge.\n\n"
+    "Choose one remedy without changing charge mass:\n"
+    "• reduce the base cell size;\n"
+    "• enable Dyn Mesh and select an internal charge refinement level greater than zero; or\n"
+    "• deliberately enable the advanced outer refinement band."
+)
+
+
 def evaluate_unsafe_capture(inputs: Any) -> CaptureGuardResult:
     seed = max(0, int(getattr(inputs, "charge_refinement_level", 0) or 0))
     band_enabled = bool(getattr(inputs, "charge_outer_refine_enable", False))
@@ -107,3 +118,12 @@ def evaluate_unsafe_capture(inputs: Any) -> CaptureGuardResult:
         if inside
         else "no aligned base-mesh cell centre lies inside the physical charge",
     )
+
+
+def require_safe_capture(inputs: Any) -> None:
+    """Raise ValueError before writing an unsafe non-remap 3D case. Non-mutating."""
+    if getattr(inputs, "remap_enabled", False):
+        return
+    guard = evaluate_unsafe_capture(inputs)
+    if not guard.safe:
+        raise ValueError(UNSAFE_CAPTURE_MESSAGE)

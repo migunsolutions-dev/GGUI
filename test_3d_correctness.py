@@ -16,11 +16,12 @@ from project_io import (
     write_project_atomic,
 )
 from solver_runner import (
+    FINAL_RECONSTRUCT_CMD,
     ExecutionIntent,
     ExecutionPreparationError,
     build_execution_plan,
 )
-from startup_capture_guard import evaluate_unsafe_capture
+from startup_capture_guard import UNSAFE_CAPTURE_MESSAGE, evaluate_unsafe_capture, require_safe_capture
 
 
 def case(**overrides) -> CaseInputs3D:
@@ -169,6 +170,131 @@ class RunnerIntentTests(unittest.TestCase):
             plan = build_execution_plan(td, 1, ExecutionIntent.ONE_STEP_RESUME)
             self.assertEqual(plan.latest_time, 0.0)
 
+    def _assert_non_destructive(self, command: str) -> None:
+        self.assertNotIn("rm -rf", command)
+        self.assertNotIn("Allclean", command)
+        self.assertNotIn("Allrun", command)
+
+    def test_parallel_resume_redecomposes_newer_serial_state(self):
+        """Serial 0.3 ahead of processor 0.2 must re-decompose; latest_time is 0.3."""
+        with tempfile.TemporaryDirectory() as td:
+            self._initialized_case(td)
+            os.makedirs(os.path.join(td, "0.3"))
+            os.makedirs(os.path.join(td, "processor0", "0.2"))
+            os.makedirs(os.path.join(td, "processor1", "0.2"))
+            plan = build_execution_plan(td, 2, ExecutionIntent.RESUME)
+            self.assertEqual(plan.latest_time, 0.3)
+            self.assertIn("decomposePar -force -latestTime", plan.command)
+            self.assertIn("mpirun -np 2", plan.command)
+            self._assert_non_destructive(plan.command)
+
+    def test_parallel_resume_uses_newer_processor_state(self):
+        """Processor 0.3 ahead of serial 0.2 must reuse processors; latest_time is 0.3."""
+        with tempfile.TemporaryDirectory() as td:
+            self._initialized_case(td)
+            os.makedirs(os.path.join(td, "0.2"))
+            os.makedirs(os.path.join(td, "processor0", "0.3"))
+            os.makedirs(os.path.join(td, "processor1", "0.3"))
+            plan = build_execution_plan(td, 2, ExecutionIntent.RESUME)
+            self.assertEqual(plan.latest_time, 0.3)
+            self.assertNotIn("decomposePar", plan.command)
+            self.assertIn("mpirun -np 2", plan.command)
+            self._assert_non_destructive(plan.command)
+
+    def test_parallel_resume_equal_times_reuse_processors(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._initialized_case(td)
+            os.makedirs(os.path.join(td, "0.3"))
+            os.makedirs(os.path.join(td, "processor0", "0.3"))
+            os.makedirs(os.path.join(td, "processor1", "0.3"))
+            plan = build_execution_plan(td, 2, ExecutionIntent.RESUME)
+            self.assertEqual(plan.latest_time, 0.3)
+            self.assertNotIn("decomposePar", plan.command)
+            self._assert_non_destructive(plan.command)
+
+    def test_one_step_resume_selects_actual_serial_source(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._initialized_case(td)
+            os.makedirs(os.path.join(td, "0.3"))
+            os.makedirs(os.path.join(td, "processor0", "0.2"))
+            os.makedirs(os.path.join(td, "processor1", "0.2"))
+            plan = build_execution_plan(td, 2, ExecutionIntent.ONE_STEP_RESUME)
+            self.assertEqual(plan.latest_time, 0.3)
+            self.assertIn("decomposePar -force -latestTime", plan.command)
+            self._assert_non_destructive(plan.command)
+
+    def test_one_step_resume_selects_actual_processor_source(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._initialized_case(td)
+            os.makedirs(os.path.join(td, "0.2"))
+            os.makedirs(os.path.join(td, "processor0", "0.3"))
+            os.makedirs(os.path.join(td, "processor1", "0.3"))
+            plan = build_execution_plan(td, 2, ExecutionIntent.ONE_STEP_RESUME)
+            self.assertEqual(plan.latest_time, 0.3)
+            self.assertNotIn("decomposePar", plan.command)
+            self._assert_non_destructive(plan.command)
+
+    def test_serial_resume_latest_time_matches_reconstructed_source(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._initialized_case(td)
+            os.makedirs(os.path.join(td, "0.2"))
+            os.makedirs(os.path.join(td, "processor0", "0.3"))
+            os.makedirs(os.path.join(td, "processor1", "0.3"))
+            plan = build_execution_plan(td, 1, ExecutionIntent.RESUME)
+            self.assertEqual(plan.latest_time, 0.3)
+            self.assertIn("reconstructPar -latestTime", plan.command)
+            self._assert_non_destructive(plan.command)
+
+    def test_final_reconstruct_command_is_latest_time(self):
+        self.assertIn("reconstructPar -latestTime", FINAL_RECONSTRUCT_CMD)
+        self.assertNotIn("rm -rf", FINAL_RECONSTRUCT_CMD)
+        self.assertNotIn("Allclean", FINAL_RECONSTRUCT_CMD)
+
+    def test_parallel_success_runs_final_reconstruct(self):
+        """Successful parallel SolverRunner completion must invoke final reconstructPar."""
+        from unittest.mock import MagicMock, patch
+        from solver_runner import SolverRunner
+
+        with tempfile.TemporaryDirectory() as td:
+            self._initialized_case(td)
+            os.makedirs(os.path.join(td, "0.1"))
+            os.makedirs(os.path.join(td, "processor0", "0.1"))
+            os.makedirs(os.path.join(td, "processor1", "0.1"))
+            runner = SolverRunner(
+                win_case_dir=td,
+                openfoam_bashrc="/opt/openfoam9/etc/bashrc",
+                project_root=td,
+                cores=2,
+                intent=ExecutionIntent.RESUME,
+            )
+            poll_returns = [None, 0, 0]
+
+            def poll_side_effect():
+                return poll_returns.pop(0) if poll_returns else 0
+
+            mock_proc = MagicMock()
+            mock_proc.poll.side_effect = poll_side_effect
+            final_mock = MagicMock(return_value=0)
+            finished = []
+
+            with patch.object(runner, "_build_wsl_cmd", return_value=["true"]), \
+                 patch("solver_runner.subprocess.Popen", return_value=mock_proc), \
+                 patch.object(runner, "_final_reconstruct_latest", final_mock), \
+                 patch.object(runner, "_maybe_reconstruct_new_times"), \
+                 patch.object(runner, "_check_watchdog_trigger"), \
+                 patch.object(runner, "_maybe_stop_after_watchdog"), \
+                 patch.object(runner, "_discover_probe_file", return_value=None), \
+                 patch.object(runner, "_find_control_dict_end_time"), \
+                 patch.object(runner, "finished_signal") as fin_sig, \
+                 patch.object(runner, "status_signal"), \
+                 patch.object(runner, "progress_signal"), \
+                 patch.object(runner, "data_signal"):
+                fin_sig.emit.side_effect = lambda ok: finished.append(ok)
+                runner.run()
+
+            final_mock.assert_called_once()
+            self.assertEqual(finished, [True])
+
 
 class CaptureGuardTests(unittest.TestCase):
     def test_unsafe_seed_zero_no_band(self):
@@ -181,6 +307,9 @@ class CaptureGuardTests(unittest.TestCase):
             charge_outer_refine_enable=False,
         )
         self.assertFalse(evaluate_unsafe_capture(inputs).safe)
+        with self.assertRaises(ValueError) as ctx:
+            require_safe_capture(inputs)
+        self.assertIn("Initialization is blocked", str(ctx.exception))
 
     def test_subcell_charge_can_contain_cell_centre(self):
         inputs = case(
@@ -192,12 +321,60 @@ class CaptureGuardTests(unittest.TestCase):
             charge_outer_refine_enable=False,
         )
         self.assertTrue(evaluate_unsafe_capture(inputs).safe)
+        require_safe_capture(inputs)  # must not raise
 
     def test_seed_or_band_protects_all_shapes(self):
         for shape in ("Sphere", "Cylinder", "Cuboid"):
             base = case(charge_shape=shape, mass_kg=0.001)
             self.assertTrue(evaluate_unsafe_capture(replace(base, charge_refinement_level=2)).safe)
             self.assertTrue(evaluate_unsafe_capture(replace(base, charge_outer_refine_enable=True)).safe)
+
+    def test_generator_blocks_unsafe_before_writing_case(self):
+        inputs = case(
+            min_point=(0, 0, 0),
+            max_point=(1, 1, 1),
+            cell_size=0.2,
+            charge_center=(0.4, 0.4, 0.4),
+            mass_kg=0.001,
+            charge_outer_refine_enable=False,
+            charge_refinement_level=0,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(ValueError) as ctx:
+                Generator3D(td).generate("unsafe", inputs)
+            self.assertEqual(str(ctx.exception), UNSAFE_CAPTURE_MESSAGE)
+            self.assertFalse(os.path.isdir(os.path.join(td, "unsafe")))
+
+    def test_generator_allows_safe_centre_inside(self):
+        inputs = case(
+            min_point=(0, 0, 0),
+            max_point=(1, 1, 1),
+            cell_size=0.2,
+            charge_center=(0.5, 0.5, 0.5),
+            mass_kg=0.02,
+            charge_outer_refine_enable=False,
+            charge_refinement_level=0,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            case_dir = Generator3D(td).generate("safe", inputs)
+            self.assertTrue(os.path.isdir(case_dir))
+
+    def test_generator_remap_bypasses_capture_guard(self):
+        inputs = case(
+            min_point=(0, 0, 0),
+            max_point=(1, 1, 1),
+            cell_size=0.2,
+            charge_center=(0.4, 0.4, 0.4),
+            mass_kg=0.001,
+            charge_outer_refine_enable=False,
+            charge_refinement_level=0,
+            remap_enabled=True,
+            remap_case_path="",
+        )
+        require_safe_capture(inputs)  # remap must not raise
+        with tempfile.TemporaryDirectory() as td:
+            case_dir = Generator3D(td).generate("remap", inputs)
+            self.assertTrue(os.path.isdir(case_dir))
 
 
 class ProjectPersistenceTests(unittest.TestCase):

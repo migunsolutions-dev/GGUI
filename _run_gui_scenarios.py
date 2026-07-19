@@ -211,7 +211,9 @@ SCENARIOS.append(("sphere_fine_no_inside", scenario_sphere_fine_no_inside, expec
 def scenario_sphere_fixed(tab: TabGeneral3D) -> None:
     _set_domain(tab, (-5, 5), (-5, 5), (0, 5), 0.5)
     tab.c_mat.setCurrentText("C4")
-    _set_charge(tab, "Sphere", 25.0, 1601.0, (0.0, 0.0, 0.5))
+    # Place charge on an aligned base-cell centre so Fixed Mesh (seed=0, no band)
+    # remains a valid generate path under the central capture guard.
+    _set_charge(tab, "Sphere", 25.0, 1601.0, (0.25, 0.25, 0.25))
     _select_fixed(tab)
     _set_charge_refine(tab, inside=5, outer_min=2, outer_max=3)
 

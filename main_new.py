@@ -5,7 +5,6 @@ Main application window with multi-panel layout following specification.
 import sys
 import os
 import subprocess
-from dataclasses import asdict
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
@@ -33,15 +32,15 @@ from models import CaseInputs1D, CaseInputs3D
 from path_utils import get_latest_time_dir, win_to_wsl_path
 from case_loader import load_case
 from initialization_plan import build_initialization_plan
-from startup_capture_guard import evaluate_unsafe_capture
+from startup_capture_guard import UNSAFE_CAPTURE_MESSAGE, require_safe_capture
 from project_io import (
     PROJECT_SUFFIX,
     ProjectFormatError,
-    build_project,
+    apply_project_payload,
+    capture_project_payload,
     read_project,
     write_project_atomic,
 )
-from viewer_widget import ObstacleItem
 try:
     from verification.verify_output import get_charge_cell_count
 except ImportError:
@@ -400,39 +399,7 @@ class BlastFoamApp(QMainWindow):
             return
         try:
             project = read_project(path)
-            inputs = project["inputs"]
-            data = asdict(inputs)
-            data["charge_radius"] = inputs.cylinder_radius
-            self.tab_3d.set_case_inputs(data)
-            saved_obstacles = project["gui_state"].get("obstacles")
-            if isinstance(saved_obstacles, list):
-                self.tab_3d.obstacles = [
-                    ObstacleItem(
-                        bool(item.get("enabled", True)),
-                        str(item["path"]),
-                        float(item.get("scale", 1.0)),
-                        float(item.get("ox", 0.0)),
-                        float(item.get("oy", 0.0)),
-                        float(item.get("oz", 0.0)),
-                    )
-                    for item in saved_obstacles
-                    if isinstance(item, dict) and item.get("path")
-                ]
-            else:
-                self.tab_3d.obstacles = [
-                    ObstacleItem(
-                        True,
-                        obstacle.stl_path,
-                        obstacle.scale,
-                        obstacle.offset_x,
-                        obstacle.offset_y,
-                        obstacle.offset_z,
-                    )
-                    for obstacle in inputs.obstacles
-                ]
-            self.tab_3d._refresh_table()
-            self.probes_model.load_dict(project["probes"])
-            self.tab_3d.load_project_gui_state(project["gui_state"])
+            apply_project_payload(self.tab_3d, self.probes_model, project)
             self.current_project_path = os.path.abspath(path)
             self.active_case_dir_3d = None
             self.active_case_initialized_3d = False
@@ -572,15 +539,7 @@ class BlastFoamApp(QMainWindow):
 
     def _save_project_to(self, path: str) -> bool:
         try:
-            payload = build_project(
-                self.tab_3d.get_case_inputs(),
-                probes=self.probes_model.to_dict(),
-                gui_state={
-                    "selected_primary_tab": "General 3D",
-                    "sections": [asdict(section) for section in self.tab_3d.sections],
-                    "obstacles": [asdict(obstacle) for obstacle in self.tab_3d.obstacles],
-                },
-            )
+            payload = capture_project_payload(self.tab_3d, self.probes_model)
             write_project_atomic(path, payload)
             self.status_bar.set_status("Project saved", "#2ecc71")
             return True
@@ -802,28 +761,30 @@ class BlastFoamApp(QMainWindow):
         """Initialize 3D model (mesh generation and field initialization)"""
         if isinstance(inputs, CaseInputs3D):
             try:
-                if not getattr(inputs, "remap_enabled", False):
-                    guard = evaluate_unsafe_capture(inputs)
-                    if not guard.safe:
-                        QMessageBox.critical(
-                            self,
-                            "Unsafe charge capture",
-                            "Initialization is blocked because no applied internal seed or "
-                            "outer refinement band protects capture, and the aligned base mesh "
-                            "has no cell centre inside the physical charge.\n\n"
-                            "Choose one remedy without changing charge mass:\n"
-                            "• reduce the base cell size;\n"
-                            "• enable Dyn Mesh and select an internal charge refinement level greater than zero; or\n"
-                            "• deliberately enable the advanced outer refinement band.",
-                        )
-                        self.status_bar.set_status("Init blocked", "#e74c3c")
-                        return
+                try:
+                    require_safe_capture(inputs)
+                except ValueError as guard_exc:
+                    QMessageBox.critical(
+                        self,
+                        "Unsafe charge capture",
+                        str(guard_exc) or UNSAFE_CAPTURE_MESSAGE,
+                    )
+                    self.status_bar.set_status("Init blocked", "#e74c3c")
+                    return
                 self.status_bar.set_status("Generating 3D Case...", "#f39c12")
                 QApplication.processEvents()
 
                 prefix = "Case_3D"
                 case_name = self.service.make_case_name(prefix)
-                case_dir = self.service.generate_case(case_name, inputs)
+                try:
+                    case_dir = self.service.generate_case(case_name, inputs)
+                except ValueError as gen_exc:
+                    msg = str(gen_exc)
+                    if "Initialization is blocked" in msg or msg == UNSAFE_CAPTURE_MESSAGE:
+                        QMessageBox.critical(self, "Unsafe charge capture", msg)
+                        self.status_bar.set_status("Init blocked", "#e74c3c")
+                        return
+                    raise
                 self.active_case_dir_3d = case_dir
                 self.active_case_initialized_3d = False
                 if not getattr(inputs, "remap_enabled", False):

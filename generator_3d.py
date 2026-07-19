@@ -16,6 +16,7 @@ from initialization_plan import build_initialization_plan
 from mesh_domain import align_domain_to_cell_size
 from models import CaseInputs3D
 from path_utils import get_latest_time_dir, win_to_wsl_path
+from startup_capture_guard import require_safe_capture
 
 
 def effective_charge_refine(inputs) -> int:
@@ -852,6 +853,10 @@ class Generator3D(BaseGenerator):
             self._validate_inputs_basic(inputs)
         except ValueError as e:
             raise ValueError(f"Invalid 3D inputs: {e}") from e
+
+        # Central non-mutating guard: blocks unsafe seed-0/no-band capture for all
+        # non-remap entry points (GUI, SimulationService, direct Generator3D.generate).
+        require_safe_capture(inputs)
 
         try:
             align = align_domain_to_cell_size(inputs.min_point, inputs.max_point, inputs.cell_size)
