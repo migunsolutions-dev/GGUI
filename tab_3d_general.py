@@ -12,6 +12,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 
 from probes_model import ProbesModel
 from models import CaseInputs3D, ObstacleData
+from initialization_plan import build_initialization_plan
 from viewer_widget import BlastViewerWidget, ObstacleItem, SectionItem
 from dialogs import RemapConfigDialog
 try:
@@ -259,12 +260,12 @@ class TabGeneral3D(QWidget):
         self.spin_refine_min.setRange(0, 10)
         self.spin_refine_min.setValue(2)
         self.spin_refine_min.setMaximumWidth(60)
-        self.spin_refine_min.setToolTip("Min refinement level (0 = no refinement).")
+        self.spin_refine_min.setToolTip("Legacy loaded-state value; runtime AMR has no integer minimum level.")
         self.spin_refine_max = QSpinBox()
         self.spin_refine_max.setRange(0, 10)
-        self.spin_refine_max.setValue(3)
+        self.spin_refine_max.setValue(1)
         self.spin_refine_max.setMaximumWidth(60)
-        self.spin_refine_max.setToolTip("Max refinement level.")
+        self.spin_refine_max.setToolTip("Runtime AMR: maxRefinement in constant/dynamicMeshDict.")
         mesh_mode_col = QWidget()
         mesh_mode_v = QVBoxLayout(mesh_mode_col)
         mesh_mode_v.setContentsMargins(0, 0, 0, 0)
@@ -275,8 +276,7 @@ class TabGeneral3D(QWidget):
         dyn_h = QHBoxLayout(dyn_row)
         dyn_h.setContentsMargins(0, 0, 0, 0)
         dyn_h.addWidget(self.rad_dyn_mesh)
-        dyn_h.addWidget(QLabel("Levels:"))
-        dyn_h.addWidget(self.spin_refine_min)
+        dyn_h.addWidget(QLabel("Max refinement:"))
         dyn_h.addWidget(self.spin_refine_max)
         dyn_h.addStretch()
         mesh_mode_v.addWidget(dyn_row)
@@ -389,17 +389,17 @@ class TabGeneral3D(QWidget):
         self.spin_charge_refine.setRange(0, 8)
         self.spin_charge_refine.setValue(0)
         self.spin_charge_refine.setMaximumWidth(60)
-        self.spin_charge_refine.setToolTip("0 = no refinement (setFields). 1–8 = refinement level (setRefinedFields). Sphere/Cylinder only.")
+        self.spin_charge_refine.setToolTip("Startup charge seed: refineInternal level in system/setFieldsDict; 0 uses setFields.")
         self.spin_charge_outer_min = QSpinBox()
         self.spin_charge_outer_min.setRange(0, 10)
         self.spin_charge_outer_min.setValue(2)
         self.spin_charge_outer_min.setMaximumWidth(60)
-        self.spin_charge_outer_min.setToolTip("Min level for charge outer refinement (snappy).")
+        self.spin_charge_outer_min.setToolTip("Charge outer band: minimum level in snappyHexMeshDict refinementRegions.")
         self.spin_charge_outer_max = QSpinBox()
         self.spin_charge_outer_max.setRange(0, 10)
         self.spin_charge_outer_max.setValue(3)
         self.spin_charge_outer_max.setMaximumWidth(60)
-        self.spin_charge_outer_max.setToolTip("Max level for charge outer refinement (snappy).")
+        self.spin_charge_outer_max.setToolTip("Charge outer band: maximum level in snappyHexMeshDict refinementRegions.")
         self.spin_charge_outer_min.valueChanged.connect(self._validate_charge_outer_levels)
         self.spin_charge_outer_max.valueChanged.connect(self._validate_charge_outer_levels)
         
@@ -1892,7 +1892,7 @@ class TabGeneral3D(QWidget):
             nz = int((self.sz2.value() - self.sz1.value()) / dx)
             total = nx * ny * nz
             self.lbl_cells.setText(f"Grid: {nx}x{ny}x{nz}  ({total:,} cells)")
-        except:
+        except (TypeError, ValueError, OverflowError):
             self.lbl_cells.setText("Grid: Error")
 
         self._clear_charge_cells_display()
@@ -2126,8 +2126,9 @@ class TabGeneral3D(QWidget):
                 plan.append(f"Remap time: specific ({(self._remap_specific_time or '').strip() or '(empty)'})")
             plan.append("Initialize commands: blockMesh -> optional surfaceFeatures/snappy -> remap_radial.py.")
         else:
-            placement = "setRefinedFields" if charge_refine > 0 and shape in ("Sphere", "Cylinder") else "setFields"
-            plan.append(f"Placement command preference: {placement}")
+            init_plan = build_initialization_plan(self.get_case_inputs())
+            plan.append(f"Initialization command: {init_plan.command}")
+            plan.append(f"Initialization reason: {init_plan.reason}")
             if has_obstacles:
                 plan.append("Initialize commands: blockMesh -> surfaceFeatures -> snappyHexMesh -> setFields workflow.")
             else:
@@ -2233,8 +2234,31 @@ class TabGeneral3D(QWidget):
             opacity = float(op_w.value()) if hasattr(op_w, "value") else 0.5
             new_secs.append(SectionItem(enabled, name, [cx, cy, cz], normal, opacity, position_m))
 
+        self.sections = new_secs
         if self.viewer:
             self.viewer.update_sections(new_secs)
+
+    def load_project_gui_state(self, state: dict) -> None:
+        """Restore GUI-only section definitions from a project JSON."""
+        sections = state.get("sections", []) if isinstance(state, dict) else []
+        if not isinstance(sections, list):
+            raise ValueError("gui_state.sections must be a list")
+        self.tbl_sec.setRowCount(0)
+        for item in sections:
+            if not isinstance(item, dict):
+                raise ValueError("Each saved section must be an object")
+            self._add_default_section()
+            row = self.tbl_sec.rowCount() - 1
+            self.tbl_sec.item(row, 0).setCheckState(
+                Qt.Checked if bool(item.get("enabled", True)) else Qt.Unchecked
+            )
+            self.tbl_sec.item(row, 1).setText(str(item.get("name", "Section")))
+            normal = item.get("normal", [0, 0, 1])
+            plane = "YZ (Side)" if normal == [1, 0, 0] else "XZ (Front)" if normal == [0, 1, 0] else "XY (Ground)"
+            self.tbl_sec.cellWidget(row, 2).setCurrentText(plane)
+            self.tbl_sec.cellWidget(row, 3).setValue(float(item.get("position_m", 0.0)))
+            self.tbl_sec.cellWidget(row, 4).setValue(float(item.get("opacity", 0.5)))
+        self._update_sections_from_table(-1, -1)
 
     def _add_stl(self):
         f, _ = QFileDialog.getOpenFileName(self, "STL", "", "STL (*.stl)")
@@ -2264,7 +2288,8 @@ class TabGeneral3D(QWidget):
             elif c==4: o.oy=float(self.tbl_obs.item(r,4).text())
             elif c==5: o.oz=float(self.tbl_obs.item(r,5).text())
             self._update_preview()
-        except: pass
+        except (IndexError, AttributeError, TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "Invalid obstacle value", str(exc))
 
     # ------------------------------------------------------------------
     #  Load case: populate all UI fields from a parsed dict
@@ -2338,7 +2363,7 @@ class TabGeneral3D(QWidget):
         elif key == "t_atm":
             self.t0.setValue(288.0)
         elif key == "refine_max":
-            self.spin_refine_max.setValue(3)
+            self.spin_refine_max.setValue(1)
         elif key == "refine_min":
             self.spin_refine_min.setValue(2)
         elif key == "enable_local_refinement":

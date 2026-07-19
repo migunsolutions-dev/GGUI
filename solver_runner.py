@@ -4,12 +4,120 @@ import glob
 import time
 import shlex
 import subprocess
+from dataclasses import dataclass
+from enum import Enum
 from typing import Optional, Tuple, List
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
 # Number of tail lines to capture from each log file for debug_summary.txt
 DEBUG_TAIL_LINES = 50
+
+
+class ExecutionIntent(str, Enum):
+    FRESH_FULL_PIPELINE = "fresh_full_pipeline"
+    INITIALIZED_SOLVER_RUN = "initialized_solver_run"
+    RESUME = "resume"
+    ONE_STEP_RESUME = "one_step_resume"
+
+
+class ExecutionPreparationError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ExecutionPlan:
+    intent: ExecutionIntent
+    command: str
+    latest_time: Optional[float]
+    log_name: str = "log.blastFoam"
+
+
+def _numeric_time_dirs(path: str) -> List[float]:
+    values: List[float] = []
+    if not os.path.isdir(path):
+        return values
+    for name in os.listdir(path):
+        try:
+            value = float(name)
+        except ValueError:
+            continue
+        if value > 0 and os.path.isdir(os.path.join(path, name)):
+            values.append(value)
+    return values
+
+
+def build_execution_plan(
+    case_dir: str,
+    cores: int,
+    intent: ExecutionIntent,
+) -> ExecutionPlan:
+    """Build a non-destructive solver command for an already generated case."""
+    cores = max(1, int(cores))
+    if intent == ExecutionIntent.FRESH_FULL_PIPELINE:
+        return ExecutionPlan(intent, "bash ./Allrun", None, "log.Allrun")
+
+    serial_times = _numeric_time_dirs(case_dir)
+    processor_dirs = sorted(
+        path
+        for path in glob.glob(os.path.join(case_dir, "processor[0-9]*"))
+        if os.path.isdir(path)
+    )
+    per_processor_times = [_numeric_time_dirs(path) for path in processor_dirs]
+    processor_times = per_processor_times[0] if per_processor_times else []
+    latest = max(serial_times + processor_times) if (serial_times or processor_times) else None
+    resume = intent in (ExecutionIntent.RESUME, ExecutionIntent.ONE_STEP_RESUME)
+    if intent == ExecutionIntent.ONE_STEP_RESUME and latest is None:
+        zero_dir = os.path.join(processor_dirs[0] if processor_dirs else case_dir, "0")
+        if os.path.isdir(zero_dir) and os.path.isfile(os.path.join(zero_dir, "p")):
+            latest = 0.0
+    if resume and latest is None:
+        raise ExecutionPreparationError(
+            "No resumable saved time exists. Initialize and run the case before Resume/Exact 1."
+        )
+
+    if cores == 1:
+        start_mode = "latestTime" if resume else "startTime"
+        prep = ""
+        if resume and processor_dirs:
+            processor_latest = max(processor_times) if processor_times else None
+            serial_latest = max(serial_times) if serial_times else None
+            if processor_latest is not None and (
+                serial_latest is None or processor_latest > serial_latest
+            ):
+                prep = "reconstructPar -latestTime > log.reconstructResume 2>&1 && "
+        cmd = (
+            f"set -o pipefail; foamDictionary system/controlDict -entry startFrom -set {start_mode} "
+            f"> log.prepareSolver 2>&1 && {prep}blastFoam 2>&1 | tee log.blastFoam"
+        )
+        return ExecutionPlan(intent, cmd, latest)
+
+    if processor_dirs:
+        expected = {f"processor{i}" for i in range(cores)}
+        actual = {os.path.basename(path) for path in processor_dirs}
+        if actual != expected:
+            raise ExecutionPreparationError(
+                f"Processor state has {len(processor_dirs)} directories but the GUI requests {cores} cores."
+            )
+        latest_values = [max(times) if times else None for times in per_processor_times]
+        if resume and len(set(latest_values)) != 1:
+            raise ExecutionPreparationError(
+                "Processor directories do not share one consistent latest saved time; "
+                "reconstruct or repair the case before resuming."
+            )
+        prep = ""
+    else:
+        # Decompose the initialized time 0 for a new run, or only the latest
+        # reconstructed serial state for resume. Neither path cleans the case.
+        decompose_opt = "-force -latestTime" if resume else "-force"
+        prep = f"decomposePar {decompose_opt} > log.decomposeParSolver 2>&1 && "
+    start_mode = "latestTime" if resume else "startTime"
+    cmd = (
+        f"set -o pipefail; foamDictionary system/controlDict -entry startFrom -set {start_mode} "
+        f"> log.prepareSolver 2>&1 && {prep}"
+        f"mpirun -np {cores} blastFoam -parallel 2>&1 | tee log.blastFoam"
+    )
+    return ExecutionPlan(intent, cmd, latest)
 
 
 class SolverRunner(QThread):
@@ -35,12 +143,14 @@ class SolverRunner(QThread):
         openfoam_bashrc: str = "/opt/openfoam9/etc/bashrc",
         project_root: Optional[str] = None,
         cores: int = 1,
+        intent: ExecutionIntent = ExecutionIntent.FRESH_FULL_PIPELINE,
     ):
         super().__init__()
         self.win_case_dir = win_case_dir
         self.openfoam_bashrc = openfoam_bashrc
         self.project_root = project_root
         self.cores = max(1, int(cores))
+        self.intent = ExecutionIntent(intent)
         self.keep_running = True
         self._proc: Optional[subprocess.Popen] = None
 
@@ -161,7 +271,8 @@ class SolverRunner(QThread):
             "=== Simulation failure: automatic error summary ===",
             "",
             f"Case directory: {self.win_case_dir}",
-            f"Allrun exit code: {exit_code}",
+            f"Execution intent: {self.intent.value}",
+            f"Process exit code: {exit_code}",
             "",
             "--- Last {} lines of each log file (newest first) ---".format(DEBUG_TAIL_LINES),
             "",
@@ -406,16 +517,26 @@ class SolverRunner(QThread):
         linux_dir = self._linux_case_dir
         self._find_control_dict_end_time()
 
-        self.status_signal.emit("Preparing scripts...")
-        self._run_simple(linux_dir, r"sed -i 's/\r$//' Allrun Allclean 2>/dev/null || true")
-        self._run_simple(linux_dir, "chmod +x Allrun Allclean 2>/dev/null || true")
-
-        self.status_signal.emit("Running Allrun...")
-        args = self._build_wsl_cmd(linux_dir, "bash ./Allrun")
+        try:
+            execution = build_execution_plan(
+                self.win_case_dir, self.cores, self.intent
+            )
+        except ExecutionPreparationError as exc:
+            self.status_signal.emit(str(exc))
+            self.finished_signal.emit(False)
+            return
+        if self.intent == ExecutionIntent.FRESH_FULL_PIPELINE:
+            self.status_signal.emit("Preparing fresh-run scripts...")
+            self._run_simple(linux_dir, r"sed -i 's/\r$//' Allrun Allclean 2>/dev/null || true")
+            self._run_simple(linux_dir, "chmod +x Allrun Allclean 2>/dev/null || true")
+        self.status_signal.emit(f"Running: {self.intent.value}")
+        args = self._build_wsl_cmd(linux_dir, execution.command)
         try:
             self._proc = subprocess.Popen(args)
         except Exception as e:
-            self.status_signal.emit(f"Failed to start Allrun: {e}")
+            self.status_signal.emit(
+                f"Failed command `{execution.command}`: {e}. Log: {execution.log_name}"
+            )
             self.finished_signal.emit(False)
             return
 
@@ -486,5 +607,8 @@ class SolverRunner(QThread):
             self.finished_signal.emit(True)
         else:
             self._write_debug_summary(rc)
-            self.status_signal.emit(f"Failed (rc={rc}). See debug_summary.txt.")
+            self.status_signal.emit(
+                f"Failed command `{execution.command}` (rc={rc}). "
+                f"Logs: {execution.log_name}, debug_summary.txt."
+            )
             self.finished_signal.emit(False)

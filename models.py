@@ -100,8 +100,8 @@ class CaseInputs3D:
     refine_max: int = 3
     # Dynamic (AMR): written to dynamicMeshDict only when enable_dyn_refine
     enable_dyn_refine: Optional[bool] = None   # None = use enable_local_refinement for backward compat
-    dyn_refine_min: Optional[int] = None      # None = use refine_min
-    dyn_refine_max: Optional[int] = None      # None = use refine_max
+    dyn_refine_min: Optional[int] = None      # legacy load compatibility; not generated
+    dyn_refine_max: Optional[int] = 1         # runtime dynamicMeshDict maxRefinement
     # Obstacle surface (snappy): refinementSurfaces levels only when enable_obstacle_refine
     enable_obstacle_refine: Optional[bool] = None  # None = use enable_local_refinement for backward compat
     obstacle_refine_min: Optional[int] = None     # None = use refine_min
