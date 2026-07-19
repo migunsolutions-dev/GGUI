@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import unittest
 
+from case_init_mode import record_set_cmd_actual
 from generator_3d import Generator3D
 from models import CaseInputs3D
 from path_utils import win_to_wsl_path
@@ -69,6 +70,35 @@ def _alpha_has_explosive_cells(case_dir: str) -> tuple[bool, str]:
     return False, "alpha.c4 present but no internalField detected"
 
 
+def _cuboid_seed2_inputs() -> CaseInputs3D:
+    return CaseInputs3D(
+        min_point=(0.0, 0.0, 0.0),
+        max_point=(1.0, 1.0, 1.0),
+        cell_size=0.25,
+        charge_center=(0.5, 0.5, 0.5),
+        charge_shape="Cuboid",
+        mass_kg=0.2 * 0.2 * 0.2 * 1601.0,
+        cylinder_radius=0.05,
+        cylinder_axis="Z",
+        material_name="C4",
+        rho_charge=1601.0,
+        energy_j_per_kg=4.5e6,
+        p_atm=101325.0,
+        t_atm=288.0,
+        end_time_s=1e-4,
+        delta_t=1e-7,
+        write_interval_steps=10,
+        cores=1,
+        enable_dyn_refine=True,
+        charge_refinement_level=2,
+        charge_outer_refine_enable=False,
+        charge_length=0.2,
+        charge_width=0.2,
+        charge_height=0.2,
+        fast_run_mode=True,
+    )
+
+
 class CuboidSetRefinedFieldsRuntimeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -76,31 +106,7 @@ class CuboidSetRefinedFieldsRuntimeTests(unittest.TestCase):
 
     def test_cuboid_setfieldsdict_contains_box_backup_and_level(self):
         """String-level compatibility: Cuboid seed>0 writes boxToCell + backup + level."""
-        inputs = CaseInputs3D(
-            min_point=(0.0, 0.0, 0.0),
-            max_point=(1.0, 1.0, 1.0),
-            cell_size=0.25,
-            charge_center=(0.5, 0.5, 0.5),
-            charge_shape="Cuboid",
-            mass_kg=0.2 * 0.2 * 0.2 * 1601.0,
-            cylinder_radius=0.05,
-            cylinder_axis="Z",
-            material_name="C4",
-            rho_charge=1601.0,
-            energy_j_per_kg=4.5e6,
-            p_atm=101325.0,
-            t_atm=288.0,
-            end_time_s=1e-4,
-            delta_t=1e-7,
-            write_interval_steps=10,
-            cores=1,
-            enable_dyn_refine=True,
-            charge_refinement_level=2,
-            charge_outer_refine_enable=False,
-            charge_length=0.2,
-            charge_width=0.2,
-            charge_height=0.2,
-        )
+        inputs = _cuboid_seed2_inputs()
         with tempfile.TemporaryDirectory() as td:
             case_dir = Generator3D(td).generate("cuboid_dict", inputs)
             with open(os.path.join(case_dir, "system", "setFieldsDict"), encoding="utf-8") as f:
@@ -113,6 +119,32 @@ class CuboidSetRefinedFieldsRuntimeTests(unittest.TestCase):
         self.assertIn("refineInternal yes", text)
         self.assertIn("level 2", text)
         self.assertEqual(mode.get("set_cmd"), "setRefinedFields")
+        self.assertIsNone(mode.get("set_cmd_actual"))
+
+    def test_record_set_cmd_actual_helper_matches_production(self):
+        """Production helper must persist set_cmd_actual after successful init."""
+        inputs = _cuboid_seed2_inputs()
+        with tempfile.TemporaryDirectory() as td:
+            case_dir = Generator3D(td).generate("cuboid_meta", inputs)
+            mode_path = os.path.join(case_dir, "case_init_mode.json")
+            with open(mode_path, encoding="utf-8") as f:
+                before = json.load(f)
+            self.assertEqual(before.get("set_cmd"), "setRefinedFields")
+            self.assertIsNone(before.get("set_cmd_actual"))
+
+            updated = record_set_cmd_actual(
+                case_dir,
+                "setRefinedFields",
+                retries_used=0,
+                cells_inside_charge=64,
+            )
+            with open(mode_path, encoding="utf-8") as f:
+                after = json.load(f)
+        self.assertEqual(updated.get("set_cmd_actual"), "setRefinedFields")
+        self.assertEqual(after.get("set_cmd"), "setRefinedFields")
+        self.assertEqual(after.get("set_cmd_actual"), "setRefinedFields")
+        self.assertEqual(after.get("cells_inside_charge"), 64)
+        self.assertEqual(after.get("retries_used"), 0)
 
     def test_cuboid_init_only_runtime_smoke(self):
         if not self.wsl_ok:
@@ -121,32 +153,7 @@ class CuboidSetRefinedFieldsRuntimeTests(unittest.TestCase):
                 f"Detail: {self.wsl_detail}"
             )
 
-        inputs = CaseInputs3D(
-            min_point=(0.0, 0.0, 0.0),
-            max_point=(1.0, 1.0, 1.0),
-            cell_size=0.25,
-            charge_center=(0.5, 0.5, 0.5),
-            charge_shape="Cuboid",
-            mass_kg=0.2 * 0.2 * 0.2 * 1601.0,
-            cylinder_radius=0.05,
-            cylinder_axis="Z",
-            material_name="C4",
-            rho_charge=1601.0,
-            energy_j_per_kg=4.5e6,
-            p_atm=101325.0,
-            t_atm=288.0,
-            end_time_s=1e-4,
-            delta_t=1e-7,
-            write_interval_steps=10,
-            cores=1,
-            enable_dyn_refine=True,
-            charge_refinement_level=2,
-            charge_outer_refine_enable=False,
-            charge_length=0.2,
-            charge_width=0.2,
-            charge_height=0.2,
-            fast_run_mode=True,
-        )
+        inputs = _cuboid_seed2_inputs()
         with tempfile.TemporaryDirectory() as td:
             case_dir = Generator3D(td).generate("cuboid_smoke", inputs)
             linux_dir = win_to_wsl_path(case_dir)
@@ -176,31 +183,27 @@ class CuboidSetRefinedFieldsRuntimeTests(unittest.TestCase):
                 errors="replace",
             )
             combined = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
-            self.assertIn(
+            ctx = combined[-2500:]
+            for marker in (
+                "BLOCKMESH:0",
+                "SNAPPY:0",
+                "ADDPATCH:0",
+                "CHANGEDICT:0",
                 "SETREFINED:0",
-                combined,
-                f"setRefinedFields failed\n{combined[-2000:]}",
-            )
-            self.assertIn(
                 "ALPHA_CHECK:0",
-                combined,
-                f"alpha.c4 check failed\n{combined[-2000:]}",
-            )
+            ):
+                self.assertIn(marker, combined, f"missing {marker}\n{ctx}")
 
             ok, detail = _alpha_has_explosive_cells(case_dir)
-            self.assertTrue(ok, detail)
+            self.assertTrue(ok, f"{detail}\n{ctx}")
 
-            mode_path = os.path.join(case_dir, "case_init_mode.json")
-            with open(mode_path, encoding="utf-8") as f:
+            with open(os.path.join(case_dir, "case_init_mode.json"), encoding="utf-8") as f:
                 mode = json.load(f)
-            mode["set_cmd_actual"] = "setRefinedFields"
-            with open(mode_path, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(mode, f, indent=2)
-                f.write("\n")
-            with open(mode_path, encoding="utf-8") as f:
-                mode = json.load(f)
-            self.assertEqual(mode.get("set_cmd"), "setRefinedFields")
-            self.assertEqual(mode.get("set_cmd_actual"), "setRefinedFields")
+            self.assertEqual(
+                mode.get("set_cmd"),
+                "setRefinedFields",
+                f"generated metadata set_cmd mismatch\n{ctx}",
+            )
 
 
 if __name__ == "__main__":

@@ -164,6 +164,23 @@ class RunnerIntentTests(unittest.TestCase):
             with self.assertRaisesRegex(ExecutionPreparationError, "consistent latest"):
                 build_execution_plan(td, 2, ExecutionIntent.RESUME)
 
+    def test_serial_resume_rejects_inconsistent_processor_times(self):
+        """Serial resume must not silently take max(processor*) when ranks disagree."""
+        with tempfile.TemporaryDirectory() as td:
+            self._initialized_case(td)
+            os.makedirs(os.path.join(td, "processor0", "0.3"))
+            os.makedirs(os.path.join(td, "processor1", "0.2"))
+            with self.assertRaisesRegex(ExecutionPreparationError, "consistent latest"):
+                build_execution_plan(td, 1, ExecutionIntent.RESUME)
+
+    def test_serial_resume_rejects_partial_processor_saved_times(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._initialized_case(td)
+            os.makedirs(os.path.join(td, "processor0", "0.3"))
+            os.makedirs(os.path.join(td, "processor1"))  # no numeric time dirs
+            with self.assertRaisesRegex(ExecutionPreparationError, "consistent latest"):
+                build_execution_plan(td, 1, ExecutionIntent.RESUME)
+
     def test_one_step_accepts_initialized_zero(self):
         with tempfile.TemporaryDirectory() as td:
             self._initialized_case(td)
@@ -294,6 +311,160 @@ class RunnerIntentTests(unittest.TestCase):
 
             final_mock.assert_called_once()
             self.assertEqual(finished, [True])
+
+    def test_final_reconstruct_waits_for_inflight_exit(self):
+        from unittest.mock import MagicMock, patch
+        from solver_runner import SolverRunner
+
+        runner = SolverRunner(
+            win_case_dir=".",
+            openfoam_bashrc="/opt/openfoam9/etc/bashrc",
+            cores=2,
+        )
+        inflight = MagicMock()
+        polls = {"n": 0}
+
+        def poll():
+            polls["n"] += 1
+            return None if polls["n"] < 3 else 0
+
+        inflight.poll.side_effect = poll
+        runner._reconstruct_proc = inflight
+        with patch.object(runner, "_build_wsl_cmd", return_value=["true"]), \
+             patch("solver_runner.subprocess.run") as run_mock, \
+             patch.object(runner, "status_signal"), \
+             patch("solver_runner.time.sleep"):
+            run_mock.return_value = MagicMock(returncode=0)
+            rc = runner._final_reconstruct_latest()
+        self.assertEqual(rc, 0)
+        run_mock.assert_called_once()
+        self.assertGreaterEqual(polls["n"], 3)
+
+    def test_final_reconstruct_timeout_does_not_launch_second(self):
+        from unittest.mock import MagicMock, patch
+        from solver_runner import SolverRunner
+
+        runner = SolverRunner(
+            win_case_dir=".",
+            openfoam_bashrc="/opt/openfoam9/etc/bashrc",
+            cores=2,
+        )
+        statuses = []
+        with patch.object(runner, "_wait_for_inflight_reconstruction", return_value=False), \
+             patch("solver_runner.subprocess.run") as run_mock, \
+             patch.object(runner, "status_signal") as status_sig:
+            status_sig.emit.side_effect = lambda msg: statuses.append(msg)
+            rc = runner._final_reconstruct_latest()
+        self.assertEqual(rc, 1)
+        run_mock.assert_not_called()
+        self.assertTrue(any("timeout" in s.lower() for s in statuses))
+
+    def test_wait_timeout_terminates_and_kills_when_needed(self):
+        from unittest.mock import MagicMock, patch
+        from solver_runner import SolverRunner
+
+        runner = SolverRunner(
+            win_case_dir=".",
+            openfoam_bashrc="/opt/openfoam9/etc/bashrc",
+            cores=2,
+        )
+        inflight = MagicMock()
+
+        def poll():
+            # Exit only after kill — proves terminate alone was insufficient.
+            return 0 if inflight.kill.called else None
+
+        inflight.poll.side_effect = poll
+        runner._reconstruct_proc = inflight
+        clock = {"t": 0.0}
+
+        def fake_time():
+            return clock["t"]
+
+        def fake_sleep(_dt):
+            # Advance past wait timeout, then past terminate grace.
+            if not inflight.terminate.called:
+                clock["t"] = 121.0
+            elif not inflight.kill.called:
+                clock["t"] = 124.0
+            else:
+                clock["t"] += 0.1
+
+        with patch("solver_runner.time.time", side_effect=fake_time), \
+             patch("solver_runner.time.sleep", side_effect=fake_sleep):
+            ok = runner._wait_for_inflight_reconstruction(timeout_s=120.0)
+        self.assertFalse(ok)
+        inflight.terminate.assert_called_once()
+        inflight.kill.assert_called_once()
+
+    def test_wait_timeout_terminates_without_kill_when_exit_prompt(self):
+        from unittest.mock import MagicMock, patch
+        from solver_runner import SolverRunner
+
+        runner = SolverRunner(
+            win_case_dir=".",
+            openfoam_bashrc="/opt/openfoam9/etc/bashrc",
+            cores=2,
+        )
+        inflight = MagicMock()
+
+        def poll():
+            return 0 if inflight.terminate.called else None
+
+        inflight.poll.side_effect = poll
+        runner._reconstruct_proc = inflight
+        clock = {"t": 0.0}
+
+        def fake_time():
+            return clock["t"]
+
+        def fake_sleep(_dt):
+            if not inflight.terminate.called:
+                clock["t"] = 121.0
+            else:
+                clock["t"] += 0.1
+
+        with patch("solver_runner.time.time", side_effect=fake_time), \
+             patch("solver_runner.time.sleep", side_effect=fake_sleep):
+            ok = runner._wait_for_inflight_reconstruction(timeout_s=120.0)
+        self.assertFalse(ok)
+        inflight.terminate.assert_called_once()
+        inflight.kill.assert_not_called()
+
+    def test_final_reconstruct_failure_marks_run_unsuccessful(self):
+        from unittest.mock import MagicMock, patch
+        from solver_runner import SolverRunner
+
+        with tempfile.TemporaryDirectory() as td:
+            self._initialized_case(td)
+            os.makedirs(os.path.join(td, "0.1"))
+            os.makedirs(os.path.join(td, "processor0", "0.1"))
+            os.makedirs(os.path.join(td, "processor1", "0.1"))
+            runner = SolverRunner(
+                win_case_dir=td,
+                openfoam_bashrc="/opt/openfoam9/etc/bashrc",
+                project_root=td,
+                cores=2,
+                intent=ExecutionIntent.RESUME,
+            )
+            mock_proc = MagicMock()
+            mock_proc.poll.side_effect = [None, 0, 0]
+            finished = []
+            with patch.object(runner, "_build_wsl_cmd", return_value=["true"]), \
+                 patch("solver_runner.subprocess.Popen", return_value=mock_proc), \
+                 patch.object(runner, "_final_reconstruct_latest", return_value=1), \
+                 patch.object(runner, "_maybe_reconstruct_new_times"), \
+                 patch.object(runner, "_check_watchdog_trigger"), \
+                 patch.object(runner, "_maybe_stop_after_watchdog"), \
+                 patch.object(runner, "_discover_probe_file", return_value=None), \
+                 patch.object(runner, "_find_control_dict_end_time"), \
+                 patch.object(runner, "finished_signal") as fin_sig, \
+                 patch.object(runner, "status_signal"), \
+                 patch.object(runner, "progress_signal"), \
+                 patch.object(runner, "data_signal"):
+                fin_sig.emit.side_effect = lambda ok: finished.append(ok)
+                runner.run()
+            self.assertEqual(finished, [False])
 
 
 class CaptureGuardTests(unittest.TestCase):

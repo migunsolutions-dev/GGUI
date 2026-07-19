@@ -67,7 +67,8 @@ def build_execution_plan(
     per_processor_times = [_numeric_time_dirs(path) for path in processor_dirs]
     resume = intent in (ExecutionIntent.RESUME, ExecutionIntent.ONE_STEP_RESUME)
 
-    # Consistent processor latest only when every rank reports the same max time.
+    # Consistent processor latest only when every discovered rank reports the same max time.
+    # This rule applies for both serial and parallel resume — never silently take max().
     processor_latest: Optional[float] = None
     if processor_dirs:
         latest_values = [max(times) if times else None for times in per_processor_times]
@@ -78,17 +79,16 @@ def build_execution_plan(
                 raise ExecutionPreparationError(
                     f"Processor state has {len(processor_dirs)} directories but the GUI requests {cores} cores."
                 )
-            if resume and len(set(latest_values)) != 1:
+        if resume:
+            if len(set(latest_values)) != 1:
                 raise ExecutionPreparationError(
                     "Processor directories do not share one consistent latest saved time; "
                     "reconstruct or repair the case before resuming."
                 )
-            if latest_values and latest_values[0] is not None and len(set(latest_values)) == 1:
+            if latest_values and latest_values[0] is not None:
                 processor_latest = latest_values[0]
-        else:
-            # Serial resume: use max across ranks (reconstructPar -latestTime will unify).
-            rank_maxes = [t for t in latest_values if t is not None]
-            processor_latest = max(rank_maxes) if rank_maxes else None
+        elif latest_values and latest_values[0] is not None and len(set(latest_values)) == 1:
+            processor_latest = latest_values[0]
 
     latest: Optional[float] = None
     if resume:
@@ -427,21 +427,55 @@ class SolverRunner(QThread):
         except Exception:
             self._reconstruct_proc = None
 
-    def _wait_for_inflight_reconstruction(self, timeout_s: float = 120.0) -> None:
-        """Block until any in-flight reconstructPar -newTimes process exits."""
+    def _wait_for_inflight_reconstruction(self, timeout_s: float = 120.0) -> bool:
+        """Wait for any in-flight reconstructPar -newTimes process.
+
+        Returns True if there is no in-flight process or it exits before timeout.
+        On timeout: terminate (then kill if needed) the owned child and return False.
+        Never leaves a reconstruction child running when False is returned and kill succeeds.
+        """
         proc = self._reconstruct_proc
         if proc is None or proc.poll() is not None:
-            return
+            return True
         deadline = time.time() + timeout_s
         while proc.poll() is None and time.time() < deadline:
             time.sleep(0.1)
+        if proc.poll() is not None:
+            return True
+
+        # Timeout: stop the owned child before any final reconstructPar -latestTime.
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        stop_deadline = time.time() + 2.0
+        while proc.poll() is None and time.time() < stop_deadline:
+            time.sleep(0.05)
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            kill_deadline = time.time() + 1.0
+            while proc.poll() is None and time.time() < kill_deadline:
+                time.sleep(0.05)
+        if proc.poll() is not None:
+            self._reconstruct_proc = None
+        return False
 
     def _final_reconstruct_latest(self) -> int:
         """Deterministic post-parallel reconstruct so the serial case has the latest result.
 
-        Returns the subprocess exit code (0 on success).
+        Returns the subprocess exit code (0 on success). Does not launch a second
+        reconstructPar while an earlier reconstruction is still active or after a
+        wait timeout.
         """
-        self._wait_for_inflight_reconstruction()
+        if not self._wait_for_inflight_reconstruction():
+            self.status_signal.emit(
+                "Final reconstruction skipped: in-flight reconstructPar did not finish "
+                "and was stopped after timeout. Check log.reconstructPar / debug_summary.txt."
+            )
+            return 1
         self.status_signal.emit("Final reconstruction (reconstructPar -latestTime)...")
         try:
             args = self._build_wsl_cmd(self._linux_case_dir, FINAL_RECONSTRUCT_CMD)

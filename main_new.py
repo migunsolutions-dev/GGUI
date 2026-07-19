@@ -33,6 +33,7 @@ from path_utils import get_latest_time_dir, win_to_wsl_path
 from case_loader import load_case
 from initialization_plan import build_initialization_plan
 from startup_capture_guard import UNSAFE_CAPTURE_MESSAGE, require_safe_capture
+from case_init_mode import record_set_cmd_actual
 from project_io import (
     PROJECT_SUFFIX,
     ProjectFormatError,
@@ -934,22 +935,20 @@ class BlastFoamApp(QMainWindow):
                     self.status_bar.set_status("Init Failed", "#e74c3c")
                     QMessageBox.critical(self, "Init Error", "Mesh initialization failed. Check console output for details.")
                     return
+                final_mode = None
                 if not use_remap:
-                    mode_path = os.path.join(case_dir, "case_init_mode.json")
                     try:
-                        import json
-                        with open(mode_path, "r", encoding="utf-8") as f:
-                            mode = json.load(f)
+                        charge_cells = None
                         if get_charge_cell_count and os.path.isfile(os.path.join(case_dir, "0", "alpha.c4")):
                             charge_cells, _ = get_charge_cell_count(case_dir, "0", 0.5)
-                            mode["cells_inside_charge"] = charge_cells
-                        mode["retries_used"] = retries_used
-                        mode["set_cmd_actual"] = set_cmd_actual
-                        with open(mode_path, "w", encoding="utf-8") as f:
-                            json.dump(mode, f, indent=2)
-                    except (OSError, ValueError, KeyError):
-                        pass
-                final_mode = mode if not use_remap else None
+                        final_mode = record_set_cmd_actual(
+                            case_dir,
+                            set_cmd_actual,
+                            retries_used=retries_used,
+                            cells_inside_charge=charge_cells,
+                        )
+                    except (OSError, ValueError, KeyError, TypeError):
+                        final_mode = None
                 
                 # Update viewer with charge center (no auto-adjust; user position is used)
                 self.tab_3d.viewer.load_case(
