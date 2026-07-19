@@ -4,12 +4,161 @@ import glob
 import time
 import shlex
 import subprocess
+from dataclasses import dataclass
+from enum import Enum
 from typing import Optional, Tuple, List
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
 # Number of tail lines to capture from each log file for debug_summary.txt
 DEBUG_TAIL_LINES = 50
+
+
+class ExecutionIntent(str, Enum):
+    FRESH_FULL_PIPELINE = "fresh_full_pipeline"
+    INITIALIZED_SOLVER_RUN = "initialized_solver_run"
+    RESUME = "resume"
+    ONE_STEP_RESUME = "one_step_resume"
+
+
+class ExecutionPreparationError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ExecutionPlan:
+    intent: ExecutionIntent
+    command: str
+    latest_time: Optional[float]
+    log_name: str = "log.blastFoam"
+
+
+def _numeric_time_dirs(path: str) -> List[float]:
+    values: List[float] = []
+    if not os.path.isdir(path):
+        return values
+    for name in os.listdir(path):
+        try:
+            value = float(name)
+        except ValueError:
+            continue
+        if value > 0 and os.path.isdir(os.path.join(path, name)):
+            values.append(value)
+    return values
+
+
+def build_execution_plan(
+    case_dir: str,
+    cores: int,
+    intent: ExecutionIntent,
+) -> ExecutionPlan:
+    """Build a non-destructive solver command for an already generated case."""
+    cores = max(1, int(cores))
+    if intent == ExecutionIntent.FRESH_FULL_PIPELINE:
+        return ExecutionPlan(intent, "bash ./Allrun", None, "log.Allrun")
+
+    serial_times = _numeric_time_dirs(case_dir)
+    serial_latest = max(serial_times) if serial_times else None
+    processor_dirs = sorted(
+        path
+        for path in glob.glob(os.path.join(case_dir, "processor[0-9]*"))
+        if os.path.isdir(path)
+    )
+    per_processor_times = [_numeric_time_dirs(path) for path in processor_dirs]
+    resume = intent in (ExecutionIntent.RESUME, ExecutionIntent.ONE_STEP_RESUME)
+
+    # Consistent processor latest only when every discovered rank reports the same max time.
+    # This rule applies for both serial and parallel resume — never silently take max().
+    processor_latest: Optional[float] = None
+    if processor_dirs:
+        latest_values = [max(times) if times else None for times in per_processor_times]
+        if cores > 1:
+            expected = {f"processor{i}" for i in range(cores)}
+            actual = {os.path.basename(path) for path in processor_dirs}
+            if actual != expected:
+                raise ExecutionPreparationError(
+                    f"Processor state has {len(processor_dirs)} directories but the GUI requests {cores} cores."
+                )
+        if resume:
+            if len(set(latest_values)) != 1:
+                raise ExecutionPreparationError(
+                    "Processor directories do not share one consistent latest saved time; "
+                    "reconstruct or repair the case before resuming."
+                )
+            if latest_values and latest_values[0] is not None:
+                processor_latest = latest_values[0]
+        elif latest_values and latest_values[0] is not None and len(set(latest_values)) == 1:
+            processor_latest = latest_values[0]
+
+    latest: Optional[float] = None
+    if resume:
+        # latest_time must match the state the solver will actually use.
+        if cores == 1:
+            if processor_latest is not None and (
+                serial_latest is None or processor_latest > serial_latest
+            ):
+                latest = processor_latest
+            else:
+                latest = serial_latest
+        else:
+            if serial_latest is not None and (
+                processor_latest is None or serial_latest > processor_latest
+            ):
+                latest = serial_latest
+            elif processor_latest is not None:
+                latest = processor_latest
+            else:
+                latest = serial_latest
+    else:
+        candidates = [t for t in (serial_latest, processor_latest) if t is not None]
+        latest = max(candidates) if candidates else None
+
+    if intent == ExecutionIntent.ONE_STEP_RESUME and latest is None:
+        zero_dir = os.path.join(processor_dirs[0] if processor_dirs else case_dir, "0")
+        if os.path.isdir(zero_dir) and os.path.isfile(os.path.join(zero_dir, "p")):
+            latest = 0.0
+    if resume and latest is None:
+        raise ExecutionPreparationError(
+            "No resumable saved time exists. Initialize and run the case before Resume/Exact 1."
+        )
+
+    if cores == 1:
+        start_mode = "latestTime" if resume else "startTime"
+        prep = ""
+        if resume and processor_dirs:
+            if processor_latest is not None and (
+                serial_latest is None or processor_latest > serial_latest
+            ):
+                prep = "reconstructPar -latestTime > log.reconstructResume 2>&1 && "
+        cmd = (
+            f"set -o pipefail; foamDictionary system/controlDict -entry startFrom -set {start_mode} "
+            f"> log.prepareSolver 2>&1 && {prep}blastFoam 2>&1 | tee log.blastFoam"
+        )
+        return ExecutionPlan(intent, cmd, latest)
+
+    prep = ""
+    if resume and processor_dirs:
+        if serial_latest is not None and (
+            processor_latest is None or serial_latest > processor_latest
+        ):
+            # Serial state is ahead: re-decompose latest serial time into processors.
+            prep = "decomposePar -force -latestTime > log.decomposeParSolver 2>&1 && "
+        # else: consistent processor state is newer or equal — reuse it.
+    elif not processor_dirs:
+        # Decompose the initialized time 0 for a new run, or only the latest
+        # reconstructed serial state for resume. Neither path cleans the case.
+        decompose_opt = "-force -latestTime" if resume else "-force"
+        prep = f"decomposePar {decompose_opt} > log.decomposeParSolver 2>&1 && "
+    start_mode = "latestTime" if resume else "startTime"
+    cmd = (
+        f"set -o pipefail; foamDictionary system/controlDict -entry startFrom -set {start_mode} "
+        f"> log.prepareSolver 2>&1 && {prep}"
+        f"mpirun -np {cores} blastFoam -parallel 2>&1 | tee log.blastFoam"
+    )
+    return ExecutionPlan(intent, cmd, latest)
+
+
+FINAL_RECONSTRUCT_CMD = "reconstructPar -latestTime > log.reconstructFinal 2>&1"
 
 
 class SolverRunner(QThread):
@@ -35,12 +184,14 @@ class SolverRunner(QThread):
         openfoam_bashrc: str = "/opt/openfoam9/etc/bashrc",
         project_root: Optional[str] = None,
         cores: int = 1,
+        intent: ExecutionIntent = ExecutionIntent.FRESH_FULL_PIPELINE,
     ):
         super().__init__()
         self.win_case_dir = win_case_dir
         self.openfoam_bashrc = openfoam_bashrc
         self.project_root = project_root
         self.cores = max(1, int(cores))
+        self.intent = ExecutionIntent(intent)
         self.keep_running = True
         self._proc: Optional[subprocess.Popen] = None
 
@@ -161,7 +312,8 @@ class SolverRunner(QThread):
             "=== Simulation failure: automatic error summary ===",
             "",
             f"Case directory: {self.win_case_dir}",
-            f"Allrun exit code: {exit_code}",
+            f"Execution intent: {self.intent.value}",
+            f"Process exit code: {exit_code}",
             "",
             "--- Last {} lines of each log file (newest first) ---".format(DEBUG_TAIL_LINES),
             "",
@@ -274,6 +426,68 @@ class SolverRunner(QThread):
             )
         except Exception:
             self._reconstruct_proc = None
+
+    def _wait_for_inflight_reconstruction(self, timeout_s: float = 120.0) -> bool:
+        """Wait for any in-flight reconstructPar -newTimes process.
+
+        Returns True if there is no in-flight process or it exits before timeout.
+        On timeout: terminate (then kill if needed) the owned child and return False.
+        Never leaves a reconstruction child running when False is returned and kill succeeds.
+        """
+        proc = self._reconstruct_proc
+        if proc is None or proc.poll() is not None:
+            return True
+        deadline = time.time() + timeout_s
+        while proc.poll() is None and time.time() < deadline:
+            time.sleep(0.1)
+        if proc.poll() is not None:
+            return True
+
+        # Timeout: stop the owned child before any final reconstructPar -latestTime.
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        stop_deadline = time.time() + 2.0
+        while proc.poll() is None and time.time() < stop_deadline:
+            time.sleep(0.05)
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            kill_deadline = time.time() + 1.0
+            while proc.poll() is None and time.time() < kill_deadline:
+                time.sleep(0.05)
+        if proc.poll() is not None:
+            self._reconstruct_proc = None
+        return False
+
+    def _final_reconstruct_latest(self) -> int:
+        """Deterministic post-parallel reconstruct so the serial case has the latest result.
+
+        Returns the subprocess exit code (0 on success). Does not launch a second
+        reconstructPar while an earlier reconstruction is still active or after a
+        wait timeout.
+        """
+        if not self._wait_for_inflight_reconstruction():
+            self.status_signal.emit(
+                "Final reconstruction skipped: in-flight reconstructPar did not finish "
+                "and was stopped after timeout. Check log.reconstructPar / debug_summary.txt."
+            )
+            return 1
+        self.status_signal.emit("Final reconstruction (reconstructPar -latestTime)...")
+        try:
+            args = self._build_wsl_cmd(self._linux_case_dir, FINAL_RECONSTRUCT_CMD)
+            completed = subprocess.run(
+                args,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return int(completed.returncode)
+        except Exception:
+            return 1
 
     def _check_watchdog_trigger(self, case_dir: str) -> None:
         """If 1D case has watchdog_probe and pressure at target radius > 1.5e5 Pa, create 'stop' for graceful exit."""
@@ -406,16 +620,26 @@ class SolverRunner(QThread):
         linux_dir = self._linux_case_dir
         self._find_control_dict_end_time()
 
-        self.status_signal.emit("Preparing scripts...")
-        self._run_simple(linux_dir, r"sed -i 's/\r$//' Allrun Allclean 2>/dev/null || true")
-        self._run_simple(linux_dir, "chmod +x Allrun Allclean 2>/dev/null || true")
-
-        self.status_signal.emit("Running Allrun...")
-        args = self._build_wsl_cmd(linux_dir, "bash ./Allrun")
+        try:
+            execution = build_execution_plan(
+                self.win_case_dir, self.cores, self.intent
+            )
+        except ExecutionPreparationError as exc:
+            self.status_signal.emit(str(exc))
+            self.finished_signal.emit(False)
+            return
+        if self.intent == ExecutionIntent.FRESH_FULL_PIPELINE:
+            self.status_signal.emit("Preparing fresh-run scripts...")
+            self._run_simple(linux_dir, r"sed -i 's/\r$//' Allrun Allclean 2>/dev/null || true")
+            self._run_simple(linux_dir, "chmod +x Allrun Allclean 2>/dev/null || true")
+        self.status_signal.emit(f"Running: {self.intent.value}")
+        args = self._build_wsl_cmd(linux_dir, execution.command)
         try:
             self._proc = subprocess.Popen(args)
         except Exception as e:
-            self.status_signal.emit(f"Failed to start Allrun: {e}")
+            self.status_signal.emit(
+                f"Failed command `{execution.command}`: {e}. Log: {execution.log_name}"
+            )
             self.finished_signal.emit(False)
             return
 
@@ -481,10 +705,23 @@ class SolverRunner(QThread):
             return
 
         if rc == 0:
+            if self.cores > 1 and self.intent != ExecutionIntent.FRESH_FULL_PIPELINE:
+                recon_rc = self._final_reconstruct_latest()
+                if recon_rc != 0:
+                    self._write_debug_summary(recon_rc)
+                    self.status_signal.emit(
+                        f"Solver finished but final reconstructPar -latestTime failed "
+                        f"(rc={recon_rc}). Log: log.reconstructFinal, debug_summary.txt."
+                    )
+                    self.finished_signal.emit(False)
+                    return
             self.progress_signal.emit(100)
             self.status_signal.emit("Finished.")
             self.finished_signal.emit(True)
         else:
             self._write_debug_summary(rc)
-            self.status_signal.emit(f"Failed (rc={rc}). See debug_summary.txt.")
+            self.status_signal.emit(
+                f"Failed command `{execution.command}` (rc={rc}). "
+                f"Logs: {execution.log_name}, debug_summary.txt."
+            )
             self.finished_signal.emit(False)

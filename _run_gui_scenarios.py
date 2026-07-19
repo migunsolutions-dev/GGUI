@@ -12,6 +12,7 @@ generated case matches what the user configured in the GUI.
 from __future__ import annotations
 
 import math
+import json
 import os
 import re
 import sys
@@ -174,8 +175,9 @@ def expect_sphere_b3d(res: Result, case_dir: str) -> None:
     assert_in(res, sf, "refineInternal yes", "setFieldsDict uses native refineInternal")
     assert_in(res, sf, "level 5", "setFieldsDict level=5")
     assert_in(res, sf, "backup", "setFieldsDict has backup region")
-    # Auto capture: max(1.05*R, 0.5*sqrt(3)*dx*factor) with dx=0.5, factor=1, R~0.155 m → ~0.433 m
-    assert_match(res, sf, r"radius\s+0\.43[0-9]", "backup.radius matches auto charge capture policy")
+    # Auto capture uses the unchanged CAPTURE_CELL_SAFETY=1.5 floor:
+    # 0.5*sqrt(3)*0.5*1.5 = 0.649519 m.
+    assert_match(res, sf, r"radius\s+0\.6495", "backup.radius matches auto charge capture policy")
     assert_in(res, dm, "adaptiveFvMesh", "dynamicMeshDict adaptive")
     assert_in(res, dm, "maxRefinement   1", "dynamicMeshDict maxRefinement=1")
     assert_in(res, dm, "dumpLevel      true", "dumpLevel true (allows level field decay visualization)")
@@ -209,7 +211,9 @@ SCENARIOS.append(("sphere_fine_no_inside", scenario_sphere_fine_no_inside, expec
 def scenario_sphere_fixed(tab: TabGeneral3D) -> None:
     _set_domain(tab, (-5, 5), (-5, 5), (0, 5), 0.5)
     tab.c_mat.setCurrentText("C4")
-    _set_charge(tab, "Sphere", 25.0, 1601.0, (0.0, 0.0, 0.5))
+    # Place charge on an aligned base-cell centre so Fixed Mesh (seed=0, no band)
+    # remains a valid generate path under the central capture guard.
+    _set_charge(tab, "Sphere", 25.0, 1601.0, (0.25, 0.25, 0.25))
     _select_fixed(tab)
     _set_charge_refine(tab, inside=5, outer_min=2, outer_max=3)
 
@@ -265,6 +269,28 @@ def expect_cuboid(res: Result, case_dir: str) -> None:
     assert_in(res, dm, "adaptiveFvMesh", "AMR enabled")
     assert_in(res, sn, "searchableBox", "snappy outer transition uses box for Cuboid charge")
 SCENARIOS.append(("cuboid_standard", scenario_cuboid, expect_cuboid))
+
+
+def scenario_cuboid_refined(tab: TabGeneral3D) -> None:
+    scenario_cuboid(tab)
+    _set_charge_refine(tab, inside=2, outer_min=2, outer_max=3)
+
+
+def expect_cuboid_refined(res: Result, case_dir: str) -> None:
+    sf = read(case_dir, "system/setFieldsDict")
+    allrun = read(case_dir, "Allrun")
+    mode = json.loads(read(case_dir, "case_init_mode.json"))
+    assert_in(res, sf, "boxToCell", "Cuboid refined path keeps boxToCell geometry")
+    assert_in(res, sf, "refineInternal yes", "Cuboid refined path requests internal refinement")
+    assert_runs_cmd(res, allrun, "setRefinedFields", "Cuboid Allrun executes setRefinedFields")
+    res.add(mode.get("set_cmd") == "setRefinedFields", "Cuboid metadata command matches Allrun")
+    res.add(
+        bool((mode.get("startup_mesh_metadata") or {}).get("startup_mesh", {}).get("uses_set_refined_fields")),
+        "Cuboid startup metadata reports setRefinedFields",
+    )
+
+
+SCENARIOS.append(("cuboid_refined_consistency", scenario_cuboid_refined, expect_cuboid_refined))
 
 
 def scenario_sphere_factor3(tab: TabGeneral3D) -> None:

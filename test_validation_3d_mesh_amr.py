@@ -38,6 +38,7 @@ def _case(**kw) -> CaseInputs3D:
         refine_max=3,
         dyn_refine_max=1,
         charge_refinement_level=2,
+        charge_outer_refine_enable=True,
         charge_outer_refine_min=2,
         charge_outer_refine_max=3,
         charge_capture_mode="auto",
@@ -162,7 +163,7 @@ class CuboidTransitionValidation(unittest.TestCase):
             self.assertGreater(float(geom.get(k, 0.0)), 0.0, msg=f"{k} must be positive for real cuboid metadata")
         self.assertNotRegex(mode.get("charge_size_info", ""), r"length=0 m")
 
-    def test_cuboid_inside_level_warns(self) -> None:
+    def test_cuboid_inside_level_uses_authoritative_refined_path(self) -> None:
         inp = _case(
             charge_shape="Cuboid",
             charge_length=0.4,
@@ -174,8 +175,14 @@ class CuboidTransitionValidation(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as td:
             gen = Generator3D(td)
-            gen.generate("box_warn", inp)
-        self.assertTrue(any("Cuboid with Inside refinement" in w for w in gen._charge_warnings))
+            case_dir = gen.generate("box_refined", inp)
+            with open(os.path.join(case_dir, "case_init_mode.json"), encoding="utf-8") as f:
+                mode = json.load(f)
+            with open(os.path.join(case_dir, "Allrun"), encoding="utf-8") as f:
+                allrun = f.read()
+        self.assertEqual(mode["set_cmd"], "setRefinedFields")
+        self.assertTrue(mode["startup_mesh_metadata"]["startup_mesh"]["uses_set_refined_fields"])
+        self.assertIn("setRefinedFields > log.setRefinedFields", allrun)
 
 
 class CuboidChargeMetadataValidation(unittest.TestCase):

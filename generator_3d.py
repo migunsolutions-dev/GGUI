@@ -12,9 +12,11 @@ except ImportError:
 from base_generator import BaseGenerator
 from charge_capture import resolve_charge_capture_radius_m, CAPTURE_CELL_SAFETY
 from startup_mesh_metadata import build_startup_mesh_metadata, flatten_warnings_for_charge_warnings
+from initialization_plan import build_initialization_plan, outer_band_level_string
 from mesh_domain import align_domain_to_cell_size
 from models import CaseInputs3D
 from path_utils import get_latest_time_dir, win_to_wsl_path
+from startup_capture_guard import require_safe_capture
 
 
 def effective_charge_refine(inputs) -> int:
@@ -852,6 +854,10 @@ class Generator3D(BaseGenerator):
         except ValueError as e:
             raise ValueError(f"Invalid 3D inputs: {e}") from e
 
+        # Central non-mutating guard: blocks unsafe seed-0/no-band capture for all
+        # non-remap entry points (GUI, SimulationService, direct Generator3D.generate).
+        require_safe_capture(inputs)
+
         try:
             align = align_domain_to_cell_size(inputs.min_point, inputs.max_point, inputs.cell_size)
             inputs = replace(inputs, min_point=align.min_point, max_point=align.max_point)
@@ -868,17 +874,7 @@ class Generator3D(BaseGenerator):
             obstacle_patch_names = self._get_obstacle_patch_names(inputs)
 
             remap_enabled = getattr(inputs, "remap_enabled", False)
-            if (
-                not remap_enabled
-                and getattr(inputs, "charge_shape", "") == "Cuboid"
-                and int(getattr(inputs, "charge_refinement_level", 0) or 0) > 0
-            ):
-                self._charge_warnings.append(
-                    "Cuboid with Inside refinement (charge_refinement_level > 0): initialization uses "
-                    "setRefinedFields with boxToCell and refineInternal. Compatibility depends on your blastFoam "
-                    "build; if meshing/init fails, use a finer base mesh or sphere/cylinder charge. "
-                    "The snappy transition region is still a searchableBox sized by outside_extent / auto policy."
-                )
+            init_plan = build_initialization_plan(inputs)
             mapped_source_dir_linux = None
             mapped_source_time = None
             remap_case_path = getattr(inputs, "remap_case_path", "") or ""
@@ -907,17 +903,7 @@ class Generator3D(BaseGenerator):
             remap_start_time = mapped_source_time if remap_enabled else None
             # Single source of truth for startup charge-region refinement: Charge pre-refinement UI (charge_refinement_level).
             # Only in Dyn Mesh mode and when charge pre-refinement is requested (level > 0).
-            enable_dyn = getattr(inputs, "enable_dyn_refine", None)
-            charge_level = getattr(inputs, "charge_refinement_level", 0) or 0
-            startup_charge_refine = (
-                not remap_enabled
-                and enable_dyn
-                and charge_level > 0
-            )
-            use_set_refined = (
-                startup_charge_refine
-                and getattr(inputs, "charge_shape", "") in ("Sphere", "Cylinder", "Cuboid")
-            )
+            use_set_refined = init_plan.uses_set_refined_fields
             self._write_system_files_3d(case_dir, inputs, dims, remap_start_time=remap_start_time, use_set_refined_allrun=use_set_refined, use_seed_bubble=False)
 
             if remap_enabled and mapped_source_dir_linux and mapped_source_time:
@@ -956,7 +942,7 @@ class Generator3D(BaseGenerator):
                 charge_capture_impossible_message=None,
                 envelope_empty_message=None,
                 charge_region_empty_message=None,
-                placement_use_setfields=use_set_refined and getattr(inputs, "charge_shape", "") == "Cuboid",
+                placement_use_setfields=False,
                 fast_run_mode=getattr(inputs, "fast_run_mode", True),
             )
 
@@ -967,12 +953,13 @@ class Generator3D(BaseGenerator):
                 ign_rad = getattr(self, "_last_initiation_radius_effective", 0.05)
                 ign_rad_req = getattr(self, "_last_initiation_radius_requested", 0.05)
                 obs_refine = inputs.obstacles[0].refinement_level if inputs.obstacles else 0
-                placement_use_setfields = use_set_refined and getattr(inputs, "charge_shape", "") == "Cuboid"
                 cr_req = int(getattr(inputs, "charge_refinement_level", 0) or 0)
                 cr_dict = int(getattr(self, "_last_charge_refinement_dict_level", cr_req))
                 _ref_role_warn = self._refinement_role_warnings(inputs)
                 mode = {
-                    "set_cmd": "setFields" if placement_use_setfields else ("setRefinedFields" if use_set_refined else "setFields"),
+                    "set_cmd": init_plan.command,
+                    "set_cmd_actual": None,
+                    "initialization_plan": init_plan.to_dict(),
                     "fallback_reason": None,
                     "initiation_radius_requested": ign_rad_req,
                     "initiation_radius_effective": ign_rad,
@@ -1060,8 +1047,8 @@ class Generator3D(BaseGenerator):
                     base_cell_size_m=float(mode.get("base_cell_size") or getattr(inputs, "cell_size", 0.5)),
                     charge_shape=str(mode.get("charge_shape") or getattr(inputs, "charge_shape", "Sphere")),
                     seed_requested=int(cr_req),
-                    seed_effective=int(cr_dict) if use_set_refined else 0,
-                    uses_set_refined_fields=bool(use_set_refined),
+                    seed_effective=int(cr_dict) if init_plan.uses_set_refined_fields else 0,
+                    uses_set_refined_fields=init_plan.uses_set_refined_fields,
                     set_cmd=str(mode.get("set_cmd") or ""),
                     charge_refine_outer_enabled=bool(_add_outer),
                     outer_snappy_level_min=_outer_min,
@@ -1198,23 +1185,14 @@ p { boundaryField { internalPatch { type internal; } "obs.*" { type zeroGradient
         coexist in snappy refinementRegions — snappy takes the per-cell maximum, so the inner
         region reaches inside_level and the surrounding band reaches outer_max.
         Fixed Mesh: no charge outer refinement.
+
+        Dyn Mesh gating matches initialization_plan.effective_dyn_refine_enabled /
+        outer_band_level_string (shared with the capture guard).
         """
-        if getattr(inputs, "enable_dyn_refine", None) is False:
+        level_str = outer_band_level_string(inputs)
+        if level_str is None:
             return False, None
-        enable = getattr(inputs, "charge_outer_refine_enable", None)
-        if enable is False:
-            return False, None
-        rmin_outer = getattr(inputs, "charge_outer_refine_min", None)
-        rmax_outer = getattr(inputs, "charge_outer_refine_max", None)
-        # Use charge_outer_* when explicitly set (None = fallback to global refine_min/refine_max); 0 is valid
-        rmin = rmin_outer if rmin_outer is not None else getattr(inputs, "refine_min", 2)
-        rmax = rmax_outer if rmax_outer is not None else getattr(inputs, "refine_max", 3)
-        if rmin == 0 and rmax == 0:
-            return False, None
-        if not getattr(inputs, "enable_local_refinement", True):
-            return True, "2 2"
-        rmax = max(rmin, rmax)
-        return True, f"{rmin} {rmax}"
+        return True, level_str
 
     def _characteristic_charge_extent_m(self, inputs: CaseInputs3D, dims: Dict[str, float]) -> float:
         """Single length scale for legacy auto outside_extent (shell beyond charge)."""

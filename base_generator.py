@@ -216,10 +216,9 @@ python3 remap_radial.py > log.remap_radial 2>&1
 bash ./check_alpha_c4.sh || exit 1
 """
             if use_set_refined:
-                # setRefinedFields only places charge; refinement inside charge is done by topoSet chargeRegion + refineMesh (before addEmptyPatch) when use_charge_interior_refinement.
-                # When use_charge_interior_refinement: mesh refinement metadata was removed, so setRefinedFields must run with -noRefine (placement-only; no refinement).
-                # Cuboid uses setFields for placement (setRefinedFields does not support boxToCell); mesh already refined by topoSet/refineMesh.
-                # Resize 0/ to refined mesh first: setRefinedFields -noRefine with minimal dict, then setFields to fill box.
+                # Native startup refinement and placement are performed by
+                # setRefinedFields for sphereToCell, cylinderToCell, and boxToCell.
+                # The legacy manual-refinement path retains placement-only support.
                 if use_charge_interior_refinement and placement_use_setfields:
                     init_fields_block = """
 # 7. Initialize Fields (Cuboid: 0.orig/alpha.c4 is uniform 0 and valid for any mesh size;

@@ -83,7 +83,10 @@ class BlastViewerWidget(QWidget):
         self._dynamic_actors: List = []
         self._obstacle_actors: List = []
         self._init_ui()
-        if HAS_PV: self._init_vtk()
+        # Headless Qt regression runs must not create an interactive OpenGL
+        # context. The data/model paths remain fully testable offscreen.
+        if HAS_PV and os.environ.get("QT_QPA_PLATFORM", "").lower() != "offscreen":
+            self._init_vtk()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)

@@ -21,12 +21,27 @@ from tab_log import LogTab
 from tab_3d_general import TabGeneral3D
 from tab_probes import TabProbes
 from probes_model import ProbesModel
-from solver_runner import SolverRunner
+from solver_runner import (
+    ExecutionIntent,
+    ExecutionPreparationError,
+    SolverRunner,
+    build_execution_plan,
+)
 from simulation_service import SimulationService
 from models import CaseInputs1D, CaseInputs3D
 from path_utils import get_latest_time_dir, win_to_wsl_path
 from case_loader import load_case
-from generator_3d import effective_charge_refine
+from initialization_plan import build_initialization_plan
+from startup_capture_guard import UNSAFE_CAPTURE_MESSAGE, require_safe_capture
+from case_init_mode import record_set_cmd_actual
+from project_io import (
+    PROJECT_SUFFIX,
+    ProjectFormatError,
+    apply_project_payload,
+    capture_project_payload,
+    read_project,
+    write_project_atomic,
+)
 try:
     from verification.verify_output import get_charge_cell_count
 except ImportError:
@@ -195,6 +210,8 @@ class BlastFoamApp(QMainWindow):
         # State
         self.runner = None
         self.active_case_dir_3d = None
+        self.active_case_initialized_3d = False
+        self.current_project_path = None
         self.view_timer = QTimer()
         self.view_timer.timeout.connect(self.check_3d_updates)
         
@@ -229,6 +246,11 @@ class BlastFoamApp(QMainWindow):
         act_open.setToolTip("Open existing model file")
         act_open.triggered.connect(self._on_open_model)
         toolbar.addAction(act_open)
+
+        act_open_case = QAction("📂 Open OpenFOAM Case", self)
+        act_open_case.setToolTip("Open an existing generated OpenFOAM case folder")
+        act_open_case.triggered.connect(self._on_open_case)
+        toolbar.addAction(act_open_case)
         
         # Save model
         act_save = QAction("💾 Save Model", self)
@@ -367,6 +389,27 @@ class BlastFoamApp(QMainWindow):
     # ====== Toolbar Action Handlers ======
     
     def _on_open_model(self):
+        """Open a versioned GGUI project file."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open GGUI Project",
+            os.path.dirname(self.current_project_path) if self.current_project_path else "",
+            "GGUI Project (*.ggui.json);;JSON (*.json)",
+        )
+        if not path:
+            return
+        try:
+            project = read_project(path)
+            apply_project_payload(self.tab_3d, self.probes_model, project)
+            self.current_project_path = os.path.abspath(path)
+            self.active_case_dir_3d = None
+            self.active_case_initialized_3d = False
+            self.tabs.setCurrentWidget(self.tab_3d)
+            self.status_bar.set_status("Project loaded", "#2ecc71")
+        except (ProjectFormatError, OSError, TypeError, ValueError) as exc:
+            QMessageBox.critical(self, "Open Project Error", str(exc))
+
+    def _on_open_case(self):
         """Open an existing BlastFoam case folder and populate the 3D tab."""
         case_dir = QFileDialog.getExistingDirectory(
             self,
@@ -407,6 +450,9 @@ class BlastFoamApp(QMainWindow):
 
         # Switch to 3D tab
         self.tabs.setCurrentWidget(self.tab_3d)
+        self.active_case_dir_3d = case_dir
+        self.active_case_initialized_3d = os.path.isdir(os.path.join(case_dir, "0"))
+        self.current_project_path = None
 
         # Load Summary (non-blocking): fields filled / not filled / unsupported + Copy
         self._show_load_summary_dialog(case_dir, load_summary)
@@ -471,12 +517,36 @@ class BlastFoamApp(QMainWindow):
         dlg.activateWindow()
 
     def _on_save_model(self):
-        """Save current model"""
-        QMessageBox.information(self, "Save Model", "Save model functionality: Still in progress...")
+        """Save current model to its existing project path."""
+        if not self.current_project_path:
+            self._on_save_model_as()
+            return
+        self._save_project_to(self.current_project_path)
     
     def _on_save_model_as(self):
-        """Save model as new file"""
-        QMessageBox.information(self, "Save As", "Save As functionality: Still in progress...")
+        """Save current model to a new project path."""
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save GGUI Project",
+            self.current_project_path or f"project{PROJECT_SUFFIX}",
+            "GGUI Project (*.ggui.json)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(PROJECT_SUFFIX):
+            path += PROJECT_SUFFIX
+        if self._save_project_to(path):
+            self.current_project_path = os.path.abspath(path)
+
+    def _save_project_to(self, path: str) -> bool:
+        try:
+            payload = capture_project_payload(self.tab_3d, self.probes_model)
+            write_project_atomic(path, payload)
+            self.status_bar.set_status("Project saved", "#2ecc71")
+            return True
+        except (OSError, TypeError, ValueError) as exc:
+            QMessageBox.critical(self, "Save Project Error", f"Could not save project:\n{exc}")
+            return False
     
     def _on_output_options(self):
         """Open Output File Options dialog"""
@@ -567,19 +637,13 @@ class BlastFoamApp(QMainWindow):
                 log.write("="*60 + "\n")
                 
             # Also try to print to console if available
-            try:
-                print(f"\n[Initialize] Command {'succeeded' if result.returncode == 0 else 'FAILED with code ' + str(result.returncode)}")
-                print(f"[Initialize] Log saved to: {log_file}")
-            except:
-                pass
+            print(f"\n[Initialize] Command {'succeeded' if result.returncode == 0 else 'FAILED with code ' + str(result.returncode)}")
+            print(f"[Initialize] Log saved to: {log_file}")
                 
             return result.returncode == 0
             
         except Exception as e:
-            try:
-                print(f"ERROR running WSL commands: {e}")
-            except:
-                pass
+            print(f"ERROR running WSL commands: {e}", file=sys.stderr)
             return False
     
     def run_active_tab(self):
@@ -698,13 +762,32 @@ class BlastFoamApp(QMainWindow):
         """Initialize 3D model (mesh generation and field initialization)"""
         if isinstance(inputs, CaseInputs3D):
             try:
+                try:
+                    require_safe_capture(inputs)
+                except ValueError as guard_exc:
+                    QMessageBox.critical(
+                        self,
+                        "Unsafe charge capture",
+                        str(guard_exc) or UNSAFE_CAPTURE_MESSAGE,
+                    )
+                    self.status_bar.set_status("Init blocked", "#e74c3c")
+                    return
                 self.status_bar.set_status("Generating 3D Case...", "#f39c12")
                 QApplication.processEvents()
 
                 prefix = "Case_3D"
                 case_name = self.service.make_case_name(prefix)
-                case_dir = self.service.generate_case(case_name, inputs)
+                try:
+                    case_dir = self.service.generate_case(case_name, inputs)
+                except ValueError as gen_exc:
+                    msg = str(gen_exc)
+                    if "Initialization is blocked" in msg or msg == UNSAFE_CAPTURE_MESSAGE:
+                        QMessageBox.critical(self, "Unsafe charge capture", msg)
+                        self.status_bar.set_status("Init blocked", "#e74c3c")
+                        return
+                    raise
                 self.active_case_dir_3d = case_dir
+                self.active_case_initialized_3d = False
                 if not getattr(inputs, "remap_enabled", False):
                     _cap_path = os.path.join(case_dir, "case_init_mode.json")
                     if os.path.isfile(_cap_path):
@@ -793,12 +876,7 @@ class BlastFoamApp(QMainWindow):
                         except (OSError, ValueError, KeyError):
                             pass
                     if set_cmd not in ("setFields", "setRefinedFields"):
-                        eff_refine = effective_charge_refine(inputs)
-                        use_set_refined = eff_refine > 0 and getattr(inputs, "charge_shape", "") in ("Sphere", "Cylinder")
-                        set_cmd = "setRefinedFields" if use_set_refined else "setFields"
-                    # Fixed Mesh: no startup charge-region refinement (single source of truth)
-                    if getattr(inputs, "enable_dyn_refine", None) is False:
-                        set_cmd = "setFields"
+                        set_cmd = build_initialization_plan(inputs).command
                     alpha_check = "bash ./check_alpha_c4.sh || exit 1"
                     # Native flow (matches BlastFoam ``building3D`` reference):
                     #   blockMesh → surfaceFeatures (if obstacles) → snappyHexMesh
@@ -857,21 +935,20 @@ class BlastFoamApp(QMainWindow):
                     self.status_bar.set_status("Init Failed", "#e74c3c")
                     QMessageBox.critical(self, "Init Error", "Mesh initialization failed. Check console output for details.")
                     return
+                final_mode = None
                 if not use_remap:
-                    mode_path = os.path.join(case_dir, "case_init_mode.json")
                     try:
-                        import json
-                        with open(mode_path, "r", encoding="utf-8") as f:
-                            mode = json.load(f)
+                        charge_cells = None
                         if get_charge_cell_count and os.path.isfile(os.path.join(case_dir, "0", "alpha.c4")):
                             charge_cells, _ = get_charge_cell_count(case_dir, "0", 0.5)
-                            mode["cells_inside_charge"] = charge_cells
-                        mode["retries_used"] = retries_used
-                        with open(mode_path, "w", encoding="utf-8") as f:
-                            json.dump(mode, f, indent=2)
-                    except (OSError, ValueError, KeyError):
-                        pass
-                final_mode = mode if not use_remap else None
+                        final_mode = record_set_cmd_actual(
+                            case_dir,
+                            set_cmd_actual,
+                            retries_used=retries_used,
+                            cells_inside_charge=charge_cells,
+                        )
+                    except (OSError, ValueError, KeyError, TypeError):
+                        final_mode = None
                 
                 # Update viewer with charge center (no auto-adjust; user position is used)
                 self.tab_3d.viewer.load_case(
@@ -901,6 +978,7 @@ class BlastFoamApp(QMainWindow):
                     set_cmd_actual=(set_cmd_actual if not use_remap else None),
                 )
                 self.status_bar.set_status("3D Initialized", "#2ecc71")
+                self.active_case_initialized_3d = True
                 
             except Exception as e:
                 self.status_bar.set_status("Error", "#e74c3c")
@@ -929,9 +1007,9 @@ class BlastFoamApp(QMainWindow):
         try:
             inputs = self.tab_3d.get_case_inputs()
             
-            if not self.active_case_dir_3d:
+            if not self.active_case_dir_3d or not self.active_case_initialized_3d:
                 self.on_initialize_model_3d(inputs)
-                if not self.active_case_dir_3d:
+                if not self.active_case_dir_3d or not self.active_case_initialized_3d:
                     return
             
             # Get write parameters based on control type
@@ -946,7 +1024,24 @@ class BlastFoamApp(QMainWindow):
                 write_param,
                 inputs.write_control_type
             )
-            self._start_solver(self.active_case_dir_3d, cores=inputs.cores, mode="3D")
+            try:
+                probe = build_execution_plan(
+                    self.active_case_dir_3d,
+                    inputs.cores,
+                    ExecutionIntent.RESUME,
+                )
+                intent = ExecutionIntent.RESUME
+            except ExecutionPreparationError as exc:
+                if str(exc).startswith("No resumable saved time exists"):
+                    intent = ExecutionIntent.INITIALIZED_SOLVER_RUN
+                else:
+                    raise
+            self._start_solver(
+                self.active_case_dir_3d,
+                cores=inputs.cores,
+                mode="3D",
+                intent=intent,
+            )
             
         except Exception as e:
             self.status_bar.set_status("Error", "#e74c3c")
@@ -968,8 +1063,8 @@ class BlastFoamApp(QMainWindow):
                         f.write(f"writeInterval {write_int};\n")
                     else:
                         f.write(line)
-        except:
-            pass
+        except OSError as exc:
+            raise RuntimeError(f"Could not update {cd_path}: {exc}") from exc
 
     def _set_control_dict_one_step(self, case_dir):
         """Set controlDict so the solver runs exactly one more step from the latest time and stops.
@@ -995,11 +1090,12 @@ class BlastFoamApp(QMainWindow):
             if delta_t is None or delta_t <= 0:
                 return False
             # Start from latest time directory so each 'exact 1' continues from the previous step
-            latest = get_latest_time_dir(case_dir)
-            try:
-                start_time = float(latest) if latest is not None else 0.0
-            except (TypeError, ValueError):
-                start_time = 0.0
+            execution = build_execution_plan(
+                case_dir,
+                max(1, int(self.tab_3d.spin_cores.value())),
+                ExecutionIntent.ONE_STEP_RESUME,
+            )
+            start_time = float(execution.latest_time or 0.0)
             one_step_end = start_time + delta_t
             with open(cd_path, "w", encoding="utf-8") as f:
                 for line in lines:
@@ -1011,21 +1107,26 @@ class BlastFoamApp(QMainWindow):
                     else:
                         f.write(line)
             return True
-        except Exception:
-            return False
+        except (OSError, ValueError, ExecutionPreparationError) as exc:
+            raise RuntimeError(f"Cannot prepare one-step resume: {exc}") from exc
 
     def run_3d_process_exact_1(self):
         """Run 3D solver for exactly one time step then stop."""
         try:
             inputs = self.tab_3d.get_case_inputs()
-            if not self.active_case_dir_3d:
+            if not self.active_case_dir_3d or not self.active_case_initialized_3d:
                 self.on_initialize_model_3d(inputs)
-                if not self.active_case_dir_3d:
+                if not self.active_case_dir_3d or not self.active_case_initialized_3d:
                     return
             if not self._set_control_dict_one_step(self.active_case_dir_3d):
                 QMessageBox.critical(self, "exact 1", "Could not set one-step end time (check system/controlDict startTime and deltaT).")
                 return
-            self._start_solver(self.active_case_dir_3d, cores=inputs.cores, mode="3D")
+            self._start_solver(
+                self.active_case_dir_3d,
+                cores=inputs.cores,
+                mode="3D",
+                intent=ExecutionIntent.ONE_STEP_RESUME,
+            )
         except Exception as e:
             self.status_bar.set_status("Error", "#e74c3c")
             QMessageBox.critical(self, "3D Run Error", str(e))
@@ -1034,7 +1135,13 @@ class BlastFoamApp(QMainWindow):
         """Run 3D solver until stop or end time."""
         self.run_3d_process()
     
-    def _start_solver(self, case_dir, cores: int = 1, mode="1D"):
+    def _start_solver(
+        self,
+        case_dir,
+        cores: int = 1,
+        mode="1D",
+        intent: ExecutionIntent = ExecutionIntent.FRESH_FULL_PIPELINE,
+    ):
         """Start solver with monitoring"""
         self.status_bar.set_status("Solver Running...", "#3498db")
         self.status_bar.set_progress(0)
@@ -1050,6 +1157,7 @@ class BlastFoamApp(QMainWindow):
             self.openfoam_bashrc,
             project_root=self.project_root,
             cores=cores,
+            intent=intent,
         )
         self.runner.data_signal.connect(lambda p, t, s, dt: self.on_new_data(p, t, s, dt, mode))
         self.runner.status_signal.connect(lambda s: self.status_bar.set_status(s, "#3498db"))
