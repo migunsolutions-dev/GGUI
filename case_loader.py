@@ -345,10 +345,18 @@ def _parse_setFieldsDict(case_dir: str, out: Dict[str, Any]) -> None:
             # Preserve the absolute entered value so regeneration can keep it.
             backup_len_abs = math.sqrt(lvec[0] ** 2 + lvec[1] ** 2 + lvec[2] ** 2)
             out["charge_backup_length_override"] = backup_len_abs
-    # Charge refinement level (setRefinedFields)
+    # Charge seed mode / level (setRefinedFields refineInternal vs plain setFields)
+    has_refine_internal = bool(
+        re.search(r"refineInternal\s+yes\b", regions, re.IGNORECASE)
+    )
     iv = _int_val(regions, "level")
-    if iv is not None:
-        out["charge_refinement_level"] = iv
+    if has_refine_internal:
+        out["charge_seed_mode"] = "Manual"
+        out["charge_refinement_level"] = int(iv) if iv is not None else 0
+    else:
+        # Plain setFields (no refineInternal): seed Off
+        out["charge_seed_mode"] = "Off"
+        out["charge_refinement_level"] = 0
     # Backup radius factor: backup_radius / computed_charge_radius (when both available)
     backup_rad = _scalar(backup, "radius") if backup else None
     if backup_rad is not None and backup_rad > 1e-9:
@@ -561,69 +569,221 @@ def _parse_dynamicMeshDict(case_dir: str, out: Dict[str, Any]) -> None:
 
 
 def _parse_snappyHexMeshDict(case_dir: str, out: Dict[str, Any]) -> None:
-    """Extract STL file references from the geometry block."""
+    """Extract STL refs, outer charge band, and castellated controls from snappyHexMeshDict."""
     text = _read_text(os.path.join(case_dir, "system", "snappyHexMeshDict"))
     if text is None:
         return
     geom = _find_block(text, "geometry")
-    if geom is None:
-        return
+    if geom is not None:
+        stl_files: List[Dict[str, Any]] = []
+        # Find all triSurfaceMesh entries:  <name> { type triSurfaceMesh; file "<file>"; ... }
+        for m in re.finditer(r"(\w+)\s*\{([^}]*type\s+triSurfaceMesh[^}]*)\}", geom):
+            entry_name = m.group(1)
+            body = m.group(2)
+            # file "X.stl"  or  file X.stl;
+            fm = re.search(r'file\s+"?([^";]+)"?\s*;', body)
+            if not fm:
+                continue
+            stl_filename = fm.group(1).strip()
+            # scale
+            scale = 1.0
+            sm = re.search(r"scale\s+([\d\.eE\+\-]+)\s*;", body)
+            if sm:
+                try:
+                    scale = float(sm.group(1))
+                except ValueError:
+                    pass
+            # Resolve to full path
+            stl_path = os.path.join(case_dir, "constant", "triSurface", stl_filename)
+            stl_files.append({
+                "name": entry_name,
+                "file": stl_filename,
+                "path": stl_path,
+                "scale": scale,
+                "exists": os.path.isfile(stl_path),
+            })
 
-    stl_files: List[Dict[str, Any]] = []
-    # Find all triSurfaceMesh entries:  <name> { type triSurfaceMesh; file "<file>"; ... }
-    for m in re.finditer(r"(\w+)\s*\{([^}]*type\s+triSurfaceMesh[^}]*)\}", geom):
-        entry_name = m.group(1)
-        body = m.group(2)
-        # file "X.stl"  or  file X.stl;
-        fm = re.search(r'file\s+"?([^";]+)"?\s*;', body)
-        if not fm:
-            continue
-        stl_filename = fm.group(1).strip()
-        # scale
-        scale = 1.0
-        sm = re.search(r"scale\s+([\d\.eE\+\-]+)\s*;", body)
-        if sm:
-            try:
-                scale = float(sm.group(1))
-            except ValueError:
-                pass
-        # Resolve to full path
-        stl_path = os.path.join(case_dir, "constant", "triSurface", stl_filename)
-        stl_files.append({
-            "name": entry_name,
-            "file": stl_filename,
-            "path": stl_path,
-            "scale": scale,
-            "exists": os.path.isfile(stl_path),
-        })
+        if stl_files:
+            out["stl_obstacles"] = stl_files
 
-    if stl_files:
-        out["stl_obstacles"] = stl_files
+        # Lossless chargeRefineOuter searchable geometry (sphere / cylinder / box).
+        m_geom_outer = re.search(
+            r"chargeRefineOuter\s*\{([^}]*type\s+searchable\w+[^}]*)\}",
+            geom,
+            re.DOTALL,
+        )
+        if m_geom_outer:
+            gbody = m_geom_outer.group(1)
+            gtype_m = re.search(r"type\s+(searchable\w+)\s*;", gbody)
+            geom_info: Dict[str, Any] = {
+                "type": gtype_m.group(1) if gtype_m else None,
+            }
+            if geom_info["type"] == "searchableSphere":
+                cm = re.search(
+                    r"centre\s*\(\s*([-\d.eE+]+)\s+([-\d.eE+]+)\s+([-\d.eE+]+)\s*\)",
+                    gbody,
+                )
+                rm = re.search(r"radius\s+([-\d.eE+]+)\s*;", gbody)
+                if cm:
+                    geom_info["centre"] = (
+                        float(cm.group(1)),
+                        float(cm.group(2)),
+                        float(cm.group(3)),
+                    )
+                if rm:
+                    geom_info["radius"] = float(rm.group(1))
+            elif geom_info["type"] == "searchableCylinder":
+                p1 = re.search(
+                    r"point1\s*\(\s*([-\d.eE+]+)\s+([-\d.eE+]+)\s+([-\d.eE+]+)\s*\)",
+                    gbody,
+                )
+                p2 = re.search(
+                    r"point2\s*\(\s*([-\d.eE+]+)\s+([-\d.eE+]+)\s+([-\d.eE+]+)\s*\)",
+                    gbody,
+                )
+                rm = re.search(r"radius\s+([-\d.eE+]+)\s*;", gbody)
+                if p1:
+                    geom_info["point1"] = (
+                        float(p1.group(1)),
+                        float(p1.group(2)),
+                        float(p1.group(3)),
+                    )
+                if p2:
+                    geom_info["point2"] = (
+                        float(p2.group(1)),
+                        float(p2.group(2)),
+                        float(p2.group(3)),
+                    )
+                if rm:
+                    geom_info["radius"] = float(rm.group(1))
+            elif geom_info["type"] == "searchableBox":
+                mn = re.search(
+                    r"min\s*\(\s*([-\d.eE+]+)\s+([-\d.eE+]+)\s+([-\d.eE+]+)\s*\)",
+                    gbody,
+                )
+                mx = re.search(
+                    r"max\s*\(\s*([-\d.eE+]+)\s+([-\d.eE+]+)\s+([-\d.eE+]+)\s*\)",
+                    gbody,
+                )
+                if mn:
+                    geom_info["min"] = (
+                        float(mn.group(1)),
+                        float(mn.group(2)),
+                        float(mn.group(3)),
+                    )
+                if mx:
+                    geom_info["max"] = (
+                        float(mx.group(1)),
+                        float(mx.group(2)),
+                        float(mx.group(3)),
+                    )
+            out["charge_outer_geometry"] = geom_info
 
     # Charge outer refinement (if present) from refinementRegions.
-    # If not present, default to disabled (0/0) so loading preserves
-    # "no static outer ring" behavior from reference cases.
+    # Canonical form: mode inside; levels ((1e15 LEVEL)) — LEVEL is the second
+    # tuple value (effective level). Legacy ((min max)) is accepted the same way
+    # (second value = level). Never treat the first value as min refinement level.
+    # mode distance: preserve every (distance, level) pair; never convert to inside.
     ref_regions = _find_block(text, "refinementRegions")
     if ref_regions:
         m_outer = re.search(
-            r"chargeRefineOuter\s*\{[^}]*levels\s*\(\(\s*(\d+)\s+(\d+)\s*\)\)\s*;",
+            r"chargeRefineOuter\s*\{([^}]*)\}",
             ref_regions,
             re.DOTALL,
         )
         if m_outer:
-            out["charge_outer_refine_min"] = int(m_outer.group(1))
-            out["charge_outer_refine_max"] = int(m_outer.group(2))
-            out["charge_outer_refine_enable"] = (
-                int(m_outer.group(1)) != 0 or int(m_outer.group(2)) != 0
+            block = m_outer.group(1)
+            out["charge_outer_raw_refinement"] = block.strip()
+            mode_m = re.search(r"mode\s+(\w+)", block)
+            mode = mode_m.group(1) if mode_m else "inside"
+            out["charge_outer_mode"] = mode
+            # All ((a b)) pairs inside levels (...)
+            pairs = re.findall(
+                r"\(\s*([^\s()]+)\s+(\d+)\s*\)",
+                block,
             )
+            if pairs:
+                if mode == "distance" and len(pairs) >= 1:
+                    dist_levels = []
+                    for a, b in pairs:
+                        try:
+                            dist_levels.append((float(a), int(b)))
+                        except ValueError:
+                            dist_levels.append((a, int(b)))
+                    out["charge_outer_distance_levels"] = dist_levels
+                    # Effective display level = max level among pairs
+                    level = max(int(b) for _, b in pairs)
+                    out["charge_outer_refine_level"] = level
+                    out["charge_outer_refine_min"] = 0
+                    out["charge_outer_refine_max"] = level
+                    out["charge_outer_refine_enable"] = level > 0
+                else:
+                    # inside: one effective level = second tuple value
+                    level = int(pairs[0][1])
+                    out["charge_outer_refine_level"] = level
+                    out["charge_outer_refine_min"] = 0
+                    out["charge_outer_refine_max"] = level
+                    out["charge_outer_refine_enable"] = level > 0
+            else:
+                out["charge_outer_refine_level"] = 0
+                out["charge_outer_refine_min"] = 0
+                out["charge_outer_refine_max"] = 0
+                out["charge_outer_refine_enable"] = False
         else:
+            out["charge_outer_refine_level"] = 0
             out["charge_outer_refine_min"] = 0
             out["charge_outer_refine_max"] = 0
             out["charge_outer_refine_enable"] = False
     else:
+        out["charge_outer_refine_level"] = 0
         out["charge_outer_refine_min"] = 0
         out["charge_outer_refine_max"] = 0
         out["charge_outer_refine_enable"] = False
+
+    # Recover outside_extent only for a demonstrably canonical uniform shell.
+    # Non-canonical imported geometry keeps charge_outer_geometry and leaves
+    # outside_extent unset (never invent a single scalar).
+    geom_info = out.get("charge_outer_geometry") or {}
+    if geom_info and out.get("charge_outer_refine_enable"):
+        try:
+            from physical_charge_geometry import (
+                canonical_outside_extent_from_outer_geometry,
+                physical_charge_geometry,
+            )
+            from types import SimpleNamespace
+
+            mass_raw = out.get("mass_kg")
+            rho_raw = out.get("rho_charge")
+            aspect_raw = out.get("charge_lbyd") or out.get("charge_aspect")
+            if mass_raw is None or rho_raw is None:
+                raise ValueError("missing mass/rho for outer extent recovery")
+            ns = SimpleNamespace(
+                charge_shape=out.get("charge_shape") or "Sphere",
+                mass_kg=float(mass_raw),
+                rho_charge=float(rho_raw),
+                charge_aspect=float(aspect_raw) if aspect_raw is not None else None,
+                charge_length=float(out.get("charge_length") or 0.0),
+                charge_width=float(out.get("charge_width") or 0.0),
+                charge_height=float(out.get("charge_height") or 0.0),
+                cylinder_radius=float(out.get("charge_radius") or out.get("cylinder_radius") or 0.0),
+            )
+            phys = physical_charge_geometry(ns)
+            centre = out.get("charge_center")
+            if centre is None:
+                centre = out.get("charge_centre")
+            extent = canonical_outside_extent_from_outer_geometry(
+                geom_info,
+                phys,
+                charge_center=centre,
+                cylinder_axis=str(out.get("cylinder_axis") or "Z"),
+            )
+            if extent is not None:
+                out["outside_extent"] = extent
+            else:
+                out.pop("outside_extent", None)
+        except Exception:
+            # Keep geometry; do not invent metres.
+            pass
 
     # Obstacle surface refinement levels from refinementSurfaces (first entry)
     ref_surf = _find_block(text, "refinementSurfaces")
@@ -813,7 +973,8 @@ UI_FIELD_KEYS = [
     "enable_dyn_refine", "dyn_refine_min", "dyn_refine_max",
     "enable_obstacle_refine", "obstacle_refine_min", "obstacle_refine_max",
     "outside_extent", "transition_cells",
-    "charge_refinement_level", "charge_outer_refine_min", "charge_outer_refine_max", "charge_outer_refine_enable",
+    "charge_refinement_level", "charge_seed_mode",
+    "charge_outer_refine_level", "charge_outer_refine_min", "charge_outer_refine_max", "charge_outer_refine_enable",
     "cylinder_axis",
     "charge_capture_mode", "charge_capture_factor", "charge_capture_radius",
     "charge_backup_radius_factor", "charge_backup_radius_override", "buffer_layers",

@@ -90,6 +90,7 @@ def _cuboid_seed2_inputs() -> CaseInputs3D:
         write_interval_steps=10,
         cores=1,
         enable_dyn_refine=True,
+        charge_seed_mode="Manual",
         charge_refinement_level=2,
         charge_outer_refine_enable=False,
         charge_length=0.2,

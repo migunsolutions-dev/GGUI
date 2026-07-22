@@ -88,8 +88,12 @@ class Tab3DGuiCorrectnessTests(unittest.TestCase):
 
     def test_seed_and_outer_band_defaults_remain_protected(self):
         tab = self.make_tab()
+        self.assertEqual(tab.combo_charge_seed_mode.currentText(), "Auto")
         self.assertEqual(tab.spin_charge_refine.value(), 0)
-        self.assertEqual(tab.spin_charge_outer_min.value(), 2)
+        self.assertFalse(tab.chk_charge_outer_enable.isChecked())
+        self.assertEqual(tab.spin_charge_outer_level.value(), 3)
+        # Legacy min/max spins mirror the single outer level.
+        self.assertEqual(tab.spin_charge_outer_min.value(), 3)
         self.assertEqual(tab.spin_charge_outer_max.value(), 3)
 
     def test_service_and_generator_share_unsafe_capture_guard(self):
@@ -112,6 +116,7 @@ class Tab3DGuiCorrectnessTests(unittest.TestCase):
             delta_t=1e-7,
             write_interval_steps=10,
             cores=1,
+            charge_seed_mode="Off",
             charge_refinement_level=0,
             charge_outer_refine_enable=False,
         )
@@ -315,7 +320,10 @@ class Tab3DGuiCorrectnessTests(unittest.TestCase):
         tab.scell.setValue(0.5)
         tab.rad_dyn_mesh.setChecked(True)
         tab.spin_refine_max.setValue(2)
+        tab.combo_charge_seed_mode.setCurrentText("Manual")
         tab.spin_charge_refine.setValue(4)
+        tab.chk_charge_outer_enable.setChecked(True)
+        tab.spin_charge_outer_level.setValue(3)
         tab._update_mesh_plan_display()
 
         plan = tab.lbl_plan_block_mesh.text()
@@ -326,13 +334,11 @@ class Tab3DGuiCorrectnessTests(unittest.TestCase):
         self.assertIn("Mesh mode:    AMR", plan)
         self.assertIn("Wave AMR level:    2", plan)
         self.assertIn("Planned initialization:    setRefinedFields", plan)
-        self.assertIn("Charge seed:    On", plan)
+        self.assertIn("Charge seed mode:    Manual", plan)
         self.assertIn("Charge seed level:    4", plan)
-        self.assertIn("Charge capture:", plan)
+        self.assertIn("Charge seed status:", plan)
         self.assertIn("Startup outer region:    On", plan)
         self.assertIn("Startup outer level:    3", plan)
-        self.assertIn("Initiation location:    Charge center", plan)
-        self.assertIn("Initiation radius:", plan)
         # First data row is total cells; base grid is second (no duplicate cell-count row).
         lines = [ln for ln in plan.splitlines() if ln.strip()]
         self.assertTrue(lines[0].startswith("Total cells before refinement:"))
@@ -350,6 +356,136 @@ class Tab3DGuiCorrectnessTests(unittest.TestCase):
         self.assertIsInstance(tab.lbl_mesh_plan_title, QLabel)
         self.assertNotIn("Mesh Plan", plan)
 
+    def test_mesh_plan_fixed_and_remap_seed_not_applied(self):
+        tab = self.make_tab()
+        tab.sx1.setValue(-5)
+        tab.sx2.setValue(5)
+        tab.sy1.setValue(-5)
+        tab.sy2.setValue(5)
+        tab.sz1.setValue(0)
+        tab.sz2.setValue(5)
+        tab.scell.setValue(0.5)
+        tab.combo_charge_seed_mode.setCurrentText("Auto")
+        tab.spin_charge_seed_target.setValue(8)
+        # Fixed Mesh
+        tab.rad_fixed_mesh.setChecked(True)
+        tab._update_charge_seed_controls_enabled()
+        tab._update_mesh_plan_display()
+        seed_txt = tab.lbl_plan_charge_seed.text()
+        self.assertIn("Not applied — Fixed Mesh", seed_txt)
+        self.assertNotIn("Charge seed level:    5", seed_txt)
+        self.assertFalse(tab.spin_charge_seed_target.isEnabled())
+        # Remap
+        tab.rad_dyn_mesh.setChecked(True)
+        tab.rad_init_remap.setChecked(True)
+        tab._update_mesh_plan_display()
+        seed_txt = tab.lbl_plan_charge_seed.text()
+        self.assertIn("Not applied — Remap", seed_txt)
+
+    def test_seed_target_enabled_only_in_auto(self):
+        tab = self.make_tab()
+        tab.rad_dyn_mesh.setChecked(True)
+        tab.combo_charge_seed_mode.setCurrentText("Auto")
+        tab._update_charge_seed_controls_enabled()
+        self.assertTrue(tab.spin_charge_seed_target.isEnabled())
+        self.assertFalse(tab.spin_charge_refine.isEnabled())
+        tab.combo_charge_seed_mode.setCurrentText("Manual")
+        tab._update_charge_seed_controls_enabled()
+        self.assertFalse(tab.spin_charge_seed_target.isEnabled())
+        self.assertTrue(tab.spin_charge_refine.isEnabled())
+        tab.combo_charge_seed_mode.setCurrentText("Off")
+        tab._update_charge_seed_controls_enabled()
+        self.assertFalse(tab.spin_charge_seed_target.isEnabled())
+        self.assertFalse(tab.spin_charge_refine.isEnabled())
+
+    def test_cylinder_mass_rho_ld_widgets_drive_same_geometry(self):
+        """Offscreen Qt: mass/density/L/D widgets → display, collect, seed, setFieldsDict."""
+        import math
+
+        from charge_seed_plan import build_charge_seed_plan
+        from physical_charge_geometry import physical_charge_geometry
+
+        tab = self.make_tab()
+        tab.c_shape.setCurrentText("Cylinder")
+        tab._on_shape_changed("Cylinder")
+        tab.c_mass.setValue(25.0)
+        tab.c_rho.setValue(1601.0)
+        tab.c_aspect.setValue(2.5)
+        tab._update_cylinder_derived_geometry()
+        self.app.processEvents()
+
+        self.assertTrue(tab.c_radius.isReadOnly())
+        self.assertTrue(tab.c_length.isReadOnly())
+        vol = 25.0 / 1601.0
+        r_exp = (vol / (2.0 * math.pi * 2.5)) ** (1.0 / 3.0)
+        L_exp = 2.0 * r_exp * 2.5
+        # SpinBoxes use 4 decimal places — compare at display precision.
+        self.assertAlmostEqual(tab.c_radius.value(), r_exp, places=4)
+        self.assertAlmostEqual(tab.c_length.value(), L_exp, places=4)
+
+        inputs = tab.get_case_inputs()
+        geom = physical_charge_geometry(inputs)
+        self.assertAlmostEqual(inputs.cylinder_radius, r_exp, places=6)
+        self.assertAlmostEqual(inputs.charge_length, L_exp, places=6)
+        self.assertAlmostEqual(geom.cylinder_radius_m, r_exp, places=6)
+        plan = build_charge_seed_plan(inputs)
+        self.assertAlmostEqual(plan.d_min_m, geom.d_min_m, places=9)
+
+        with tempfile.TemporaryDirectory() as td:
+            case_dir = Generator3D(td).generate("cyl_qt", inputs)
+            with open(os.path.join(case_dir, "system", "setFieldsDict"), encoding="utf-8") as fh:
+                sf = fh.read()
+            self.assertIn("cylindericalMassToCell", sf)
+            self.assertIn("mass 25", sf)
+            self.assertIn("rho 1601", sf)
+            self.assertRegex(sf, r"LbyD\s+2\.5")
+
+    def test_seed_policy_hidden_fields_survive_project_round_trip(self):
+        """Dialog-free: non-default min/max seed policy preserved Save→Open→collect."""
+        from project_io import (
+            apply_project_payload,
+            build_project,
+            capture_project_payload,
+            read_project,
+            write_project_atomic,
+        )
+
+        tab = self.make_tab()
+        tab.rad_dyn_mesh.setChecked(True)
+        tab.combo_charge_seed_mode.setCurrentText("Auto")
+        tab.spin_charge_seed_target.setValue(7)
+        tab._charge_seed_min_cells = 4
+        tab._charge_seed_max_level = 3
+        tab._charge_outer_legacy_migration_warning = "legacy bake test warning"
+        collected = tab.get_case_inputs()
+        self.assertEqual(collected.charge_seed_target_cells, 7)
+        self.assertEqual(collected.charge_seed_min_cells, 4)
+        self.assertEqual(collected.charge_seed_max_level, 3)
+        self.assertEqual(
+            collected.charge_outer_legacy_migration_warning, "legacy bake test warning"
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "seed_policy.ggui.json")
+            payload = build_project(
+                collected, probes={"probes": []}, gui_state={}
+            )
+            write_project_atomic(path, payload)
+            loaded = read_project(path)
+            tab2 = self.make_tab()
+            apply_project_payload(tab2, ProbesModel(), loaded)
+            again = tab2.get_case_inputs()
+            self.assertEqual(again.charge_seed_mode, "Auto")
+            self.assertEqual(again.charge_seed_target_cells, 7)
+            self.assertEqual(again.charge_seed_min_cells, 4)
+            self.assertEqual(again.charge_seed_max_level, 3)
+            self.assertEqual(
+                again.charge_outer_legacy_migration_warning, "legacy bake test warning"
+            )
+            # Second collect after save/open still matches
+            payload2 = capture_project_payload(tab2, ProbesModel())
+            self.assertEqual(payload2["case_inputs"]["charge_seed_min_cells"], 4)
+            self.assertEqual(payload2["case_inputs"]["charge_seed_max_level"], 3)
     def test_initialization_results_hidden_until_metadata(self):
         tab = self.make_tab()
         self.assertTrue(tab.grp_init_results.isHidden())
@@ -493,9 +629,10 @@ class Tab3DGuiCorrectnessTests(unittest.TestCase):
     def test_relocated_advanced_mesh_values_survive_project_apply(self):
         tab = self.make_tab()
         tab.rad_dyn_mesh.setChecked(True)
+        tab.combo_charge_seed_mode.setCurrentText("Manual")
         tab.spin_charge_refine.setValue(3)
-        tab.spin_charge_outer_min.setValue(1)
-        tab.spin_charge_outer_max.setValue(4)
+        tab.chk_charge_outer_enable.setChecked(True)
+        tab.spin_charge_outer_level.setValue(4)
         tab.spin_transition_cells.setValue(5)
         tab._enable_post_processing = True
         tab._fast_run_mode = False
@@ -508,16 +645,18 @@ class Tab3DGuiCorrectnessTests(unittest.TestCase):
 
             tab2 = self.make_tab()
             apply_project_payload(tab2, ProbesModel(), read_project(path))
+            self.assertEqual(tab2.combo_charge_seed_mode.currentText(), "Manual")
             self.assertEqual(tab2.spin_charge_refine.value(), 3)
-            self.assertEqual(tab2.spin_charge_outer_min.value(), 1)
+            self.assertTrue(tab2.chk_charge_outer_enable.isChecked())
+            self.assertEqual(tab2.spin_charge_outer_level.value(), 4)
             self.assertEqual(tab2.spin_charge_outer_max.value(), 4)
             self.assertEqual(tab2.spin_transition_cells.value(), 5)
             self.assertTrue(tab2._enable_post_processing)
             self.assertFalse(tab2._fast_run_mode)
             inputs = tab2.get_case_inputs()
+            self.assertEqual(inputs.charge_seed_mode, "Manual")
             self.assertEqual(inputs.charge_refinement_level, 3)
-            self.assertEqual(inputs.charge_outer_refine_min, 1)
-            self.assertEqual(inputs.charge_outer_refine_max, 4)
+            self.assertEqual(inputs.charge_outer_refine_level, 4)
             self.assertEqual(inputs.transition_cells, 5)
 
     def test_warning_label_uses_word_wrap(self):

@@ -189,6 +189,7 @@ class ChargeCaptureTests(unittest.TestCase):
             write_interval_steps=10,
             cores=1,
             enable_dyn_refine=True,
+            charge_seed_mode="Manual",
             charge_refinement_level=3,
             charge_capture_mode="auto",
             charge_capture_factor=1.0,

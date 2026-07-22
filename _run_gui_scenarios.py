@@ -89,9 +89,19 @@ def _set_charge(tab: TabGeneral3D, shape: str, mass: float, rho: float,
 
 
 def _set_charge_refine(tab: TabGeneral3D, inside: int, outer_min: int, outer_max: int) -> None:
-    tab.spin_charge_refine.setValue(inside)
-    tab.spin_charge_outer_min.setValue(outer_min)
-    tab.spin_charge_outer_max.setValue(outer_max)
+    """Drive advanced seed/outer controls (Manual when inside>0; outer level = max)."""
+    if inside > 0:
+        tab.combo_charge_seed_mode.setCurrentText("Manual")
+        tab.spin_charge_refine.setValue(inside)
+    else:
+        tab.combo_charge_seed_mode.setCurrentText("Off")
+        tab.spin_charge_refine.setValue(0)
+    level = max(int(outer_min), int(outer_max))
+    tab.chk_charge_outer_enable.setChecked(level > 0)
+    if hasattr(tab, "spin_charge_outer_level"):
+        tab.spin_charge_outer_level.setValue(level)
+    tab.spin_charge_outer_min.setValue(level)
+    tab.spin_charge_outer_max.setValue(level)
 
 
 def run_scenario(name: str, configure: Callable[[TabGeneral3D], None],
@@ -233,7 +243,10 @@ def scenario_cylinder_b3d(tab: TabGeneral3D) -> None:
     tab.c_mat.setCurrentText("C4")
     _set_charge(tab, "Cylinder", 25.0, 1601.0, (0.0, 0.0, 0.5), lbyd=2.5, axis="Z")
     _select_dyn(tab, refine_max=1, refine_min=2)
-    _set_charge_refine(tab, inside=5, outer_min=2, outer_max=3)
+    # building3D architecture: Auto seed (→ L5), outer band Off, Wave AMR 1
+    tab.combo_charge_seed_mode.setCurrentText("Auto")
+    tab.spin_charge_seed_target.setValue(8)
+    tab.chk_charge_outer_enable.setChecked(False)
     tab._bubble_radius_factor = 1.5
 
 def expect_cylinder_b3d(res: Result, case_dir: str) -> None:
@@ -244,9 +257,11 @@ def expect_cylinder_b3d(res: Result, case_dir: str) -> None:
     assert_in(res, sf, "cylindericalMassToCell", "setFieldsDict has cylindericalMassToCell (BlastFoam spelling)")
     assert_in(res, sf, "refineInternal yes", "setFieldsDict uses native refineInternal")
     assert_in(res, sf, "level 5", "setFieldsDict level=5")
+    assert_in(res, sf, "nBufferLayers 5", "startup setFieldsDict nBufferLayers=5")
     assert_in(res, sf, "backup", "setFieldsDict has backup region")
     assert_in(res, dm, "adaptiveFvMesh", "AMR enabled")
-    assert_in(res, sn, "searchableCylinder", "snappy chargeRefineOuter uses cylinder geometry")
+    assert_in(res, dm, "maxRefinement   1", "Wave AMR maxRefinement remains 1")
+    assert_not_in(res, sn, "chargeRefineOuter", "no default chargeRefineOuter (outer Off)")
     assert_runs_cmd(res, allrun, "setRefinedFields", "Allrun calls setRefinedFields")
 SCENARIOS.append(("cylinder_b3d_match", scenario_cylinder_b3d, expect_cylinder_b3d))
 

@@ -17,6 +17,13 @@ from initialization_plan import (
     outer_band_level_string,
     outer_band_will_be_applied,
 )
+from charge_seed_plan import (
+    SEED_MODE_AUTO,
+    SEED_MODE_MANUAL,
+    SEED_MODE_OFF,
+    build_charge_seed_plan,
+    seed_status_label,
+)
 from charge_capture import resolve_charge_capture_radius_m
 from viewer_widget import BlastViewerWidget, ObstacleItem, SectionItem
 from dialogs import RemapConfigDialog
@@ -62,6 +69,7 @@ class TabGeneral3D(QWidget):
 
         self._build_ui()
         self._connect_signals()
+        self._on_mesh_mode_changed()
         self._update_edit_button_visibility()
         self._on_material_changed("TNT")
         self._on_shape_changed("Sphere")
@@ -141,7 +149,6 @@ class TabGeneral3D(QWidget):
         self.lbl_plan_block_status = _plan_lbl(parent=self.grp_mesh_plan)
         plan_body.addWidget(self.lbl_plan_block_mesh)
         plan_body.addWidget(self.lbl_plan_block_seed)
-        plan_body.addWidget(self.lbl_plan_block_status)
         # Text holders for tests / tooltips — owned by the plan group, never shown alone
         self.lbl_plan_base_grid = _plan_lbl(
             "Base blockMesh grid from domain extents and Cell Size.", parent=self.grp_mesh_plan
@@ -185,7 +192,9 @@ class TabGeneral3D(QWidget):
         self.lbl_charge_resolution_warning.setWordWrap(True)
         self.lbl_charge_resolution_warning.setMinimumHeight(36)
         self.lbl_charge_resolution_warning.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        # Warning sits above initiation so Phase 1F order is: plan rows → warnings → initiation.
         plan_body.addWidget(self.lbl_charge_resolution_warning)
+        plan_body.addWidget(self.lbl_plan_block_status)
         plan_l.addLayout(plan_body)
         il.addWidget(self.grp_mesh_plan)
 
@@ -360,10 +369,10 @@ class TabGeneral3D(QWidget):
         mesh_props_h.addWidget(self.btn_mesh_properties)
         mesh_props_h.addStretch()
         f.addWidget(mesh_props_row, 4, 0, 1, 2)
-        # Mesh mode: Fixed Mesh (default) / Dyn Mesh; Wave AMR level below for narrow panels
+        # Mesh mode: Dyn Mesh default (building3D-style AMR); Fixed Mesh available
         self.rad_fixed_mesh = QRadioButton("Fixed Mesh")
         self.rad_dyn_mesh = QRadioButton("Dyn Mesh (AMR)")
-        self.rad_fixed_mesh.setChecked(True)
+        self.rad_dyn_mesh.setChecked(True)
         self.rad_fixed_mesh.setToolTip("Static mesh (no AMR).")
         self.rad_dyn_mesh.setToolTip("Dynamic mesh (AMR). Wave AMR level controls maxRefinement.")
         mesh_mode_bg = QButtonGroup(self)
@@ -473,11 +482,17 @@ class TabGeneral3D(QWidget):
 
         # --- Geometry fields: Radius, Aspect (L/D), Length, Width, Height ---
         self.c_radius = self._spin(0.001, 100, 0.1, 0.01, 4)
-        self.c_radius.setToolTip("Charge radius [m]. Editable for Cylinder.")
+        self.c_radius.setToolTip(
+            "Charge radius [m]. For Cylinder: derived from mass, density and L/D "
+            "for cylindericalMassToCell (read-only)."
+        )
         self.c_aspect = self._spin(0.1, 20, 2.5, 0.1, 2)
         self.c_aspect.setToolTip("Length-to-Diameter ratio (L/D). Only for Cylinder shape.")
         self.c_length = self._spin(0.001, 100, 0.5, 0.01, 4)
-        self.c_length.setToolTip("Cuboid length along X [m].")
+        self.c_length.setToolTip(
+            "Cuboid length along X [m]. For Cylinder: derived length "
+            "(read-only; from mass, density and L/D)."
+        )
         self.c_width = self._spin(0.001, 100, 0.5, 0.01, 4)
         self.c_width.setToolTip("Cuboid width along Y [m].")
         self.c_height = self._spin(0.001, 100, 0.5, 0.01, 4)
@@ -503,24 +518,51 @@ class TabGeneral3D(QWidget):
         self.init_ix = self._spin(-100, 100, 0, 0.1, 2, max_width=116)
         self.init_iy = self._spin(-100, 100, 0, 0.1, 2, max_width=116)
         self.init_iz = self._spin(-100, 100, 0, 0.1, 2, max_width=116)
-        # Charge refinement (internal + outer) — created here so we can place the block above Center
+        # Charge seed / outer — created here for Mesh Properties Advanced + load/save hosts
+        self.combo_charge_seed_mode = QComboBox()
+        self.combo_charge_seed_mode.addItems([SEED_MODE_AUTO, SEED_MODE_MANUAL, SEED_MODE_OFF])
+        self.combo_charge_seed_mode.setCurrentText(SEED_MODE_AUTO)
+        self.combo_charge_seed_mode.setToolTip(
+            "Startup charge seed mode: Auto (target cells), Manual (explicit level), or Off."
+        )
+        self.spin_charge_seed_target = QSpinBox()
+        self.spin_charge_seed_target.setRange(1, 20)
+        self.spin_charge_seed_target.setValue(8)
+        self.spin_charge_seed_target.setMaximumWidth(60)
+        self.spin_charge_seed_target.setToolTip(
+            "Auto seed: target cells across the smallest charge dimension."
+        )
         self.spin_charge_refine = QSpinBox()
         self.spin_charge_refine.setRange(0, 8)
         self.spin_charge_refine.setValue(0)
         self.spin_charge_refine.setMaximumWidth(60)
-        self.spin_charge_refine.setToolTip("Startup charge seed: refineInternal level in system/setFieldsDict; 0 uses setFields.")
+        self.spin_charge_refine.setToolTip(
+            "Manual startup charge seed level (refineInternal). Used when Seed mode = Manual."
+        )
+        self.chk_charge_outer_enable = QCheckBox("Startup outer region")
+        self.chk_charge_outer_enable.setChecked(False)
+        self.chk_charge_outer_enable.setToolTip(
+            "Emit snappyHexMesh chargeRefineOuter region at Outer level (Dyn Mesh only)."
+        )
+        self.spin_charge_outer_level = QSpinBox()
+        self.spin_charge_outer_level.setRange(0, 10)
+        self.spin_charge_outer_level.setValue(3)
+        self.spin_charge_outer_level.setMaximumWidth(60)
+        self.spin_charge_outer_level.setToolTip(
+            "Single mode-inside level for chargeRefineOuter (source of truth)."
+        )
+        # Legacy min/max mirrors for load compatibility (hidden; synced from level).
         self.spin_charge_outer_min = QSpinBox()
         self.spin_charge_outer_min.setRange(0, 10)
-        self.spin_charge_outer_min.setValue(2)
+        self.spin_charge_outer_min.setValue(3)
         self.spin_charge_outer_min.setMaximumWidth(60)
-        self.spin_charge_outer_min.setToolTip("Charge outer band: minimum level in snappyHexMeshDict refinementRegions.")
+        self.spin_charge_outer_min.setToolTip("Legacy mirror of Outer level (min).")
         self.spin_charge_outer_max = QSpinBox()
         self.spin_charge_outer_max.setRange(0, 10)
         self.spin_charge_outer_max.setValue(3)
         self.spin_charge_outer_max.setMaximumWidth(60)
-        self.spin_charge_outer_max.setToolTip("Charge outer band: maximum level in snappyHexMeshDict refinementRegions.")
-        self.spin_charge_outer_min.valueChanged.connect(self._validate_charge_outer_levels)
-        self.spin_charge_outer_max.valueChanged.connect(self._validate_charge_outer_levels)
+        self.spin_charge_outer_max.setToolTip("Legacy mirror of Outer level (max).")
+        self.spin_charge_outer_level.valueChanged.connect(self._sync_charge_outer_level_mirrors)
         
         for _l in (self.lbl_radius, self.lbl_aspect, self.lbl_cylinder_axis, self.lbl_length, self.lbl_width, self.lbl_height):
             _l.setMinimumWidth(LABEL_MINW)
@@ -567,8 +609,8 @@ class TabGeneral3D(QWidget):
         self.spin_transition_cells.setValue(2)
         self.spin_transition_cells.setMaximumWidth(60)
         self.spin_transition_cells.setToolTip(
-            "Cells between refinement levels for charge outside region "
-            "(nCellsBetweenLevels-style graded transition in snappyHexMesh)."
+            "Global nCellsBetweenLevels used by snappyHexMesh. Controls grading "
+            "between refinement levels; it does not change outer-region physical extent."
         )
         self.spin_transition_cells.valueChanged.connect(lambda: self._set_provenance_user("transition_cells"))
         self._charge_seed_host = QWidget(self)
@@ -576,14 +618,19 @@ class TabGeneral3D(QWidget):
         seed_host_l = QFormLayout(self._charge_seed_host)
         seed_host_l.setContentsMargins(0, 0, 0, 0)
         seed_host_l.addRow(self.lbl_charge_refinement)
-        seed_host_l.addRow("Inside", self.spin_charge_refine)
+        seed_host_l.addRow("Seed mode", self.combo_charge_seed_mode)
+        seed_host_l.addRow("Target cells", self.spin_charge_seed_target)
+        seed_host_l.addRow("Manual seed level", self.spin_charge_refine)
+        seed_host_l.addRow(self.chk_charge_outer_enable)
+        seed_host_l.addRow("Outer level", self.spin_charge_outer_level)
+        # Legacy min/max kept as hidden mirrors for load/save compatibility.
         outside_host_row = QWidget()
         outside_host_h = QHBoxLayout(outside_host_row)
         outside_host_h.setContentsMargins(0, 0, 0, 0)
         outside_host_h.addWidget(self.spin_charge_outer_min)
         outside_host_h.addWidget(self.spin_charge_outer_max)
-        seed_host_l.addRow("Outside", outside_host_row)
-        seed_host_l.addRow("Transition Cells", self.spin_transition_cells)
+        seed_host_l.addRow("Outside (legacy mirrors)", outside_host_row)
+        seed_host_l.addRow("Snappy cells between levels", self.spin_transition_cells)
         # Keep value widgets owned/laid-out, but never painted in the main tab.
         self._charge_seed_host.setAttribute(Qt.WA_DontShowOnScreen, True)
         self._charge_seed_host.setFixedSize(0, 0)
@@ -638,11 +685,22 @@ class TabGeneral3D(QWidget):
         self._lower_refine_threshold = 0.1
         self._unrefine_threshold = 0.1
         self._n_buffer_layers_dynamic = 2
+        self._buffer_layers = 5
         self._enable_balancing = False
         self._refine_indicator_field = "densityGradient"
         # Snappy outer transition + optional topoSet seed: R_seed = R_charge * factor (not setRefinedFields capture).
         self._bubble_radius_factor = 1.5
         self._outside_extent = None  # None/0 in Mesh Properties = auto transition shell thickness
+        # Imported / preserved chargeRefineOuter state (lossless round-trip).
+        # Cleared only when the user deliberately edits Outer settings.
+        self._charge_outer_mode = None  # "inside" | "distance" | None
+        self._charge_outer_distance_levels = None  # list[(distance, level)]
+        self._charge_outer_geometry = None  # dict searchable* params
+        self._charge_outer_raw_refinement = None
+        # Hidden seed-policy fields (defaults match CaseInputs3D; not all have UI controls).
+        self._charge_seed_min_cells = 6
+        self._charge_seed_max_level = 5
+        self._charge_outer_legacy_migration_warning = None
         self._dynamic_max_cells = 200000000
         self._begin_unrefine = None
         self._upper_refine_level = None
@@ -919,6 +977,8 @@ class TabGeneral3D(QWidget):
         self._update_wave_amr_cell_label()
         dyn = self.rad_dyn_mesh.isChecked() and self.rad_dyn_mesh.isEnabled()
         wave_lvl = max(0, int(self.spin_refine_max.value()))
+        seed_mode = self.combo_charge_seed_mode.currentText()
+        seed_target = int(self.spin_charge_seed_target.value())
         self.lbl_plan_mesh_mode.setText(
             self._mesh_plan_row("Mesh mode", "AMR" if dyn else "Fixed")
         )
@@ -933,6 +993,8 @@ class TabGeneral3D(QWidget):
             if nx is not None:
                 grid_lines.append(self._mesh_plan_row("Base grid", f"{nx} × {ny} × {nz}"))
             grid_lines.append(self._mesh_plan_row("Mesh mode", "AMR" if dyn else "Fixed"))
+            grid_lines.append(self._mesh_plan_row("Charge seed mode", seed_mode))
+            grid_lines.append(self._mesh_plan_row("Charge seed target cells", str(seed_target)))
             grid_lines.append(self._mesh_plan_row("Wave AMR level", str(wave_lvl)))
             self.lbl_plan_block_mesh.setText("\n".join(grid_lines))
             self.lbl_plan_block_seed.hide()
@@ -942,16 +1004,41 @@ class TabGeneral3D(QWidget):
         init_cmd = self._planned_init_command_label(inputs)
         self.lbl_plan_init_command.setText(self._mesh_plan_row("Planned initialization", init_cmd))
 
+        seed_plan = build_charge_seed_plan(inputs)
         init_plan = build_initialization_plan(inputs)
-        seed_req = int(init_plan.seed_requested)
-        seed_label = "None" if seed_req <= 0 else "On"
+        # Effective level from init plan (Fixed Mesh / Remap force 0; Auto/Manual use seed plan).
+        seed_level = int(init_plan.seed_effective)
+        if bool(getattr(inputs, "remap_enabled", False)):
+            status = "Not applied — Remap"
+            seed_level_display = "0 (Not applied — Remap)"
+            target_display = "n/a (Remap)"
+        elif not (self.rad_dyn_mesh.isChecked() and self.rad_dyn_mesh.isEnabled()):
+            status = "Not applied — Fixed Mesh"
+            seed_level_display = "0 (Not applied — Fixed Mesh)"
+            target_display = (
+                str(seed_plan.target_cells)
+                if seed_plan.mode == "Auto"
+                else "n/a"
+            )
+        else:
+            status = seed_status_label(seed_plan)
+            seed_level_display = str(seed_level)
+            target_display = (
+                str(seed_plan.target_cells)
+                if seed_plan.mode == "Auto"
+                else "n/a (Manual/Off)"
+            )
         self.lbl_plan_charge_seed.setText(
-            self._mesh_plan_row("Charge seed", seed_label)
+            self._mesh_plan_row("Charge seed mode", seed_plan.mode)
             + "\n"
-            + self._mesh_plan_row("Charge seed level", str(seed_req))
+            + self._mesh_plan_row("Charge seed target cells", target_display)
+            + "\n"
+            + self._mesh_plan_row("Charge seed level", seed_level_display)
+            + "\n"
+            + self._mesh_plan_row("Charge seed status", status)
         )
 
-        # Charge capture status (short) + details in tooltip
+        # Charge capture status kept for tooltips / compatibility (not a Phase 1F visible row)
         try:
             r_phys = float(getattr(inputs, "cylinder_radius", 0.05) or 0.05)
             _r_cap, report = resolve_charge_capture_radius_m(inputs, r_phys)
@@ -1008,32 +1095,45 @@ class TabGeneral3D(QWidget):
         warn_parts = []
         if est > 0 and est < 8:
             warn_parts.append("Warning: Charge resolution is too low. Blast may fail.")
+        for w in seed_plan.warnings or ():
+            text = str(w or "").strip()
+            if not text:
+                continue
+            # Independence note is informational; surface safety/cap warnings only.
+            if "intentionally independent" in text.lower():
+                continue
+            warn_parts.append(text)
         self.lbl_charge_resolution_warning.setText("\n".join(warn_parts))
         if not warn_parts:
             self.lbl_charge_resolution_warning.setToolTip("")
 
-        # Visible Mesh Plan: one datum per row, fixed order (no h0 / no arrows).
+        # Visible Mesh Plan Phase 1F order (one datum per row; no h0 / no arrows).
         plan_lines = []
         if total is not None:
             plan_lines.append(self._mesh_plan_row("Total cells before refinement", f"{total:,}"))
         if nx is not None:
             plan_lines.append(self._mesh_plan_row("Base grid", f"{nx} × {ny} × {nz}"))
         plan_lines.append(self._mesh_plan_row("Mesh mode", "AMR" if dyn else "Fixed"))
+        plan_lines.append(self._mesh_plan_row("Charge seed mode", seed_plan.mode))
+        plan_lines.append(self._mesh_plan_row("Charge seed target cells", str(seed_plan.target_cells)))
+        plan_lines.append(self._mesh_plan_row("Charge seed level", str(seed_level)))
+        plan_lines.append(self._mesh_plan_row("Charge seed status", status))
         plan_lines.append(self._mesh_plan_row("Wave AMR level", str(wave_lvl)))
         plan_lines.append(self._mesh_plan_row("Planned initialization", init_cmd))
-        plan_lines.append(self._mesh_plan_row("Charge seed", seed_label))
-        plan_lines.append(self._mesh_plan_row("Charge seed level", str(seed_req)))
-        plan_lines.append(self.lbl_plan_charge_capture.text())
         plan_lines.append(self.lbl_plan_startup_outer.text())
         if outer_level is not None:
             plan_lines.append(self._mesh_plan_row("Startup outer level", str(outer_level)))
-        plan_lines.append(self._mesh_plan_row("Initiation location", loc))
-        plan_lines.append(self._mesh_plan_row("Initiation radius", f"{r_ign:g} m"))
 
         self.lbl_plan_block_mesh.setText("\n".join(plan_lines))
         self.lbl_plan_block_mesh.setToolTip(self.lbl_plan_charge_capture.toolTip())
         self.lbl_plan_block_seed.hide()
-        self.lbl_plan_block_status.hide()
+        # Initiation rows after warnings (layout order: mesh → warning → status).
+        self.lbl_plan_block_status.setText(
+            self._mesh_plan_row("Initiation location", loc)
+            + "\n"
+            + self._mesh_plan_row("Initiation radius", f"{r_ign:g} m")
+        )
+        self.lbl_plan_block_status.show()
 
     def _refresh_init_results_block(self) -> None:
         lines = []
@@ -1358,13 +1458,41 @@ class TabGeneral3D(QWidget):
         """Sync AMR maxRefinement with user-visible Levels max (so explicit change is written)."""
         self._dyn_refine_max = self.spin_refine_max.value()
 
+    def _sync_charge_outer_level_mirrors(self, *_args):
+        """Keep legacy min/max spins mirrored to spin_charge_outer_level (source of truth)."""
+        lvl = int(self.spin_charge_outer_level.value())
+        self.spin_charge_outer_min.blockSignals(True)
+        self.spin_charge_outer_max.blockSignals(True)
+        self.spin_charge_outer_min.setValue(lvl)
+        self.spin_charge_outer_max.setValue(lvl)
+        self.spin_charge_outer_min.blockSignals(False)
+        self.spin_charge_outer_max.blockSignals(False)
+
     def _validate_charge_outer_levels(self):
-        """Ensure charge outer min <= max."""
+        """Compatibility: prefer outer level spin; keep legacy min <= max."""
+        if hasattr(self, "spin_charge_outer_level"):
+            self._sync_charge_outer_level_mirrors()
+            return
         a, b = self.spin_charge_outer_min.value(), self.spin_charge_outer_max.value()
         if a > b:
             self.spin_charge_outer_min.blockSignals(True)
             self.spin_charge_outer_min.setValue(b)
             self.spin_charge_outer_min.blockSignals(False)
+
+    def _update_charge_seed_controls_enabled(self):
+        """Enable Advanced seed hosts for Dyn Mesh; target only in Auto; Manual level only in Manual."""
+        dyn = self.rad_dyn_mesh.isChecked() and self.rad_dyn_mesh.isEnabled()
+        mode = self.combo_charge_seed_mode.currentText()
+        self.lbl_charge_refinement.setEnabled(dyn)
+        self.combo_charge_seed_mode.setEnabled(dyn)
+        self.spin_charge_seed_target.setEnabled(dyn and mode == SEED_MODE_AUTO)
+        self.spin_charge_refine.setEnabled(dyn and mode == SEED_MODE_MANUAL)
+        self.chk_charge_outer_enable.setEnabled(dyn)
+        outer_on = dyn and self.chk_charge_outer_enable.isChecked()
+        self.spin_charge_outer_level.setEnabled(outer_on)
+        self.spin_charge_outer_min.setEnabled(outer_on)
+        self.spin_charge_outer_max.setEnabled(outer_on)
+        self.spin_transition_cells.setEnabled(dyn)
 
     def _compute_safe_dt(self) -> float:
         if getattr(self, "_delta_t_loaded", None) is not None:
@@ -1431,11 +1559,7 @@ class TabGeneral3D(QWidget):
         dyn = self.rad_dyn_mesh.isChecked() and self.rad_dyn_mesh.isEnabled()
         self.spin_refine_min.setEnabled(dyn)
         self.spin_refine_max.setEnabled(dyn)
-        self.lbl_charge_refinement.setEnabled(dyn)
-        self.spin_charge_refine.setEnabled(dyn)
-        self.spin_charge_outer_min.setEnabled(dyn)
-        self.spin_charge_outer_max.setEnabled(dyn)
-        self.spin_transition_cells.setEnabled(dyn)
+        self._update_charge_seed_controls_enabled()
         self._update_wave_amr_cell_label()
         self._update_calculated_dt_label()
         self._update_mesh_plan_display()
@@ -1505,8 +1629,9 @@ class TabGeneral3D(QWidget):
         self.c_mass.valueChanged.connect(self._update_charge_radius)
         self.c_rho.valueChanged.connect(self._update_charge_radius)
         self.c_aspect.valueChanged.connect(self._update_charge_radius)
-        self.c_aspect.valueChanged.connect(self._update_cylinder_height)
-        self.c_radius.valueChanged.connect(self._update_cylinder_height)
+        self.c_aspect.valueChanged.connect(self._update_cylinder_derived_geometry)
+        self.c_mass.valueChanged.connect(self._update_cylinder_derived_geometry)
+        self.c_rho.valueChanged.connect(self._update_cylinder_derived_geometry)
         self.c_length.valueChanged.connect(self._update_cuboid_height)
         self.c_width.valueChanged.connect(self._update_cuboid_height)
         
@@ -1521,6 +1646,8 @@ class TabGeneral3D(QWidget):
         for w in [
             self.scell,
             self.spin_charge_refine,
+            self.spin_charge_seed_target,
+            self.spin_charge_outer_level,
             self.spin_charge_outer_min,
             self.spin_charge_outer_max,
             self.spin_transition_cells,
@@ -1533,9 +1660,38 @@ class TabGeneral3D(QWidget):
             self.c_aspect,
         ]:
             w.valueChanged.connect(self._update_mesh_plan_display)
+        self.combo_charge_seed_mode.currentTextChanged.connect(self._on_charge_seed_mode_changed)
+        self.chk_charge_outer_enable.toggled.connect(self._on_charge_outer_enable_changed)
+        self.spin_charge_outer_level.valueChanged.connect(self._on_charge_outer_level_changed)
         self.c_shape.currentIndexChanged.connect(self._update_mesh_plan_display)
         self.rad_init_standard.toggled.connect(self._update_mesh_plan_display)
         self.rad_init_remap.toggled.connect(self._update_mesh_plan_display)
+
+    def _invalidate_imported_outer_state(self) -> None:
+        """Drop retained imported outer geometry/mode after deliberate Outer edits.
+
+        Transition: subsequent generation uses canonical GGUI mode inside + UI level
+        and rebuilt searchable geometry from outside_extent / bubble_radius_factor.
+        """
+        if getattr(self, "_block_signals", False):
+            return
+        self._charge_outer_geometry = None
+        self._charge_outer_distance_levels = None
+        self._charge_outer_raw_refinement = None
+        self._charge_outer_mode = "inside"
+
+    def _on_charge_seed_mode_changed(self, *_args):
+        self._update_charge_seed_controls_enabled()
+        self._update_mesh_plan_display()
+
+    def _on_charge_outer_enable_changed(self, *_args):
+        self._invalidate_imported_outer_state()
+        self._update_charge_seed_controls_enabled()
+        self._update_mesh_plan_display()
+
+    def _on_charge_outer_level_changed(self, *_args):
+        self._invalidate_imported_outer_state()
+        self._update_mesh_plan_display()
 
     def _update_edit_button_visibility(self):
         is_custom = self.c_mat.currentText() == "Custom"
@@ -1594,10 +1750,10 @@ class TabGeneral3D(QWidget):
         f_buf = QFormLayout(grp_buf)
         spin_buf_setfields = QSpinBox()
         spin_buf_setfields.setRange(0, 20)
-        spin_buf_setfields.setValue(getattr(self, "_buffer_layers", 2))
-        spin_buf_setfields.setToolTip("nBufferLayers in setFieldsDict. Default 2 (building3D-style).")
+        spin_buf_setfields.setValue(getattr(self, "_buffer_layers", 5))
+        spin_buf_setfields.setToolTip("nBufferLayers in setFieldsDict. Default 5.")
         f_buf.addRow("Buffer layers (setFields)", spin_buf_setfields)
-        f_buf.addRow("", QLabel("nBufferLayers for charge/refinement regions (building3D: 2)."))
+        f_buf.addRow("", QLabel("nBufferLayers for charge/refinement regions (default: 5)."))
         cap_hint = QLabel(
             "Charge capture radius is used only to seed the explosive on a coarse base mesh "
             "(setRefinedFields backup region). It is not the physical charge radius and must not "
@@ -1670,43 +1826,68 @@ class TabGeneral3D(QWidget):
         # Charge seed / outer band (relocated from main Charge Properties)
         grp_charge_seed = QGroupBox("Charge seed / outer band (Advanced)")
         f_seed_adv = QFormLayout(grp_charge_seed)
+        combo_seed_mode = QComboBox()
+        combo_seed_mode.addItems([SEED_MODE_AUTO, SEED_MODE_MANUAL, SEED_MODE_OFF])
+        combo_seed_mode.setCurrentText(self.combo_charge_seed_mode.currentText())
+        combo_seed_mode.setToolTip(self.combo_charge_seed_mode.toolTip())
+        combo_seed_mode.setEnabled(self.combo_charge_seed_mode.isEnabled())
+        f_seed_adv.addRow("Seed mode", combo_seed_mode)
+        spin_seed_target = QSpinBox()
+        spin_seed_target.setRange(self.spin_charge_seed_target.minimum(), self.spin_charge_seed_target.maximum())
+        spin_seed_target.setValue(self.spin_charge_seed_target.value())
+        spin_seed_target.setToolTip(self.spin_charge_seed_target.toolTip())
+        spin_seed_target.setEnabled(self.spin_charge_seed_target.isEnabled())
+        f_seed_adv.addRow("Target cells", spin_seed_target)
         spin_seed_inside = QSpinBox()
         spin_seed_inside.setRange(self.spin_charge_refine.minimum(), self.spin_charge_refine.maximum())
         spin_seed_inside.setValue(self.spin_charge_refine.value())
         spin_seed_inside.setToolTip(self.spin_charge_refine.toolTip())
-        spin_seed_inside.setEnabled(self.spin_charge_refine.isEnabled())
-        f_seed_adv.addRow("Inside / manual seed level", spin_seed_inside)
-        spin_out_min = QSpinBox()
-        spin_out_min.setRange(self.spin_charge_outer_min.minimum(), self.spin_charge_outer_min.maximum())
-        spin_out_min.setValue(self.spin_charge_outer_min.value())
-        spin_out_min.setToolTip(self.spin_charge_outer_min.toolTip())
-        spin_out_min.setEnabled(self.spin_charge_outer_min.isEnabled())
-        spin_out_max = QSpinBox()
-        spin_out_max.setRange(self.spin_charge_outer_max.minimum(), self.spin_charge_outer_max.maximum())
-        spin_out_max.setValue(self.spin_charge_outer_max.value())
-        spin_out_max.setToolTip(self.spin_charge_outer_max.toolTip())
-        spin_out_max.setEnabled(self.spin_charge_outer_max.isEnabled())
-        outside_row = QWidget()
-        outside_h = QHBoxLayout(outside_row)
-        outside_h.setContentsMargins(0, 0, 0, 0)
-        outside_h.addWidget(QLabel("Min"))
-        outside_h.addWidget(spin_out_min)
-        outside_h.addWidget(QLabel("Max"))
-        outside_h.addWidget(spin_out_max)
-        outside_h.addStretch()
-        f_seed_adv.addRow("Outside", outside_row)
+        f_seed_adv.addRow("Manual seed level", spin_seed_inside)
+        chk_outer_enable = QCheckBox("Startup outer region")
+        chk_outer_enable.setChecked(self.chk_charge_outer_enable.isChecked())
+        chk_outer_enable.setToolTip(self.chk_charge_outer_enable.toolTip())
+        chk_outer_enable.setEnabled(self.chk_charge_outer_enable.isEnabled())
+        f_seed_adv.addRow(chk_outer_enable)
+        spin_out_level = QSpinBox()
+        spin_out_level.setRange(self.spin_charge_outer_level.minimum(), self.spin_charge_outer_level.maximum())
+        spin_out_level.setValue(self.spin_charge_outer_level.value())
+        spin_out_level.setToolTip(self.spin_charge_outer_level.toolTip())
+        f_seed_adv.addRow("Outer level", spin_out_level)
         spin_trans = QSpinBox()
         spin_trans.setRange(self.spin_transition_cells.minimum(), self.spin_transition_cells.maximum())
         spin_trans.setValue(self.spin_transition_cells.value())
-        spin_trans.setToolTip(self.spin_transition_cells.toolTip())
+        spin_trans.setToolTip(
+            "Global nCellsBetweenLevels used by snappyHexMesh. Controls grading "
+            "between refinement levels; it does not change outer-region physical extent."
+        )
         spin_trans.setEnabled(self.spin_transition_cells.isEnabled())
-        f_seed_adv.addRow("Transition Cells", spin_trans)
+        f_seed_adv.addRow("Snappy cells between levels", spin_trans)
+        tip_trans = QLabel(
+            "Snappy cells between levels sets global nCellsBetweenLevels for grading "
+            "between refinement levels; it does not change outer-region size in metres."
+        )
+        tip_trans.setWordWrap(True)
+        f_seed_adv.addRow(tip_trans)
         hint_seed = QLabel(
-            "These controls are unchanged in meaning; only their location moved out of the main flow. "
-            "Fixed Mesh disables seed/outer band (same as before)."
+            "Fixed Mesh disables seed application at initialize (mode is left unchanged). "
+            "Manual seed level is used only when Seed mode = Manual."
         )
         hint_seed.setWordWrap(True)
         f_seed_adv.addRow(hint_seed)
+
+        def _refresh_seed_adv_enabled() -> None:
+            dyn = self.rad_dyn_mesh.isChecked() and self.rad_dyn_mesh.isEnabled()
+            mode = combo_seed_mode.currentText()
+            combo_seed_mode.setEnabled(dyn)
+            spin_seed_target.setEnabled(dyn and mode == SEED_MODE_AUTO)
+            spin_seed_inside.setEnabled(dyn and mode == SEED_MODE_MANUAL)
+            chk_outer_enable.setEnabled(dyn)
+            spin_out_level.setEnabled(dyn and chk_outer_enable.isChecked())
+            spin_trans.setEnabled(dyn)
+
+        _refresh_seed_adv_enabled()
+        combo_seed_mode.currentTextChanged.connect(lambda _t: _refresh_seed_adv_enabled())
+        chk_outer_enable.toggled.connect(lambda _v: _refresh_seed_adv_enabled())
         v.addWidget(grp_charge_seed)
 
         # Group: Dyn Refine (AMR) – only core controls
@@ -1983,14 +2164,15 @@ class TabGeneral3D(QWidget):
                 self._charge_backup_radius_override = self._charge_capture_radius_manual
             else:
                 self._charge_backup_radius_override = None
+            self.combo_charge_seed_mode.setCurrentText(combo_seed_mode.currentText())
+            self.spin_charge_seed_target.setValue(int(spin_seed_target.value()))
             self.spin_charge_refine.setValue(int(spin_seed_inside.value()))
-            a_out, b_out = int(spin_out_min.value()), int(spin_out_max.value())
-            if a_out > b_out:
-                a_out, b_out = b_out, a_out
-            self.spin_charge_outer_min.setValue(a_out)
-            self.spin_charge_outer_max.setValue(b_out)
+            self.chk_charge_outer_enable.setChecked(chk_outer_enable.isChecked())
+            self.spin_charge_outer_level.setValue(int(spin_out_level.value()))
+            self._sync_charge_outer_level_mirrors()
             self.spin_transition_cells.setValue(int(spin_trans.value()))
             self._set_provenance_user("transition_cells")
+            self._update_charge_seed_controls_enabled()
             self._refine_interval = spin_ref_int.value()
             self._lower_refine_threshold = spin_lower.value()
             self._unrefine_threshold = spin_unref.value()
@@ -2003,7 +2185,11 @@ class TabGeneral3D(QWidget):
             self._enable_balancing = chk_bal.isChecked()
             self._balance_interval = None if spin_bal_int.value() <= 0 else int(spin_bal_int.value())
             v_oe = float(spin_out_extent.value())
+            prev_oe = getattr(self, "_outside_extent", None)
             self._outside_extent = None if v_oe <= 0.0 else v_oe
+            # Deliberate Outside extent edit invalidates imported outer geometry.
+            if prev_oe != self._outside_extent:
+                self._invalidate_imported_outer_state()
             self._refine_indicator_field = str(combo_refine_indicator.currentData() or "densityGradient")
             for k in (
                 "outside_extent",
@@ -2203,17 +2389,35 @@ class TabGeneral3D(QWidget):
         self.c_radius.blockSignals(False)
         self._update_preview()
 
-    def _update_cylinder_height(self):
-        """For Cylinder: keep displayed height coupled to Radius and L/D."""
+    def _update_cylinder_derived_geometry(self):
+        """Cylinder Radius/Length are derived from mass, density and L/D (read-only)."""
         if self.c_shape.currentText() != "Cylinder":
             return
-        r = max(1e-9, self.c_radius.value())
-        aspect = max(0.1, self.c_aspect.value())
-        L = 2.0 * r * aspect
+        try:
+            from physical_charge_geometry import physical_charge_geometry
+            from types import SimpleNamespace
+
+            geom = physical_charge_geometry(
+                SimpleNamespace(
+                    charge_shape="Cylinder",
+                    mass_kg=float(self.c_mass.value()),
+                    rho_charge=float(self.c_rho.value()),
+                    charge_aspect=float(self.c_aspect.value()),
+                )
+            )
+        except ValueError:
+            return
+        self.c_radius.blockSignals(True)
         self.c_length.blockSignals(True)
-        self.c_length.setValue(round(L, 6) if L < 1000 else L)
+        self.c_radius.setValue(float(geom.cylinder_radius_m))
+        self.c_length.setValue(float(geom.length_m))
+        self.c_radius.blockSignals(False)
         self.c_length.blockSignals(False)
         self._update_preview()
+
+    def _update_cylinder_height(self):
+        """Compatibility alias — Cylinder length is mass/ρ/L/D-derived."""
+        self._update_cylinder_derived_geometry()
 
     def _update_cuboid_height(self):
         """For Cuboid: set height = V/(L×W) so dimensions match mass and density. Height is read-only."""
@@ -2256,10 +2460,17 @@ class TabGeneral3D(QWidget):
             self._update_charge_radius()
         elif is_cylinder:
             self.lbl_radius.setText("Radius [m]")
-            self.c_radius.setReadOnly(False)
+            # Derived from mass/ρ/L/D for cylindericalMassToCell — not editable.
+            self.c_radius.setReadOnly(True)
+            self.c_radius.setToolTip(
+                "Derived from mass, density and L/D for cylindericalMassToCell."
+            )
+            self.c_length.setToolTip(
+                "Derived from mass, density and L/D for cylindericalMassToCell."
+            )
             for w in (self.c_radius, self.lbl_radius):
-                w.setEnabled(True)
-            self._update_cylinder_height()
+                w.setEnabled(False)  # gray display-only, same as Sphere radius
+            self._update_cylinder_derived_geometry()
         else:
             for w in (self.c_radius, self.lbl_radius):
                 w.setEnabled(False)
@@ -2279,13 +2490,14 @@ class TabGeneral3D(QWidget):
             self.c_height.setReadOnly(True)
             self._update_cuboid_height()
         elif is_cylinder:
-            self.lbl_length.setText("Height [m]")
+            self.lbl_length.setText("Length [m]")
             for w in (self.c_length, self.lbl_length):
                 w.setEnabled(False)
                 w.setVisible(True)
             self.c_length.setReadOnly(True)
             for w in (self.c_width, self.lbl_width, self.c_height, self.lbl_height):
                 w.setVisible(False)
+            self._update_cylinder_derived_geometry()
         else:
             for w in (self.c_length, self.lbl_length, self.c_width, self.lbl_width, self.c_height, self.lbl_height):
                 w.setEnabled(False)
@@ -2458,15 +2670,20 @@ class TabGeneral3D(QWidget):
         has_obstacles = any(obs.enabled for obs in self.obstacles)
         shape = self.c_shape.currentText()
         dyn_refine = self.rad_dyn_mesh.isChecked() and self.rad_dyn_mesh.isEnabled()
-        charge_refine = self.spin_charge_refine.value() if dyn_refine else 0
-        outside_min = self.spin_charge_outer_min.value()
-        outside_max = self.spin_charge_outer_max.value()
+        seed_mode = self.combo_charge_seed_mode.currentText()
+        charge_refine = self.spin_charge_refine.value()
+        outer_level = self.spin_charge_outer_level.value()
+        outer_on = dyn_refine and self.chk_charge_outer_enable.isChecked()
 
         plan.append("Create/refresh case dictionaries under system/, constant/, and 0.orig/.")
         plan.append(f"Mesh mode: {'Dynamic/Hybrid' if dyn_refine else 'Fixed/Static'}")
         plan.append(f"Charge geometry: {shape}")
-        plan.append(f"Charge refine level (requested): {charge_refine}")
-        plan.append(f"Outer transition levels (requested): {outside_min}-{outside_max}")
+        plan.append(f"Charge seed mode: {seed_mode}")
+        plan.append(f"Charge seed target cells: {self.spin_charge_seed_target.value()}")
+        plan.append(f"Charge refine level (manual storage): {charge_refine}")
+        plan.append(
+            f"Startup outer region: {'On (level ' + str(outer_level) + ')' if outer_on else 'Off'}"
+        )
         plan.append(f"Obstacle meshing: {'enabled' if has_obstacles else 'disabled'}")
         if remap:
             plan.append("Initialization source: remap from pre-cursor case.")
@@ -2768,14 +2985,23 @@ class TabGeneral3D(QWidget):
         elif key == "cores":
             self.spin_cores.setValue(1)
         elif key == "charge_refinement_level":
-            self.spin_charge_refine.setValue(2)
+            self.spin_charge_refine.setValue(0)
+        elif key == "charge_seed_mode":
+            self.combo_charge_seed_mode.setCurrentText(SEED_MODE_AUTO)
+        elif key == "charge_seed_target_cells":
+            self.spin_charge_seed_target.setValue(8)
+        elif key == "charge_outer_refine_level":
+            self.spin_charge_outer_level.setValue(3)
+            self._sync_charge_outer_level_mirrors()
         elif key == "charge_outer_refine_min":
-            self.spin_charge_outer_min.setValue(self.spin_refine_min.value())
+            self.spin_charge_outer_level.setValue(max(self.spin_charge_outer_level.value(), 0))
+            self._sync_charge_outer_level_mirrors()
         elif key == "charge_outer_refine_max":
-            self.spin_charge_outer_max.setValue(self.spin_refine_max.value())
+            self.spin_charge_outer_level.setValue(3)
+            self._sync_charge_outer_level_mirrors()
         elif key == "charge_outer_refine_enable":
-            self.spin_charge_outer_min.setValue(0)
-            self.spin_charge_outer_max.setValue(0)
+            self.chk_charge_outer_enable.setChecked(False)
+            self._sync_charge_outer_level_mirrors()
         elif key == "cylinder_axis":
             idx = self.c_cylinder_axis.findText("Z")
             if idx >= 0:
@@ -2793,7 +3019,7 @@ class TabGeneral3D(QWidget):
             self._charge_capture_radius_manual = 0.2
             self._charge_backup_radius_override = None
         elif key == "buffer_layers":
-            self._buffer_layers = 2
+            self._buffer_layers = 5
         elif key == "activation_model":
             self.rad_init_standard.setChecked(True)
         elif key == "stl_obstacles":
@@ -3144,28 +3370,94 @@ class TabGeneral3D(QWidget):
                     # Ignore malformed values from imported cases and keep current defaults.
                     continue
                 setattr(self, attr, val)
+            if "charge_seed_mode" in data and data["charge_seed_mode"] not in (None, ""):
+                mode_txt = str(data["charge_seed_mode"]).strip()
+                idx = self.combo_charge_seed_mode.findText(mode_txt)
+                if idx < 0:
+                    low = mode_txt.lower()
+                    if low == "auto":
+                        idx = self.combo_charge_seed_mode.findText(SEED_MODE_AUTO)
+                    elif low in ("manual", "man"):
+                        idx = self.combo_charge_seed_mode.findText(SEED_MODE_MANUAL)
+                    elif low in ("off", "none", "disabled", "0"):
+                        idx = self.combo_charge_seed_mode.findText(SEED_MODE_OFF)
+                if idx >= 0:
+                    self.combo_charge_seed_mode.setCurrentIndex(idx)
+            elif "charge_refinement_level" in data and data["charge_refinement_level"] is not None:
+                # Legacy projects without explicit mode: non-zero level → Manual, else Off.
+                lvl_legacy = int(data["charge_refinement_level"])
+                self.combo_charge_seed_mode.setCurrentText(
+                    SEED_MODE_MANUAL if lvl_legacy > 0 else SEED_MODE_OFF
+                )
+            if "charge_seed_target_cells" in data and data["charge_seed_target_cells"] is not None:
+                try:
+                    self.spin_charge_seed_target.setValue(
+                        max(1, min(20, int(data["charge_seed_target_cells"])))
+                    )
+                except (TypeError, ValueError):
+                    pass
+            if "charge_seed_min_cells" in data and data["charge_seed_min_cells"] is not None:
+                try:
+                    self._charge_seed_min_cells = max(1, int(data["charge_seed_min_cells"]))
+                except (TypeError, ValueError):
+                    pass
+            if "charge_seed_max_level" in data and data["charge_seed_max_level"] is not None:
+                try:
+                    self._charge_seed_max_level = max(0, int(data["charge_seed_max_level"]))
+                except (TypeError, ValueError):
+                    pass
+            if "charge_outer_legacy_migration_warning" in data:
+                warn = data.get("charge_outer_legacy_migration_warning")
+                self._charge_outer_legacy_migration_warning = (
+                    str(warn) if warn else None
+                )
             if "charge_refinement_level" in data and data["charge_refinement_level"] is not None:
                 self.spin_charge_refine.setValue(int(data["charge_refinement_level"]))
-            has_outside = any(
+            # Outer: prefer charge_outer_refine_level; migrate legacy min/max → level = max(min, max).
+            outer_level_val = None
+            if data.get("charge_outer_refine_level") is not None:
+                try:
+                    outer_level_val = int(data["charge_outer_refine_level"])
+                except (TypeError, ValueError):
+                    outer_level_val = None
+            elif data.get("charge_outer_refine_min") is not None or data.get("charge_outer_refine_max") is not None:
+                try:
+                    a = int(data["charge_outer_refine_min"]) if data.get("charge_outer_refine_min") is not None else 0
+                    b = int(data["charge_outer_refine_max"]) if data.get("charge_outer_refine_max") is not None else a
+                    outer_level_val = max(a, b)
+                except (TypeError, ValueError):
+                    outer_level_val = None
+            if outer_level_val is not None:
+                self.spin_charge_outer_level.setValue(max(0, outer_level_val))
+                self._sync_charge_outer_level_mirrors()
+            if "charge_outer_refine_enable" in data:
+                self.chk_charge_outer_enable.setChecked(bool(data["charge_outer_refine_enable"]))
+            elif any(
                 k in data and data[k] is not None
-                for k in ("charge_outer_refine_min", "charge_outer_refine_max", "charge_outer_refine_enable")
-            )
-            if has_outside:
-                if data.get("charge_outer_refine_min") is not None:
-                    self.spin_charge_outer_min.setValue(int(data["charge_outer_refine_min"]))
+                for k in ("charge_outer_refine_min", "charge_outer_refine_max", "charge_outer_refine_level")
+            ):
+                # Legacy: presence of outer levels implied enabled (unless explicitly False above).
+                self.chk_charge_outer_enable.setChecked(True)
+            # Lossless imported outer mode / geometry / distance pairs (hidden state).
+            if "charge_outer_mode" in data:
+                mode = data.get("charge_outer_mode")
+                self._charge_outer_mode = str(mode).strip().lower() if mode else None
+            if "charge_outer_distance_levels" in data:
+                pairs = data.get("charge_outer_distance_levels")
+                if isinstance(pairs, list):
+                    norm = []
+                    for item in pairs:
+                        if isinstance(item, (list, tuple)) and len(item) >= 2:
+                            norm.append((float(item[0]), int(item[1])))
+                    self._charge_outer_distance_levels = norm or None
                 else:
-                    self.spin_charge_outer_min.setValue(0)
-                if data.get("charge_outer_refine_max") is not None:
-                    self.spin_charge_outer_max.setValue(int(data["charge_outer_refine_max"]))
-                else:
-                    self.spin_charge_outer_max.setValue(0)
-            else:
-                # Explicit load rule: when outside is not defined in file, keep 0/0.
-                self.spin_charge_outer_min.setValue(0)
-                self.spin_charge_outer_max.setValue(0)
-            if data.get("charge_outer_refine_enable") is False:
-                self.spin_charge_outer_min.setValue(0)
-                self.spin_charge_outer_max.setValue(0)
+                    self._charge_outer_distance_levels = None
+            if "charge_outer_geometry" in data:
+                geom = data.get("charge_outer_geometry")
+                self._charge_outer_geometry = dict(geom) if isinstance(geom, dict) else None
+            if "charge_outer_raw_refinement" in data:
+                raw = data.get("charge_outer_raw_refinement")
+                self._charge_outer_raw_refinement = str(raw) if raw else None
             if "cylinder_axis" in data:
                 idx = self.c_cylinder_axis.findText(data["cylinder_axis"])
                 if idx >= 0:
@@ -3309,14 +3601,18 @@ class TabGeneral3D(QWidget):
         charge_capture_radius_out = (
             float(_mrad_raw) if _cc_mode_l == "manual" and _mrad_raw is not None else None
         )
-        return CaseInputs3D(
+        seed_mode = self.combo_charge_seed_mode.currentText()
+        outer_level = int(self.spin_charge_outer_level.value())
+        # Fixed Mesh: outer enable forced False; seed mode left as-is (init plan forces seed off).
+        outer_enable = bool(self.chk_charge_outer_enable.isChecked()) if refine else False
+        inputs = CaseInputs3D(
             min_point=(self.sx1.value(), self.sy1.value(), self.sz1.value()),
             max_point=(self.sx2.value(), self.sy2.value(), self.sz2.value()),
             cell_size=self.scell.value(),
             charge_center=(self.cx.value(), self.cy.value(), self.cz.value()),
             initiation_point=initiation_point,
             ignition_mode=ignition_mode,
-            buffer_layers=getattr(self, "_buffer_layers", 2),
+            buffer_layers=getattr(self, "_buffer_layers", 5),
             charge_shape=self.c_shape.currentText(),
             cylinder_radius=self.c_radius.value() if self.c_shape.currentText() in ("Sphere", "Cylinder") else 0.05,
             cylinder_axis=self.c_cylinder_axis.currentText(),
@@ -3344,13 +3640,33 @@ class TabGeneral3D(QWidget):
             enable_obstacle_refine=enable_obs,
             obstacle_refine_min=self.spin_obstacle_refine_min.value(),
             obstacle_refine_max=self.spin_obstacle_refine_max.value(),
-            # Fixed Mesh: no charge refinement (inside, outside, or startup seed) — mesh stays uniform
-            charge_refinement_level=(self.spin_charge_refine.value() if refine else 0),
-            charge_outer_refine_enable=(refine and (self.spin_charge_outer_min.value() != 0 or self.spin_charge_outer_max.value() != 0)),
-            charge_outer_refine_min=self.spin_charge_outer_min.value(),
-            charge_outer_refine_max=self.spin_charge_outer_max.value(),
+            # Mode is authoritative; still pass manual spin for Manual (and for Auto/Off storage).
+            charge_refinement_level=int(self.spin_charge_refine.value()),
+            charge_seed_mode=seed_mode,
+            charge_seed_target_cells=int(self.spin_charge_seed_target.value()),
+            charge_seed_min_cells=int(getattr(self, "_charge_seed_min_cells", 6)),
+            charge_seed_max_level=int(getattr(self, "_charge_seed_max_level", 5)),
+            charge_outer_refine_enable=outer_enable,
+            charge_outer_refine_level=outer_level,
+            charge_outer_refine_min=outer_level,
+            charge_outer_refine_max=outer_level,
+            charge_outer_mode=getattr(self, "_charge_outer_mode", None),
+            charge_outer_distance_levels=(
+                list(self._charge_outer_distance_levels)
+                if getattr(self, "_charge_outer_distance_levels", None)
+                else None
+            ),
+            charge_outer_geometry=(
+                dict(self._charge_outer_geometry)
+                if isinstance(getattr(self, "_charge_outer_geometry", None), dict)
+                else None
+            ),
+            charge_outer_raw_refinement=getattr(self, "_charge_outer_raw_refinement", None),
+            charge_outer_legacy_migration_warning=getattr(
+                self, "_charge_outer_legacy_migration_warning", None
+            ),
             transition_cells=transition_cells,
-            use_seed_bubble=(refine and self.spin_charge_refine.value() > 0),
+            use_seed_bubble=(refine and seed_mode != SEED_MODE_OFF),
             charge_capture_mode=str(getattr(self, "_charge_capture_mode", "auto") or "auto"),
             charge_capture_factor=charge_capture_factor_out,
             charge_capture_radius=charge_capture_radius_out,
@@ -3422,3 +3738,23 @@ class TabGeneral3D(QWidget):
             provenance=dict(getattr(self, "_provenance", {})),
             estimated_charge_cells=est_cells,
         )
+        # Cylinder: mass/ρ/L/D are authoritative for cylindericalMassToCell — sync derived r, L.
+        if inputs.charge_shape == "Cylinder":
+            from physical_charge_geometry import (
+                physical_charge_geometry,
+                sync_derived_cylinder_fields,
+            )
+
+            try:
+                inputs = sync_derived_cylinder_fields(inputs)
+                geom = physical_charge_geometry(inputs)
+                self.c_radius.blockSignals(True)
+                self.c_length.blockSignals(True)
+                self.c_radius.setValue(float(geom.cylinder_radius_m))
+                self.c_length.setValue(float(geom.length_m))
+            except ValueError:
+                pass
+            finally:
+                self.c_radius.blockSignals(False)
+                self.c_length.blockSignals(False)
+        return inputs
