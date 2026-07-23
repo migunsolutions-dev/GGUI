@@ -3,7 +3,7 @@ import numpy as np
 import pyvista as pv
 from pyvistaqt import QtInteractor
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QFrame, QLabel
+    QWidget, QVBoxLayout, QFrame, QLabel, QSizePolicy
 )
 from PyQt5.QtCore import pyqtSignal
 from dataclasses import dataclass, field
@@ -91,7 +91,11 @@ class BlastViewerWidget(QWidget):
     def _init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0,0,0,0)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.plotter_frame = QFrame()
+        self.plotter_frame.setMinimumWidth(0)
+        self.plotter_frame.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.plotter_layout = QVBoxLayout(self.plotter_frame)
         self.plotter_layout.setContentsMargins(0,0,0,0)
         layout.addWidget(self.plotter_frame)
@@ -102,7 +106,13 @@ class BlastViewerWidget(QWidget):
         self._plotter.set_background("#F0F2F5")  # Light bluish-grey (Engineering style)
         self._plotter.add_axes()
         self._plotter.enable_trackball_style()
-        self.plotter_layout.addWidget(self._plotter.interactor)
+        interactor = self._plotter.interactor
+        try:
+            interactor.setMinimumWidth(0)
+            interactor.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        except Exception:
+            pass
+        self.plotter_layout.addWidget(interactor)
 
     def set_field(self, name):
         self.current_field = name

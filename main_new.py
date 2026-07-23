@@ -10,10 +10,10 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFrame, QProgressBar, QMessageBox, QToolBar, QAction,
     QSplitter, QScrollArea, QGroupBox, QFormLayout, QStatusBar, QFileDialog,
-    QDialog, QTextEdit, QDialogButtonBox,
+    QDialog, QTextEdit, QDialogButtonBox, QSizePolicy,
 )
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QIcon
+from PyQt5.QtCore import Qt, QTimer, QSize
+from PyQt5.QtGui import QIcon, QFont
 
 from tab_1d import Tab1D
 from tab_2d import Tab2D
@@ -98,89 +98,268 @@ class InfoPanel(QFrame):
 
 
 class SegmentedStatusBar(QFrame):
-    """Bottom full-width status bar with segments for 1D/2D/3D"""
+    """Bottom full-width status bar with segments for 1D/2D/3D.
+
+    Compact grouped metrics keep all three stage histories visible at the
+    reference opening width (~1685 px) without a status scrollbar. Metric
+    groups use Preferred widths inside a local QScrollArea so the top-level
+    window remains shrinkable. Ready/Running stays fixed on the right.
+    """
+
+    _DASH = "——"
+    _LABEL_STYLE = "color: white; background: transparent;"
+    _STATUS_STYLE_TMPL = "color: {color}; font-weight: bold; background: transparent;"
+
+    def _metrics_font(self, pixel_size: int = 12) -> QFont:
+        # Pixel size avoids inflated pt metrics on high logicalDpi displays.
+        font = QFont("Consolas")
+        font.setStyleHint(QFont.TypeWriter)
+        font.setPixelSize(pixel_size)
+        font.setWeight(QFont.DemiBold)
+        return font
+
+    def _apply_metrics_font(self, font: QFont) -> None:
+        for lbl in (
+            self.lbl_1d_group, self.lbl_2d_group, self.lbl_3d_group,
+            self.lbl_3d_initial_dt, self.lbl_3d_et,
+            self._sep_1d_2d, self._sep_2d_3d, self._sep_3d_meta,
+            self.lbl_status,
+        ):
+            lbl.setFont(font)
+
+    def _fit_metrics_font_to_opening_width(self, target_content_width: int = 1550) -> None:
+        """Choose the largest pixel font that keeps idle/representative content under target.
+
+        Ensures the ~1685 opening width can show all metrics without a status scrollbar
+        across Consolas/Courier and offscreen/native metric differences.
+        """
+        # Seed representative text for measurement (restored to dashes afterward).
+        probe_1d = dict(self._1d)
+        probe_2d = dict(self._2d)
+        probe_3d = dict(self._3d)
+        probe_init = self._initial_dt
+        self.lbl_1d_group.setText(
+            self._format_mode_group("1D", {"step": 123456, "tt": 0.01234, "dt": 1.23e-6})
+        )
+        self.lbl_2d_group.setText(
+            self._format_mode_group("2D", {"step": 234567, "tt": 0.02345, "dt": 2.34e-6})
+        )
+        self.lbl_3d_group.setText(
+            self._format_mode_group("3D", {"step": 345678, "tt": 0.03456, "dt": 3.45e-6})
+        )
+        self.lbl_3d_initial_dt.setText("Initial Δt: 5.56e-07")
+        self.lbl_3d_et.setText("ET: 12.34s")
+
+        chosen = self._metrics_font(10)
+        for px in range(13, 9, -1):
+            font = self._metrics_font(px)
+            self._apply_metrics_font(font)
+            self._metrics_widget.adjustSize()
+            if self._metrics_widget.sizeHint().width() <= target_content_width:
+                chosen = font
+                break
+        self._apply_metrics_font(chosen)
+
+        # Restore current (possibly dash) values
+        self.lbl_1d_group.setText(self._format_mode_group("1D", probe_1d))
+        self.lbl_2d_group.setText(self._format_mode_group("2D", probe_2d))
+        self.lbl_3d_group.setText(self._format_mode_group("3D", probe_3d))
+        if probe_init is None:
+            self.lbl_3d_initial_dt.setText("Initial Δt: —")
+        else:
+            self.lbl_3d_initial_dt.setText(f"Initial Δt: {probe_init:.2e}")
+        et = probe_3d.get("et")
+        self.lbl_3d_et.setText(f"ET: {self._DASH}" if et is None else f"ET: {et:.2f}s")
+        self._refresh_metrics_width()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(40)
-        self.setStyleSheet("background-color: #34495e; border-top: 2px solid #2c3e50;")
-        
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 5, 10, 5)
-        layout.setSpacing(20)
-        
-        label_style = "color: white; font-family: 'Consolas', monospace; font-size: 10pt; font-weight: bold;"
-        
-        # 1D Section
-        self.lbl_1d_step = QLabel("Step–1D: ——")
-        self.lbl_1d_tt = QLabel("Tt–1D: ——")
-        self.lbl_1d_dt = QLabel("DT–1D: ——")
-        
-        # 2D Section (placeholder for future)
-        self.lbl_2d_step = QLabel("Step–2D: ——")
-        self.lbl_2d_tt = QLabel("Tt–2D: ——")
-        self.lbl_2d_dt = QLabel("DT–2D: ——")
-        
-        # 3D Section
-        self.lbl_3d_step = QLabel("Step–3D: ——")
-        self.lbl_3d_tt = QLabel("Tt–3D: ——")
-        self.lbl_3d_dt = QLabel("DT–3D: ——")
-        self.lbl_3d_initial_dt = QLabel("Initial dt: —")
-        self.lbl_3d_et = QLabel("ET: ——")
-        
-        # General status
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setStyleSheet(
+            "SegmentedStatusBar { background-color: #34495e; border-top: 2px solid #2c3e50; }"
+        )
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(6, 2, 6, 2)
+        outer.setSpacing(6)
+
+        metrics_font = self._metrics_font(12)
+
+        # Cached last values so partial updates and tab switches retain history
+        self._1d = {"step": None, "tt": None, "dt": None}
+        self._2d = {"step": None, "tt": None, "dt": None}
+        self._3d = {"step": None, "tt": None, "dt": None, "et": None}
+        self._initial_dt = None
+
+        # One compact group label per mode (avoids repeating "–1D"/"–2D"/"–3D")
+        self.lbl_1d_group = QLabel(self._format_mode_group("1D", self._1d))
+        self.lbl_2d_group = QLabel(self._format_mode_group("2D", self._2d))
+        self.lbl_3d_group = QLabel(self._format_mode_group("3D", self._3d))
+        self.lbl_3d_initial_dt = QLabel("Initial Δt: —")
+        self.lbl_3d_et = QLabel(f"ET: {self._DASH}")
+
+        # Backward-compatible aliases used by tests / callers that inspect fields
+        self.lbl_1d_mode = self.lbl_1d_group
+        self.lbl_2d_mode = self.lbl_2d_group
+        self.lbl_3d_mode = self.lbl_3d_group
+        self.lbl_1d_step = self.lbl_1d_group
+        self.lbl_1d_tt = self.lbl_1d_group
+        self.lbl_1d_dt = self.lbl_1d_group
+        self.lbl_2d_step = self.lbl_2d_group
+        self.lbl_2d_tt = self.lbl_2d_group
+        self.lbl_2d_dt = self.lbl_2d_group
+        self.lbl_3d_step = self.lbl_3d_group
+        self.lbl_3d_tt = self.lbl_3d_group
+        self.lbl_3d_dt = self.lbl_3d_group
+
         self.lbl_status = QLabel("Ready")
-        self.lbl_status.setStyleSheet("color: #2ecc71; font-weight: bold; font-size: 11pt;")
-        
-        
-        # Apply styles
-        for lbl in [self.lbl_1d_step, self.lbl_1d_tt, self.lbl_1d_dt,
-                    self.lbl_2d_step, self.lbl_2d_tt, self.lbl_2d_dt,
-                    self.lbl_3d_step, self.lbl_3d_tt, self.lbl_3d_dt, self.lbl_3d_initial_dt, self.lbl_3d_et]:
-            lbl.setStyleSheet(label_style)
-        
-        # Layout
-        layout.addWidget(self.lbl_1d_step)
-        layout.addWidget(self.lbl_1d_tt)
-        layout.addWidget(self.lbl_1d_dt)
-        layout.addWidget(QLabel("│").setStyleSheet("color: #7f8c8d;") or QLabel("│"))
-        layout.addWidget(self.lbl_2d_step)
-        layout.addWidget(self.lbl_2d_tt)
-        layout.addWidget(self.lbl_2d_dt)
-        layout.addWidget(QLabel("│").setStyleSheet("color: #7f8c8d;") or QLabel("│"))
-        layout.addWidget(self.lbl_3d_step)
-        layout.addWidget(self.lbl_3d_tt)
-        layout.addWidget(self.lbl_3d_dt)
-        layout.addWidget(self.lbl_3d_initial_dt)
-        layout.addWidget(self.lbl_3d_et)
-        layout.addStretch()
-        layout.addWidget(self.lbl_status)
-    
+        self.lbl_status.setFont(metrics_font)
+        self.lbl_status.setStyleSheet(self._STATUS_STYLE_TMPL.format(color="#2ecc71"))
+        self.lbl_status.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self.lbl_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        metric_labels = [
+            self.lbl_1d_group, self.lbl_2d_group, self.lbl_3d_group,
+            self.lbl_3d_initial_dt, self.lbl_3d_et,
+        ]
+        for lbl in metric_labels:
+            lbl.setFont(metrics_font)
+            lbl.setStyleSheet(self._LABEL_STYLE)
+            lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+            lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        def _sep() -> QLabel:
+            sep = QLabel("│")
+            sep.setFont(metrics_font)
+            sep.setStyleSheet("color: #7f8c8d; background: transparent;")
+            sep.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+            return sep
+
+        self._sep_1d_2d = _sep()
+        self._sep_2d_3d = _sep()
+        self._sep_3d_meta = _sep()
+
+        self._metrics_widget = QWidget()
+        self._metrics_widget.setObjectName("statusMetricsInner")
+        self._metrics_widget.setStyleSheet(
+            "QWidget#statusMetricsInner { background-color: #34495e; }"
+        )
+        metrics_layout = QHBoxLayout(self._metrics_widget)
+        metrics_layout.setContentsMargins(0, 0, 0, 0)
+        metrics_layout.setSpacing(4)
+        metrics_layout.addWidget(self.lbl_1d_group)
+        metrics_layout.addWidget(self._sep_1d_2d)
+        metrics_layout.addWidget(self.lbl_2d_group)
+        metrics_layout.addWidget(self._sep_2d_3d)
+        metrics_layout.addWidget(self.lbl_3d_group)
+        metrics_layout.addWidget(self._sep_3d_meta)
+        metrics_layout.addWidget(self.lbl_3d_initial_dt)
+        metrics_layout.addWidget(self.lbl_3d_et)
+
+        self._metrics_scroll = QScrollArea()
+        self._metrics_scroll.setObjectName("statusMetricsScroll")
+        self._metrics_scroll.setFrameShape(QFrame.NoFrame)
+        self._metrics_scroll.setWidgetResizable(False)
+        self._metrics_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._metrics_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._metrics_scroll.setMinimumWidth(0)
+        self._metrics_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._metrics_scroll.setStyleSheet(
+            "QScrollArea#statusMetricsScroll { background-color: #34495e; border: none; }"
+            "QScrollArea#statusMetricsScroll > QWidget > QWidget { background-color: #34495e; }"
+            "QScrollBar:horizontal {"
+            "  height: 8px; background: #2c3e50; margin: 0;"
+            "}"
+            "QScrollBar::handle:horizontal { background: #7f8c8d; min-width: 24px; border-radius: 3px; }"
+            "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }"
+        )
+        self._metrics_scroll.setWidget(self._metrics_widget)
+        self._fit_metrics_font_to_opening_width()
+
+        outer.addWidget(self._metrics_scroll, stretch=1)
+        outer.addWidget(self.lbl_status, stretch=0)
+
+    def _fmt_step(self, step):
+        return self._DASH if step is None else str(step)
+
+    def _fmt_tt(self, tt):
+        return self._DASH if tt is None else f"{tt:.5f}"
+
+    def _fmt_dt(self, dt):
+        return self._DASH if dt is None else f"{dt:.2e}"
+
+    def _format_mode_group(self, mode: str, values: dict) -> str:
+        # Compact single-line group: "1D: Step … Tt … Δt …"
+        return (
+            f"{mode}: Step {self._fmt_step(values.get('step'))} "
+            f"Tt {self._fmt_tt(values.get('tt'))} "
+            f"Δt {self._fmt_dt(values.get('dt'))}"
+        )
+
+    def minimumSizeHint(self):
+        """Height from content; width must not clamp the top-level window."""
+        sh = super().minimumSizeHint()
+        return QSize(0, sh.height())
+
+    def _refresh_metrics_width(self):
+        """Keep metrics content at its natural readable width after text updates."""
+        self._metrics_widget.adjustSize()
+        hint = self._metrics_widget.sizeHint()
+        self._metrics_widget.resize(hint)
+        self._metrics_scroll.updateGeometry()
+
     def update_1d(self, step=None, tt=None, dt=None):
+        """Update 1D metrics only; leave 2D/3D histories unchanged."""
         if step is not None:
-            self.lbl_1d_step.setText(f"Step–1D: {step}")
+            self._1d["step"] = step
         if tt is not None:
-            self.lbl_1d_tt.setText(f"Tt–1D: {tt:.5f}")
+            self._1d["tt"] = tt
         if dt is not None:
-            self.lbl_1d_dt.setText(f"DT–1D: {dt:.2e}")
-    
+            self._1d["dt"] = dt
+        self.lbl_1d_group.setText(self._format_mode_group("1D", self._1d))
+        self._refresh_metrics_width()
+
+    def update_2d(self, step=None, tt=None, dt=None):
+        """Update 2D metrics only; leave 1D/3D histories unchanged.
+
+        2D solver execution is not implemented yet; this API is ready for a
+        future runner mode=='2D' connection without inventing values.
+        """
+        if step is not None:
+            self._2d["step"] = step
+        if tt is not None:
+            self._2d["tt"] = tt
+        if dt is not None:
+            self._2d["dt"] = dt
+        self.lbl_2d_group.setText(self._format_mode_group("2D", self._2d))
+        self._refresh_metrics_width()
+
     def update_3d(self, step=None, tt=None, dt=None, et=None):
+        """Update 3D metrics only; leave 1D/2D histories unchanged."""
         if step is not None:
-            self.lbl_3d_step.setText(f"Step–3D: {step}")
+            self._3d["step"] = step
         if tt is not None:
-            self.lbl_3d_tt.setText(f"Tt–3D: {tt:.5f}")
+            self._3d["tt"] = tt
         if dt is not None:
-            self.lbl_3d_dt.setText(f"DT–3D: {dt:.2e}")
+            self._3d["dt"] = dt
         if et is not None:
+            self._3d["et"] = et
             self.lbl_3d_et.setText(f"ET: {et:.2f}s")
+        self.lbl_3d_group.setText(self._format_mode_group("3D", self._3d))
+        self._refresh_metrics_width()
 
     def set_3d_initial_dt(self, dt_val):
-        """Set the calculated initial dt in the 3D segment (from Execution parameters)."""
-        self.lbl_3d_initial_dt.setText(f"Initial dt: {dt_val:.2e}")
-    
+        """Set the calculated initial Δt in the meta segment."""
+        self._initial_dt = dt_val
+        self.lbl_3d_initial_dt.setText(f"Initial Δt: {dt_val:.2e}")
+        self._refresh_metrics_width()
+
     def set_status(self, text, color="white"):
         self.lbl_status.setText(text)
-        self.lbl_status.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 11pt;")
-    
+        self.lbl_status.setStyleSheet(self._STATUS_STYLE_TMPL.format(color=color))
+
     def set_progress(self, value):
         pass  # Progress bar removed
 
@@ -239,7 +418,11 @@ class BlastFoamApp(QMainWindow):
         toolbar = QToolBar("Main Toolbar")
         toolbar.setMovable(False)
         toolbar.setIconSize(toolbar.iconSize() * 1.2)
+        # Keep all actions; rely on QToolBar overflow rather than window min-width.
+        toolbar.setMinimumWidth(0)
+        toolbar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.addToolBar(Qt.TopToolBarArea, toolbar)
+        self._main_toolbar = toolbar
         
         # Open model
         act_open = QAction("📂 Open Model", self)
@@ -302,6 +485,10 @@ class BlastFoamApp(QMainWindow):
         # Primary tabs (full width at top for tab bar visibility)
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
+        # Allow the window to shrink below the sum of all tab titles.
+        self.tabs.tabBar().setUsesScrollButtons(True)
+        self.tabs.tabBar().setElideMode(Qt.ElideRight)
+        self.tabs.setMinimumWidth(0)
         
         # Initialize shared data models
         self.probes_model = ProbesModel()
@@ -1174,11 +1361,14 @@ class BlastFoamApp(QMainWindow):
         self.view_timer.stop()
     
     def on_new_data(self, pressures, sim_time_s, step_n, dt_val, mode="1D"):
-        """Handle new simulation data"""
+        """Handle new simulation data; retain prior stage metrics when updating another mode."""
         if mode == "1D":
             self.status_bar.update_1d(step=step_n, tt=sim_time_s, dt=dt_val)
             if self.tabs.currentWidget() == self.tab_1d:
                 self.tab_1d.update_graph(pressures, sim_time_s)
+        elif mode == "2D":
+            # 2D runner path is not implemented yet; keep API wired for future use.
+            self.status_bar.update_2d(step=step_n, tt=sim_time_s, dt=dt_val)
         elif mode == "3D":
             self.status_bar.update_3d(step=step_n, tt=sim_time_s, dt=dt_val)
     

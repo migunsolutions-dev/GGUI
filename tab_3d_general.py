@@ -271,22 +271,35 @@ class TabGeneral3D(QWidget):
 
         # ===== RIGHT SIDE: Viewport + Execution Controls (stacked vertically) =====
         right_container = QWidget()
+        right_container.setObjectName("general3dRightContainer")
+        right_container.setMinimumWidth(0)
+        # Ignored horizontal policy lets the top-level window shrink; splitter keeps left width.
+        right_container.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         right_layout = QVBoxLayout(right_container)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
         
         # Viewport (top)
         self.viewer = BlastViewerWidget()
+        self.viewer.setMinimumWidth(0)
+        self.viewer.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         right_layout.addWidget(self.viewer, stretch=1)
         
         # Execution Controls (bottom)
         self.ctrl_tabs = QTabWidget()
+        self.ctrl_tabs.setMinimumWidth(0)
         self.ctrl_tabs.setMinimumHeight(220)
         self.ctrl_tabs.setMaximumHeight(400)
+        self.ctrl_tabs.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.ctrl_tabs.tabBar().setUsesScrollButtons(True)
+        self.ctrl_tabs.tabBar().setElideMode(Qt.ElideRight)
         
         self._tab_exec = QWidget(); self._build_exec_tab(self._tab_exec)
         self._tab_view = QWidget(); self._build_view_tab(self._tab_view)
         self._tab_sect = QWidget(); self._build_section_tab(self._tab_sect)
+        for _t in (self._tab_exec, self._tab_view, self._tab_sect):
+            _t.setMinimumWidth(0)
+            _t.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         self.ctrl_tabs.addTab(self._tab_exec, "Execution Controls")
         self.ctrl_tabs.addTab(self._tab_view, "Viewport Options")
@@ -298,6 +311,10 @@ class TabGeneral3D(QWidget):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([450, 700])
+        # Expose for tests / diagnostics only (no visible controls).
+        self._main_splitter = splitter
+        self._right_container = right_container
+        self._left_setup_scroll = scroll
 
     def _lbl(self, text: str) -> QLabel:
         """Create a label with fixed width so all field columns align."""
@@ -1197,11 +1214,19 @@ class TabGeneral3D(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # Isolate inner content width from the top-level / right-workspace minimum.
+        scroll.setMinimumWidth(0)
+        scroll.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._exec_scroll = scroll
         inner = QWidget()
+        inner.setObjectName("executionControlsInner")
         l = QHBoxLayout(inner)
+        l.setContentsMargins(4, 4, 4, 4)
         g1 = QGroupBox("Simulation Control"); f1 = QFormLayout(g1)
         f1.setVerticalSpacing(3)     # מרווח בין שורות
         f1.setHorizontalSpacing(10)   # מרווח בין label לשדה
+        # Keep fields compact so extra width is not absorbed as blank stretch inside this group.
+        f1.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
         self.spin_end = self._spin(0, 100, 0.030, 0.001, 10)
         self.spin_end.setMaximumWidth(120)
         self.spin_end.setToolTip(
@@ -1256,7 +1281,6 @@ class TabGeneral3D(QWidget):
         cores_h.setContentsMargins(0, 0, 0, 0)
         cores_h.addWidget(self.spin_cores)
         cores_h.addWidget(self.btn_decomposition_edit)
-        cores_h.addStretch()
         f1.addRow("Cores", cores_row)
         self.chk_obstacle_refine = QCheckBox()
         self.chk_obstacle_refine.setChecked(True)
@@ -1277,7 +1301,6 @@ class TabGeneral3D(QWidget):
         obst_h.addWidget(QLabel("Levels:"))
         obst_h.addWidget(self.spin_obstacle_refine_min)
         obst_h.addWidget(self.spin_obstacle_refine_max)
-        obst_h.addStretch()
         f1.addRow("Obstacle refine", obstacle_refine_row)
         f1.addRow(self._lbl("Write control"), self.combo_write_control)
         wrap_steps = QWidget()
@@ -1285,19 +1308,19 @@ class TabGeneral3D(QWidget):
         h_steps.setContentsMargins(0, 0, 0, 0)
         h_steps.addWidget(self.lbl_write_interval)
         h_steps.addWidget(self.spin_write)
-        h_steps.addStretch()
         wrap_time = QWidget()
         h_time = QHBoxLayout(wrap_time)
         h_time.setContentsMargins(0, 0, 0, 0)
         h_time.addWidget(self.lbl_write_time)
         h_time.addWidget(self.spin_write_time)
-        h_time.addStretch()
         f1.addRow(wrap_steps)
         f1.addRow(wrap_time)
         f1.addRow(self._lbl("cycleWrite"), self.spin_cycle_write)
         self.wrap_write_steps = wrap_steps
         self.wrap_write_time = wrap_time
         self._on_write_control_changed(self.combo_write_control.currentText())
+        # Content-sized groups: trailing stretch absorbs leftover width (collapses first when narrowing).
+        g1.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
         l.addWidget(g1)
 
         self._on_cores_changed(self.spin_cores.value())
@@ -1326,9 +1349,11 @@ class TabGeneral3D(QWidget):
         v2.addWidget(self.btn_stop)
         v2.addWidget(self.btn_exec_advanced)
         v2.addStretch()
+        g2.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
         l.addWidget(g2)
         
         g3 = QGroupBox("Field Display"); f3 = QFormLayout(g3)
+        f3.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
         # מיפוי שם תצוגה → שם שדה פנימי
         self._field_display_map = {
             "Pressure": "p",
@@ -1356,7 +1381,9 @@ class TabGeneral3D(QWidget):
         f3.addRow(self.chk_log_scale)
         f3.addRow("Min", self.spin_min_val)
         f3.addRow("Max", self.spin_max_val)
+        g3.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
         l.addWidget(g3)
+        l.addStretch(1)
         scroll.setWidget(inner)
         outer = QVBoxLayout(parent)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1565,7 +1592,14 @@ class TabGeneral3D(QWidget):
         self._update_mesh_plan_display()
 
     def _build_view_tab(self, parent):
-        l = QHBoxLayout(parent)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setMinimumWidth(0)
+        scroll.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        inner = QWidget()
+        l = QHBoxLayout(inner)
         g1 = QGroupBox("Camera"); v1 = QVBoxLayout(g1)
         self.rad_persp = QRadioButton("Perspective"); self.rad_persp.setChecked(True)
         self.rad_ortho = QRadioButton("Parallel (Ortho)")
@@ -1579,6 +1613,7 @@ class TabGeneral3D(QWidget):
             b = QPushButton(name); b.clicked.connect(lambda _, n=name: self.viewer.set_standard_view(n))
             hb.addWidget(b)
         v1.addLayout(hb); v1.addStretch()
+        g1.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
         l.addWidget(g1)
         
         g2 = QGroupBox("Visibility"); v2 = QVBoxLayout(g2)
@@ -1606,20 +1641,38 @@ class TabGeneral3D(QWidget):
         v2.addWidget(self.chk_tracers)
         v2.addWidget(self.chk_probes)
         v2.addStretch()
-        l.addWidget(g2); l.addStretch()
+        g2.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        l.addWidget(g2); l.addStretch(1)
+        scroll.setWidget(inner)
+        outer = QVBoxLayout(parent)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
 
     def _build_section_tab(self, parent):
-        l = QHBoxLayout(parent)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setMinimumWidth(0)
+        scroll.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        inner = QWidget()
+        l = QHBoxLayout(inner)
         self.tbl_sec = QTableWidget(0, 5)
         self.tbl_sec.setHorizontalHeaderLabels(["On", "Name", "Plane", "Position [m]", "Opacity"])
         self.tbl_sec.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.tbl_sec.cellChanged.connect(self._update_sections_from_table)
+        self.tbl_sec.setMinimumWidth(0)
+        self.tbl_sec.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         l.addWidget(self.tbl_sec, stretch=2)
         v = QVBoxLayout()
         self.btn_add_sec = QPushButton("Add Section"); self.btn_del_sec = QPushButton("Remove Selected")
         self.btn_add_sec.clicked.connect(self._add_default_section); self.btn_del_sec.clicked.connect(self._del_section)
         v.addWidget(self.btn_add_sec); v.addWidget(self.btn_del_sec); v.addStretch()
         l.addLayout(v)
+        scroll.setWidget(inner)
+        outer = QVBoxLayout(parent)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
 
     def _connect_signals(self):
         widgets = [self.sx1, self.sx2, self.sy1, self.sy2, self.sz1, self.sz2, self.scell,
