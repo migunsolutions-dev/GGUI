@@ -106,7 +106,13 @@ class CaseInputs3D:
     enable_obstacle_refine: Optional[bool] = None  # None = use enable_local_refinement for backward compat
     obstacle_refine_min: Optional[int] = None     # None = use refine_min
     obstacle_refine_max: Optional[int] = None     # None = use refine_max
-    charge_refinement_level: int = 0  # setRefinedFields level; 0 = use setFields
+    # Manual seed level storage. Auto mode computes level via charge_seed_plan (do not overload 0).
+    charge_refinement_level: int = 0
+    # Explicit seed mode: "Auto" | "Manual" | "Off" (new cases default Auto).
+    charge_seed_mode: str = "Auto"
+    charge_seed_target_cells: int = 8   # Auto: cells across smallest charge dimension
+    charge_seed_min_cells: int = 6      # Auto: minimum acceptable cells across d_min
+    charge_seed_max_level: int = 5      # Auto: maximum automatic seed level
     # --- Charge capture (setRefinedFields backup { radius ... } only; not snappy transition) ---
     charge_capture_mode: str = "auto"  # "auto" | "manual"
     charge_capture_factor: float = 1.0  # auto: multiplier on 0.5*sqrt(dx²+dy²+dz²) term
@@ -145,7 +151,8 @@ class CaseInputs3D:
     bubble_radius_factor: float = 1.5
 
     # --- setFields/setRefinedFields ---
-    buffer_layers: int = 2                   # nBufferLayers in setFieldsDict (replaces hardcoded 5)
+    # building3D-style startup buffer (setFieldsDict only — not runtime dynamicMeshDict).
+    buffer_layers: int = 5
 
     # --- Run mode (Allrun + controlDict speed-vs-verbosity tradeoffs) ---
     # Defaults are tuned for FAST runs: skip optional post-processing and verbose
@@ -154,11 +161,25 @@ class CaseInputs3D:
     enable_post_processing: bool = False     # write functions { impulse; overpressure; fieldMinMax; } in controlDict
     fast_run_mode: bool = True               # skip stage_check/log.stageVerification/checkMesh/check_charge_region/check_internal_patch in Allrun
 
-    # --- Charge outer refinement (snappyHexMesh refinement region); None = use global refine_min/refine_max
-    charge_outer_refine_enable: Optional[bool] = None   # None/True = enable; False = disable charge outer refinement
-    charge_outer_refine_min: Optional[int] = None      # None = use refine_min
-    charge_outer_refine_max: Optional[int] = None      # None = use refine_max
-    transition_cells: int = 2                          # nCellsBetweenLevels for charge outside graded refinement (snappy)
+    # --- Charge outer refinement (snappyHexMesh refinement region); expert/legacy only ---
+    # New cases: Off. Legacy None on load is migrated to True in project_io.
+    charge_outer_refine_enable: Optional[bool] = False
+    # Canonical mode-inside level (second tuple value). Legacy min/max kept for migration only.
+    charge_outer_refine_level: Optional[int] = None
+    charge_outer_refine_min: Optional[int] = None      # legacy load only; not a true "min level"
+    charge_outer_refine_max: Optional[int] = None      # legacy load only
+    # snappy mode: "inside" | "distance" (preserved on load; never convert distance→inside)
+    charge_outer_mode: Optional[str] = None
+    # For mode distance: list of (distance_m, level) pairs; lossless round-trip
+    charge_outer_distance_levels: Optional[list] = None
+    # Parsed searchable* geometry for chargeRefineOuter (sphere/cylinder/box params)
+    charge_outer_geometry: Optional[dict] = None
+    # Unsupported outer config preserved verbatim; blocks regeneration if set with warning
+    charge_outer_raw_refinement: Optional[str] = None
+    # Global snappy nCellsBetweenLevels (not outer-extent metres). UI: "Snappy cells between levels".
+    transition_cells: int = 2
+    # Set when a legacy auto outside_extent was baked to an explicit metres value on load.
+    charge_outer_legacy_migration_warning: Optional[str] = None
 
     # --- dynamicMeshDict advanced (building3D-style; used when enable_dyn_refine) ---
     refine_interval: int = 3

@@ -5,6 +5,11 @@ import math
 from dataclasses import dataclass
 from typing import Any, Iterable, Tuple
 
+from charge_seed_plan import (
+    SEED_MODE_AUTO,
+    UNSAFE_AUTO_SEED_MESSAGE,
+    build_charge_seed_plan,
+)
 from initialization_plan import (
     build_initialization_plan,
     outer_band_will_be_applied,
@@ -20,30 +25,19 @@ class CaptureGuardResult:
 
 
 def _charge_extents(inputs: Any) -> Tuple[float, float, float]:
-    volume = float(inputs.mass_kg) / float(inputs.rho_charge)
-    shape = str(inputs.charge_shape)
+    """Half-extents from authoritative physical_charge_geometry."""
+    from physical_charge_geometry import physical_charge_geometry
+
+    geom = physical_charge_geometry(inputs)
+    shape = geom.shape
     if shape == "Sphere":
-        r = (3.0 * volume / (4.0 * math.pi)) ** (1.0 / 3.0)
+        r = geom.radius_m
         return r, r, r
     if shape == "Cuboid":
-        length = float(getattr(inputs, "charge_length", 0.0) or 0.0)
-        width = float(getattr(inputs, "charge_width", 0.0) or 0.0)
-        height = float(getattr(inputs, "charge_height", 0.0) or 0.0)
-        if not (
-            length > 0
-            and width > 0
-            and height > 0
-            and abs(length * width * height - volume) <= 0.02 * volume
-        ):
-            length = width = height = volume ** (1.0 / 3.0)
-        return length / 2.0, width / 2.0, height / 2.0
-    radius = float(getattr(inputs, "cylinder_radius", 0.05) or 0.05)
-    length = float(getattr(inputs, "charge_length", 0.0) or 0.0)
-    if length <= 0:
-        aspect = float(getattr(inputs, "charge_aspect", 0.0) or 0.0)
-        length = 2.0 * radius * aspect if aspect > 0 else volume / (math.pi * radius * radius)
-    axis = str(getattr(inputs, "cylinder_axis", "X")).upper()
-    half = length / 2.0
+        return geom.length_box_m / 2.0, geom.width_m / 2.0, geom.height_m / 2.0
+    radius = geom.cylinder_radius_m
+    half = geom.length_m / 2.0
+    axis = str(getattr(inputs, "cylinder_axis", "Z")).upper()
     return (
         (half, radius, radius)
         if axis == "X"
@@ -98,7 +92,7 @@ UNSAFE_CAPTURE_MESSAGE = (
     "has no cell centre inside the physical charge.\n\n"
     "Choose one remedy without changing charge mass:\n"
     "• reduce the base cell size;\n"
-    "• enable Dyn Mesh and select an internal charge refinement level greater than zero; or\n"
+    "• enable Dyn Mesh with Auto seed (or Manual seed level > 0); or\n"
     "• deliberately enable the advanced outer refinement band."
 )
 
@@ -125,9 +119,37 @@ def evaluate_unsafe_capture(inputs: Any) -> CaptureGuardResult:
 
 
 def require_safe_capture(inputs: Any) -> None:
-    """Raise ValueError before writing an unsafe non-remap 3D case. Non-mutating."""
+    """Raise ValueError before writing an unsafe non-remap 3D case. Non-mutating.
+
+    Policy (``build_initialization_plan`` is authoritative):
+
+    1. Remap — bypass entirely.
+    2. Effective Auto seed with ``setRefinedFields`` — enforce Auto seed safety.
+    3. Fixed Mesh / seed Off / Manual — never raise the Auto-seed-specific error;
+       fall through to the physical base-cell-centre capture check when no
+       applied seed or outer band protects capture.
+    """
     if getattr(inputs, "remap_enabled", False):
         return
+    plan = build_initialization_plan(inputs)
+    # Auto-seed target failure only when the effective plan will actually run
+    # setRefinedFields with a non-zero Auto seed — not raw GUI selection alone.
+    if (
+        plan.uses_set_refined_fields
+        and int(plan.seed_effective) > 0
+        and plan.seed_mode == SEED_MODE_AUTO
+    ):
+        seed_plan = build_charge_seed_plan(inputs)
+        if not seed_plan.is_safe:
+            raise ValueError(
+                UNSAFE_AUTO_SEED_MESSAGE.format(
+                    min_cells=seed_plan.min_cells,
+                    d_min=seed_plan.d_min_m,
+                    max_level=seed_plan.max_level,
+                    achieved=seed_plan.achieved_cells,
+                    h_seed=seed_plan.h_seed_m,
+                )
+            )
     guard = evaluate_unsafe_capture(inputs)
     if not guard.safe:
         raise ValueError(UNSAFE_CAPTURE_MESSAGE)

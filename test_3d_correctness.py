@@ -49,8 +49,10 @@ def case(**overrides) -> CaseInputs3D:
         cores=1,
         enable_dyn_refine=True,
         dyn_refine_max=1,
+        charge_seed_mode="Manual",
         charge_refinement_level=0,
         charge_outer_refine_enable=True,
+        charge_outer_refine_level=3,
         charge_outer_refine_min=2,
         charge_outer_refine_max=3,
     )
