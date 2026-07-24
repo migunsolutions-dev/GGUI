@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
     QDialog, QTextEdit, QDialogButtonBox, QSizePolicy,
 )
 from PyQt5.QtCore import Qt, QTimer, QSize
-from PyQt5.QtGui import QIcon, QFont
+from PyQt5.QtGui import QIcon, QFont, QFontMetrics
 
 from tab_1d import Tab1D
 from tab_2d import Tab2D
@@ -98,83 +98,56 @@ class InfoPanel(QFrame):
 
 
 class SegmentedStatusBar(QFrame):
-    """Bottom full-width status bar with segments for 1D/2D/3D.
+    """Bottom full-width status bar: one row of 1D | 2D | 3D | ET + Ready.
 
-    Compact grouped metrics keep all three stage histories visible at the
-    reference opening width (~1685 px) without a status scrollbar. Metric
-    groups use Preferred widths inside a local QScrollArea so the top-level
-    window remains shrinkable. Ready/Running stays fixed on the right.
+    Each mode group is a single non-wrapping QLabel with width reserved for the
+    representative populated string. ET is wall-clock elapsed run time.
     """
 
-    _DASH = "——"
+    _DASH = "—"
     _LABEL_STYLE = "color: white; background: transparent;"
     _STATUS_STYLE_TMPL = "color: {color}; font-weight: bold; background: transparent;"
+    _REP_MODE = "3D: Step=12345678  Tt=1.234567e-04  Δt=1.234e-07"
+    _REP_ET = "ET=12345.6 s"
 
-    def _metrics_font(self, pixel_size: int = 12) -> QFont:
-        # Pixel size avoids inflated pt metrics on high logicalDpi displays.
+    def _metrics_font(self, point_size: int = None) -> QFont:
+        from ui_metrics import STATUS_METRICS_POINT_SIZE, STATUS_FONT_MIN_POINT_SIZE
+        pt = STATUS_METRICS_POINT_SIZE if point_size is None else int(point_size)
+        pt = max(STATUS_FONT_MIN_POINT_SIZE, pt)
         font = QFont("Consolas")
         font.setStyleHint(QFont.TypeWriter)
-        font.setPixelSize(pixel_size)
+        font.setPointSize(pt)
+        font.setWeight(QFont.Normal)
+        # Tightened tracking so three reserved mode groups + ET fit at ~1685.
+        font.setLetterSpacing(QFont.PercentageSpacing, 70.0)
+        return font
+
+    def _ready_font(self) -> QFont:
+        from ui_metrics import STATUS_READY_POINT_SIZE, STATUS_FONT_MIN_POINT_SIZE
+        font = QFont("Segoe UI")
+        font.setStyleHint(QFont.SansSerif)
+        font.setPointSize(max(STATUS_FONT_MIN_POINT_SIZE, STATUS_READY_POINT_SIZE))
         font.setWeight(QFont.DemiBold)
         return font
 
-    def _apply_metrics_font(self, font: QFont) -> None:
-        for lbl in (
-            self.lbl_1d_group, self.lbl_2d_group, self.lbl_3d_group,
-            self.lbl_3d_initial_dt, self.lbl_3d_et,
-            self._sep_1d_2d, self._sep_2d_3d, self._sep_3d_meta,
-            self.lbl_status,
-        ):
-            lbl.setFont(font)
-
-    def _fit_metrics_font_to_opening_width(self, target_content_width: int = 1550) -> None:
-        """Choose the largest pixel font that keeps idle/representative content under target.
-
-        Ensures the ~1685 opening width can show all metrics without a status scrollbar
-        across Consolas/Courier and offscreen/native metric differences.
-        """
-        # Seed representative text for measurement (restored to dashes afterward).
-        probe_1d = dict(self._1d)
-        probe_2d = dict(self._2d)
-        probe_3d = dict(self._3d)
-        probe_init = self._initial_dt
-        self.lbl_1d_group.setText(
-            self._format_mode_group("1D", {"step": 123456, "tt": 0.01234, "dt": 1.23e-6})
-        )
-        self.lbl_2d_group.setText(
-            self._format_mode_group("2D", {"step": 234567, "tt": 0.02345, "dt": 2.34e-6})
-        )
-        self.lbl_3d_group.setText(
-            self._format_mode_group("3D", {"step": 345678, "tt": 0.03456, "dt": 3.45e-6})
-        )
-        self.lbl_3d_initial_dt.setText("Initial Δt: 5.56e-07")
-        self.lbl_3d_et.setText("ET: 12.34s")
-
-        chosen = self._metrics_font(10)
-        for px in range(13, 9, -1):
-            font = self._metrics_font(px)
-            self._apply_metrics_font(font)
-            self._metrics_widget.adjustSize()
-            if self._metrics_widget.sizeHint().width() <= target_content_width:
-                chosen = font
-                break
-        self._apply_metrics_font(chosen)
-
-        # Restore current (possibly dash) values
-        self.lbl_1d_group.setText(self._format_mode_group("1D", probe_1d))
-        self.lbl_2d_group.setText(self._format_mode_group("2D", probe_2d))
-        self.lbl_3d_group.setText(self._format_mode_group("3D", probe_3d))
-        if probe_init is None:
-            self.lbl_3d_initial_dt.setText("Initial Δt: —")
-        else:
-            self.lbl_3d_initial_dt.setText(f"Initial Δt: {probe_init:.2e}")
-        et = probe_3d.get("et")
-        self.lbl_3d_et.setText(f"ET: {self._DASH}" if et is None else f"ET: {et:.2f}s")
-        self._refresh_metrics_width()
+    def _make_group_label(self, text: str, font: QFont, rep: str, object_name: str) -> QLabel:
+        fm = QFontMetrics(font)
+        width = fm.horizontalAdvance(rep)
+        lbl = QLabel(text)
+        lbl.setObjectName(object_name)
+        lbl.setFont(font)
+        lbl.setStyleSheet(self._LABEL_STYLE)
+        lbl.setWordWrap(False)
+        lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        lbl.setMinimumWidth(width)
+        lbl.setFixedWidth(width)
+        lbl.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        return lbl
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(40)
+        self.setFixedHeight(36)
         self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setStyleSheet(
@@ -182,25 +155,43 @@ class SegmentedStatusBar(QFrame):
         )
 
         outer = QHBoxLayout(self)
-        outer.setContentsMargins(6, 2, 6, 2)
-        outer.setSpacing(6)
+        outer.setContentsMargins(4, 2, 4, 2)
+        outer.setSpacing(4)
 
-        metrics_font = self._metrics_font(12)
+        metrics_font = self._metrics_font()
+        self._metrics_point_size = metrics_font.pointSize()
 
-        # Cached last values so partial updates and tab switches retain history
+        from ui_metrics import STATUS_REP_MODE_GROUP, STATUS_REP_ET
+        self._REP_MODE = STATUS_REP_MODE_GROUP
+        self._REP_ET = STATUS_REP_ET
+
         self._1d = {"step": None, "tt": None, "dt": None}
         self._2d = {"step": None, "tt": None, "dt": None}
-        self._3d = {"step": None, "tt": None, "dt": None, "et": None}
-        self._initial_dt = None
+        self._3d = {"step": None, "tt": None, "dt": None}
+        self._et_seconds = None
+        self._et_monotonic_start = None
 
-        # One compact group label per mode (avoids repeating "–1D"/"–2D"/"–3D")
-        self.lbl_1d_group = QLabel(self._format_mode_group("1D", self._1d))
-        self.lbl_2d_group = QLabel(self._format_mode_group("2D", self._2d))
-        self.lbl_3d_group = QLabel(self._format_mode_group("3D", self._3d))
-        self.lbl_3d_initial_dt = QLabel("Initial Δt: —")
-        self.lbl_3d_et = QLabel(f"ET: {self._DASH}")
+        self.lbl_status = QLabel("Ready")
+        self.lbl_status.setFont(self._ready_font())
+        self.lbl_status.setStyleSheet(self._STATUS_STYLE_TMPL.format(color="#2ecc71"))
+        self.lbl_status.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self.lbl_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_status.setWordWrap(False)
 
-        # Backward-compatible aliases used by tests / callers that inspect fields
+        self.lbl_1d_group = self._make_group_label(
+            self._format_mode_group("1D", self._1d), metrics_font, self._REP_MODE, "status1dGroup"
+        )
+        self.lbl_2d_group = self._make_group_label(
+            self._format_mode_group("2D", self._2d), metrics_font, self._REP_MODE, "status2dGroup"
+        )
+        self.lbl_3d_group = self._make_group_label(
+            self._format_mode_group("3D", self._3d), metrics_font, self._REP_MODE, "status3dGroup"
+        )
+        self.lbl_et = self._make_group_label(
+            self._format_et(), metrics_font, self._REP_ET, "statusEt"
+        )
+
+        # Compatibility aliases (same group labels — no separate Step/Tt/Δt widgets).
         self.lbl_1d_mode = self.lbl_1d_group
         self.lbl_2d_mode = self.lbl_2d_group
         self.lbl_3d_mode = self.lbl_3d_group
@@ -213,33 +204,23 @@ class SegmentedStatusBar(QFrame):
         self.lbl_3d_step = self.lbl_3d_group
         self.lbl_3d_tt = self.lbl_3d_group
         self.lbl_3d_dt = self.lbl_3d_group
+        self.lbl_3d_et = self.lbl_et
+        self.lbl_meta = self.lbl_et
+        self.lbl_3d_initial_dt = self.lbl_et  # Initial Δt moved to 3D Simulation Control
+        self.lbl_metrics_line = QLabel(self._format_metrics_line())
+        self.lbl_metrics_line.setObjectName("statusMetricsLine")
+        self.lbl_metrics_line.hide()
+        self.lbl_metrics_modes = self.lbl_metrics_line
+        self.lbl_metrics_meta = self.lbl_et
 
-        self.lbl_status = QLabel("Ready")
-        self.lbl_status.setFont(metrics_font)
-        self.lbl_status.setStyleSheet(self._STATUS_STYLE_TMPL.format(color="#2ecc71"))
-        self.lbl_status.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
-        self.lbl_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
-
-        metric_labels = [
-            self.lbl_1d_group, self.lbl_2d_group, self.lbl_3d_group,
-            self.lbl_3d_initial_dt, self.lbl_3d_et,
-        ]
-        for lbl in metric_labels:
-            lbl.setFont(metrics_font)
-            lbl.setStyleSheet(self._LABEL_STYLE)
-            lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
-            lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
-
-        def _sep() -> QLabel:
-            sep = QLabel("│")
-            sep.setFont(metrics_font)
-            sep.setStyleSheet("color: #7f8c8d; background: transparent;")
-            sep.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
-            return sep
-
-        self._sep_1d_2d = _sep()
-        self._sep_2d_3d = _sep()
-        self._sep_3d_meta = _sep()
+        sep_font = metrics_font
+        self._sep_1d_2d = QLabel(" | ")
+        self._sep_2d_3d = QLabel(" | ")
+        self._sep_3d_et = QLabel(" | ")
+        for sep in (self._sep_1d_2d, self._sep_2d_3d, self._sep_3d_et):
+            sep.setFont(sep_font)
+            sep.setStyleSheet(self._LABEL_STYLE)
+            sep.setWordWrap(False)
 
         self._metrics_widget = QWidget()
         self._metrics_widget.setObjectName("statusMetricsInner")
@@ -248,15 +229,14 @@ class SegmentedStatusBar(QFrame):
         )
         metrics_layout = QHBoxLayout(self._metrics_widget)
         metrics_layout.setContentsMargins(0, 0, 0, 0)
-        metrics_layout.setSpacing(4)
-        metrics_layout.addWidget(self.lbl_1d_group)
-        metrics_layout.addWidget(self._sep_1d_2d)
-        metrics_layout.addWidget(self.lbl_2d_group)
-        metrics_layout.addWidget(self._sep_2d_3d)
-        metrics_layout.addWidget(self.lbl_3d_group)
-        metrics_layout.addWidget(self._sep_3d_meta)
-        metrics_layout.addWidget(self.lbl_3d_initial_dt)
-        metrics_layout.addWidget(self.lbl_3d_et)
+        metrics_layout.setSpacing(0)
+        for w in (
+            self.lbl_1d_group, self._sep_1d_2d,
+            self.lbl_2d_group, self._sep_2d_3d,
+            self.lbl_3d_group, self._sep_3d_et,
+            self.lbl_et,
+        ):
+            metrics_layout.addWidget(w, stretch=0)
 
         self._metrics_scroll = QScrollArea()
         self._metrics_scroll.setObjectName("statusMetricsScroll")
@@ -276,85 +256,126 @@ class SegmentedStatusBar(QFrame):
             "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }"
         )
         self._metrics_scroll.setWidget(self._metrics_widget)
-        self._fit_metrics_font_to_opening_width()
+        self._refresh_metrics_width()
 
         outer.addWidget(self._metrics_scroll, stretch=1)
         outer.addWidget(self.lbl_status, stretch=0)
 
+        self._et_timer = QTimer(self)
+        self._et_timer.setInterval(100)
+        self._et_timer.timeout.connect(self._on_et_tick)
+
+    def metrics_point_size(self) -> int:
+        return int(self.lbl_1d_group.font().pointSize())
+
+    def metrics_value_labels(self):
+        return [self.lbl_1d_group, self.lbl_2d_group, self.lbl_3d_group, self.lbl_et]
+
     def _fmt_step(self, step):
-        return self._DASH if step is None else str(step)
+        return self._DASH if step is None else str(int(step))
 
     def _fmt_tt(self, tt):
-        return self._DASH if tt is None else f"{tt:.5f}"
+        return self._DASH if tt is None else f"{tt:.6e}"
 
     def _fmt_dt(self, dt):
-        return self._DASH if dt is None else f"{dt:.2e}"
+        return self._DASH if dt is None else f"{dt:.3e}"
 
     def _format_mode_group(self, mode: str, values: dict) -> str:
-        # Compact single-line group: "1D: Step … Tt … Δt …"
         return (
-            f"{mode}: Step {self._fmt_step(values.get('step'))} "
-            f"Tt {self._fmt_tt(values.get('tt'))} "
-            f"Δt {self._fmt_dt(values.get('dt'))}"
+            f"{mode}: Step={self._fmt_step(values.get('step'))}  "
+            f"Tt={self._fmt_tt(values.get('tt'))}  "
+            f"Δt={self._fmt_dt(values.get('dt'))}"
         )
 
+    def _format_et(self) -> str:
+        if self._et_seconds is None:
+            return f"ET={self._DASH}"
+        return f"ET={self._et_seconds:.1f} s"
+
+    def _format_metrics_line(self) -> str:
+        return (
+            f"{self._format_mode_group('1D', self._1d)} | "
+            f"{self._format_mode_group('2D', self._2d)} | "
+            f"{self._format_mode_group('3D', self._3d)} | "
+            f"{self._format_et()}"
+        )
+
+    def _sync_visible_metrics_line(self) -> None:
+        self.lbl_1d_group.setText(self._format_mode_group("1D", self._1d))
+        self.lbl_2d_group.setText(self._format_mode_group("2D", self._2d))
+        self.lbl_3d_group.setText(self._format_mode_group("3D", self._3d))
+        self.lbl_et.setText(self._format_et())
+        self.lbl_metrics_line.setText(self._format_metrics_line())
+        self._refresh_metrics_width()
+
     def minimumSizeHint(self):
-        """Height from content; width must not clamp the top-level window."""
         sh = super().minimumSizeHint()
         return QSize(0, sh.height())
 
     def _refresh_metrics_width(self):
-        """Keep metrics content at its natural readable width after text updates."""
         self._metrics_widget.adjustSize()
         hint = self._metrics_widget.sizeHint()
-        self._metrics_widget.resize(hint)
+        self._metrics_widget.resize(
+            hint.width(), max(hint.height(), self.lbl_1d_group.sizeHint().height())
+        )
         self._metrics_scroll.updateGeometry()
 
     def update_1d(self, step=None, tt=None, dt=None):
-        """Update 1D metrics only; leave 2D/3D histories unchanged."""
         if step is not None:
             self._1d["step"] = step
         if tt is not None:
             self._1d["tt"] = tt
         if dt is not None:
             self._1d["dt"] = dt
-        self.lbl_1d_group.setText(self._format_mode_group("1D", self._1d))
-        self._refresh_metrics_width()
+        self._sync_visible_metrics_line()
 
     def update_2d(self, step=None, tt=None, dt=None):
-        """Update 2D metrics only; leave 1D/3D histories unchanged.
-
-        2D solver execution is not implemented yet; this API is ready for a
-        future runner mode=='2D' connection without inventing values.
-        """
         if step is not None:
             self._2d["step"] = step
         if tt is not None:
             self._2d["tt"] = tt
         if dt is not None:
             self._2d["dt"] = dt
-        self.lbl_2d_group.setText(self._format_mode_group("2D", self._2d))
-        self._refresh_metrics_width()
+        self._sync_visible_metrics_line()
 
     def update_3d(self, step=None, tt=None, dt=None, et=None):
-        """Update 3D metrics only; leave 1D/2D histories unchanged."""
+        """Update 3D Step/Tt/Δt. Wall-clock ET is managed by start/stop_et_timing."""
         if step is not None:
             self._3d["step"] = step
         if tt is not None:
             self._3d["tt"] = tt
         if dt is not None:
             self._3d["dt"] = dt
-        if et is not None:
-            self._3d["et"] = et
-            self.lbl_3d_et.setText(f"ET: {et:.2f}s")
-        self.lbl_3d_group.setText(self._format_mode_group("3D", self._3d))
-        self._refresh_metrics_width()
+        # Ignore legacy et= solver-time argument; ET is real elapsed run time.
+        self._sync_visible_metrics_line()
 
     def set_3d_initial_dt(self, dt_val):
-        """Set the calculated initial Δt in the meta segment."""
-        self._initial_dt = dt_val
-        self.lbl_3d_initial_dt.setText(f"Initial Δt: {dt_val:.2e}")
-        self._refresh_metrics_width()
+        """Compatibility no-op for status bar — Initial Δt lives in 3D Simulation Control."""
+        pass
+
+    def start_et_timing(self) -> None:
+        """Begin wall-clock ET at the start of a solver run."""
+        import time
+        self._et_monotonic_start = time.monotonic()
+        self._et_seconds = 0.0
+        self._sync_visible_metrics_line()
+        self._et_timer.start()
+
+    def stop_et_timing(self) -> None:
+        """Freeze ET at the final elapsed value when the run ends or is interrupted."""
+        import time
+        if self._et_monotonic_start is not None:
+            self._et_seconds = time.monotonic() - self._et_monotonic_start
+        self._et_monotonic_start = None
+        self._et_timer.stop()
+        self._sync_visible_metrics_line()
+
+    def _on_et_tick(self) -> None:
+        import time
+        if self._et_monotonic_start is None:
+            return
+        self._et_seconds = time.monotonic() - self._et_monotonic_start
+        self.lbl_et.setText(self._format_et())
 
     def set_status(self, text, color="white"):
         self.lbl_status.setText(text)
@@ -370,7 +391,9 @@ class BlastFoamApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("BlastFoam GUI Manager - v4.0 (Refactored UI)")
-        self.setGeometry(50, 50, 800, 1000)
+        # Default opening size is applied after the central widget is built so
+        # size hints cannot defeat the review geometry. This is NOT a minimum.
+        self._opening_geometry_applied = False
         
         # Configuration
         self.openfoam_bashrc = "/opt/openfoam9/etc/bashrc"
@@ -405,6 +428,43 @@ class BlastFoamApp(QMainWindow):
             remap_status="None",
             license_status="Active"
         )
+        self._apply_default_opening_geometry()
+        # Explicitly clear any widget-driven floor so the window stays shrinkable.
+        self.setMinimumWidth(0)
+
+    def _apply_default_opening_geometry(self) -> None:
+        """First-show default size ≈1685×1060, fitted inside availableGeometry.
+
+        This is intentionally NOT a hard minimum — the user may still shrink
+        the window. Never call this from tab/status/run update paths.
+        """
+        from ui_metrics import DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT
+        from PyQt5.QtGui import QGuiApplication
+        from PyQt5.QtCore import QRect
+
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+        else:
+            avail = QRect(0, 0, DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
+        w = min(int(DEFAULT_WINDOW_WIDTH), int(avail.width()))
+        h = min(int(DEFAULT_WINDOW_HEIGHT), int(avail.height()))
+        x = int(avail.x() + max(0, (avail.width() - w) // 2))
+        y = int(avail.y() + max(0, (avail.height() - h) // 2))
+        self.setGeometry(x, y, w, h)
+        self._opening_geometry_applied = True
+
+    def minimumSizeHint(self):
+        """Do not let toolbar/tab size hints impose a large top-level floor."""
+        sh = super().minimumSizeHint()
+        return QSize(0, sh.height())
+
+    def showEvent(self, event):
+        # Ensure the first real show uses the review opening size even if a
+        # platform/size-hint path briefly applied a different geometry.
+        if not self._opening_geometry_applied:
+            self._apply_default_opening_geometry()
+        super().showEvent(event)
 
     def closeEvent(self, event):
         """Stop the solver when closing the window so the simulation does not keep running."""
@@ -485,7 +545,8 @@ class BlastFoamApp(QMainWindow):
         # Primary tabs (full width at top for tab bar visibility)
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
-        # Allow the window to shrink below the sum of all tab titles.
+        # Prefer full titles when space allows; elide + scroll when the window is narrowed.
+        # ElideNone must NOT be used — it reintroduces a large top-level minimumWidth.
         self.tabs.tabBar().setUsesScrollButtons(True)
         self.tabs.tabBar().setElideMode(Qt.ElideRight)
         self.tabs.setMinimumWidth(0)
@@ -523,6 +584,21 @@ class BlastFoamApp(QMainWindow):
         self.tab_3d.sig_request_run_exact_1.connect(lambda: (self.tabs.setCurrentWidget(self.tab_3d), self.run_3d_process_exact_1()))
         self.tab_3d.sig_request_run_exact_end.connect(lambda: (self.tabs.setCurrentWidget(self.tab_3d), self.run_3d_process_exact_end()))
         self.tab_3d.sig_request_stop.connect(self.on_stop_request)
+
+        # Shared computational left-panel width across 1D / 2D / 3D (session-preserved).
+        from ui_metrics import COMPUTATIONAL_LEFT_PANEL_WIDTH
+        self._computational_left_width = COMPUTATIONAL_LEFT_PANEL_WIDTH
+        self.tabs.currentChanged.connect(self._on_main_tab_changed)
+        for _tab in self._computational_tabs():
+            if hasattr(_tab, "set_computational_left_width"):
+                _tab.set_computational_left_width(self._computational_left_width)
+            splitter = getattr(_tab, "_main_splitter", None) or getattr(_tab, "splitter", None)
+            if splitter is not None and not getattr(splitter, "_ggui_width_hooked", False):
+                splitter.splitterMoved.connect(self._on_computational_splitter_moved)
+                splitter._ggui_width_hooked = True
+        # Re-apply after first show so realized splitter geometry matches the target.
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(0, self._apply_opening_computational_left_width)
         
         # Main content area with splitter
         content_splitter = QSplitter(Qt.Horizontal)
@@ -557,8 +633,45 @@ class BlastFoamApp(QMainWindow):
         # Bottom: Segmented Status Bar
         self.status_bar = SegmentedStatusBar()
         main_layout.addWidget(self.status_bar)
-        self.tab_3d.initial_dt_changed.connect(self.status_bar.set_3d_initial_dt)
+        self.tab_3d.initial_dt_changed.connect(self._on_3d_initial_dt_changed)
         self.tab_3d._update_calculated_dt_label()
+
+    def _computational_tabs(self):
+        return (self.tab_1d, self.tab_2d, self.tab_3d)
+
+    def _apply_opening_computational_left_width(self) -> None:
+        from ui_metrics import COMPUTATIONAL_LEFT_PANEL_WIDTH
+        if self._computational_left_width is None:
+            self._computational_left_width = COMPUTATIONAL_LEFT_PANEL_WIDTH
+        for tab in self._computational_tabs():
+            if hasattr(tab, "set_computational_left_width"):
+                tab.set_computational_left_width(self._computational_left_width)
+
+    def _on_main_tab_changed(self, _index: int) -> None:
+        """Preserve shared left-panel width across 1D/2D/3D tab switches."""
+        self._sync_computational_left_width(
+            self.tabs.currentWidget(), record_from_current=False
+        )
+
+    def _sync_computational_left_width(self, widget, record_from_current: bool = False) -> None:
+        if widget not in self._computational_tabs():
+            return
+        if record_from_current and hasattr(widget, "get_computational_left_width"):
+            self._computational_left_width = widget.get_computational_left_width()
+        if self._computational_left_width is None:
+            from ui_metrics import COMPUTATIONAL_LEFT_PANEL_WIDTH
+            self._computational_left_width = COMPUTATIONAL_LEFT_PANEL_WIDTH
+        if hasattr(widget, "set_computational_left_width"):
+            widget.set_computational_left_width(self._computational_left_width)
+        splitter = getattr(widget, "_main_splitter", None) or getattr(widget, "splitter", None)
+        if splitter is not None and not getattr(splitter, "_ggui_width_hooked", False):
+            splitter.splitterMoved.connect(self._on_computational_splitter_moved)
+            splitter._ggui_width_hooked = True
+
+    def _on_computational_splitter_moved(self, _pos: int = 0, _index: int = 0) -> None:
+        current = self.tabs.currentWidget()
+        if current in self._computational_tabs() and hasattr(current, "get_computational_left_width"):
+            self._computational_left_width = current.get_computational_left_width()
     
     def _create_placeholder_tab(self, title, message):
         """Create a placeholder tab for unimplemented features"""
@@ -1332,6 +1445,7 @@ class BlastFoamApp(QMainWindow):
         """Start solver with monitoring"""
         self.status_bar.set_status("Solver Running...", "#3498db")
         self.status_bar.set_progress(0)
+        self.status_bar.start_et_timing()
         
         log_path = os.path.join(case_dir, "log.blastFoam")
         self.tab_jotter.start_monitoring(log_path)
@@ -1357,6 +1471,7 @@ class BlastFoamApp(QMainWindow):
         """Handle stop/interrupt request"""
         if self.runner:
             self.runner.stop()
+            self.status_bar.stop_et_timing()
             self.status_bar.set_status("Interrupted", "#e67e22")
         self.view_timer.stop()
     
@@ -1382,6 +1497,7 @@ class BlastFoamApp(QMainWindow):
         self.view_timer.stop()
         self.tab_jotter.stop_monitoring()
         self.runner = None
+        self.status_bar.stop_et_timing()
         
         if success:
             self.status_bar.set_progress(100)
@@ -1391,6 +1507,14 @@ class BlastFoamApp(QMainWindow):
         else:
             if "Interrupted" not in self.status_bar.lbl_status.text():
                 self.status_bar.set_status("Stopped/Failed", "#e74c3c")
+
+    def _on_3d_initial_dt_changed(self, dt_val):
+        """Initial Δt is shown in General 3D Simulation Control (not the status bar)."""
+        if hasattr(self.tab_3d, "lbl_initial_dt_display"):
+            if dt_val is None:
+                self.tab_3d.lbl_initial_dt_display.setText("Initial Δt: — s")
+            else:
+                self.tab_3d.lbl_initial_dt_display.setText(f"Initial Δt: {dt_val:g} s")
 
 
 def main():

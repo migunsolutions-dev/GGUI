@@ -512,12 +512,16 @@ class Tab3DGuiCorrectnessTests(unittest.TestCase):
                 )
             tab.update_charge_cells_display(td)
 
-        self.assertFalse(tab.grp_init_results.isHidden())
+        # Tall Initialization Results group stays hidden; compact Info panel shows actuals.
+        self.assertTrue(tab.grp_init_results.isHidden())
         self.assertTrue(tab._init_results_available)
         self.assertIn("12345", tab.lbl_result_total_cells.text().replace(",", ""))
         self.assertIn("setFields", tab.lbl_result_init_command.text())
         self.assertIn("88", tab.lbl_result_charge_cells.text())
         self.assertIn("12", tab.lbl_result_ignition_cells.text())
+        self.assertIn("12345", tab.lbl_info_total_cells.text().replace(",", ""))
+        self.assertIn("88", tab.lbl_info_charge_cells.text())
+        self.assertTrue(tab.lbl_info_total_cells.text().startswith("Current cells:"))
 
     def test_duplicate_summary_rows_removed(self):
         tab = self.make_tab()

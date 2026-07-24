@@ -26,6 +26,17 @@ from charge_seed_plan import (
 )
 from charge_capture import resolve_charge_capture_radius_m
 from viewer_widget import BlastViewerWidget, ObstacleItem, SectionItem
+from ui_metrics import (
+    COMPUTATIONAL_LEFT_PANEL_WIDTH,
+    COMPUTATIONAL_LEFT_PANEL_MIN,
+    INFO_PANEL_HEIGHT,
+    INFO_ROW_STYLE,
+    INFO_TITLE_STYLE,
+    SECONDARY_INFO_STYLE,
+    WARNING_STYLE,
+    GROUP_MARGINS,
+    FORM_ROW_SPACING,
+)
 from dialogs import RemapConfigDialog
 try:
     from bf_option_discovery import get_eos_options, get_activation_options, get_thermo_options, get_decomposition_method_options
@@ -88,21 +99,88 @@ class TabGeneral3D(QWidget):
         main_layout.addWidget(splitter)
 
         # ===== LEFT SIDE: Input Panel (extends full height) =====
-        setup_widget = QWidget()
-        setup_layout = QVBoxLayout(setup_widget)
-        setup_layout.setContentsMargins(4, 4, 4, 4)
-        setup_layout.setSpacing(4)
+        # Create relocatable Mesh Plan detail labels before Model Setup builds,
+        # so they can be placed next to the relevant controls.
+        info_font = "font-size: 9pt; color: #333;"
+
+        def _plan_lbl(tip: str = "", parent: QWidget = None) -> QLabel:
+            lbl = QLabel("", parent)
+            lbl.setStyleSheet(info_font + " background: transparent; border: none;")
+            lbl.setWordWrap(True)
+            lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+            if tip:
+                lbl.setToolTip(tip)
+            return lbl
+
+        self.lbl_plan_base_grid = _plan_lbl(
+            "Base blockMesh grid from domain extents and Cell Size."
+        )
+        self.lbl_plan_mesh_mode = _plan_lbl(
+            "Fixed mesh or runtime AMR (Wave AMR level / finest wave cell)."
+        )
+        self.lbl_plan_init_command = _plan_lbl(
+            "Initialization command selected by the current policy."
+        )
+        self.lbl_plan_charge_seed = _plan_lbl(
+            "Requested/effective charge seed level, estimated smallest charge cell, and estimated charge-cell count."
+        )
+        self.lbl_plan_charge_capture = _plan_lbl(
+            "Charge capture status for setFieldsDict backup region (not the physical charge size)."
+        )
+        self.lbl_plan_startup_outer = _plan_lbl(
+            "Whether the current configuration emits the startup outer refinement region (chargeRefineOuter)."
+        )
+        self.lbl_plan_initiation = _plan_lbl(
+            "Ignition mode, point, and initiation radius."
+        )
+        self.lbl_result_total_cells = _plan_lbl(
+            "Actual total cell count after initialization."
+        )
+        self.lbl_result_init_command = _plan_lbl(
+            "Initialization command actually executed."
+        )
+        self.lbl_result_charge_cells = _plan_lbl(
+            "Number of cells with alpha.c4 above threshold in 0/ after init."
+        )
+        self.lbl_result_ignition_cells = _plan_lbl(
+            "Cells with alpha.c4>thr in the ignition region (when available)."
+        )
+        self.lbl_charge_resolution_warning = QLabel("")
+        self.lbl_charge_resolution_warning.setStyleSheet(
+            "font-size: 9pt; color: #c00; font-weight: bold; padding: 2px 0; border: none;"
+        )
+        self.lbl_charge_resolution_warning.setWordWrap(True)
+        self.lbl_charge_resolution_warning.setMinimumHeight(36)
+        self.lbl_charge_resolution_warning.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        self.lbl_charge_resolution_warning.hide()
         
         self.settings_tabs = QTabWidget()
-        self._tab_model = QWidget(); self._build_model_tab(self._tab_model)
-        self._tab_obs = QWidget(); self._build_obstacles_tab(self._tab_obs)
-        
-        self.settings_tabs.addTab(self._tab_model, "Model Setup")
-        self.settings_tabs.addTab(self._tab_obs, "Obstacles")
-        setup_layout.addWidget(self.settings_tabs)
-        
+        self._tab_model = QWidget()
+        self._build_model_tab(self._tab_model)
+        self._tab_obs = QWidget()
+        self._build_obstacles_tab(self._tab_obs)
+
+        model_scroll = QScrollArea()
+        model_scroll.setWidget(self._tab_model)
+        model_scroll.setWidgetResizable(True)
+        model_scroll.setMinimumWidth(COMPUTATIONAL_LEFT_PANEL_MIN)
+        model_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        model_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._left_setup_scroll = model_scroll
+
+        obs_scroll = QScrollArea()
+        obs_scroll.setWidget(self._tab_obs)
+        obs_scroll.setWidgetResizable(True)
+        obs_scroll.setMinimumWidth(0)
+        obs_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        obs_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._left_obs_scroll = obs_scroll
+
+        self.settings_tabs.addTab(model_scroll, "Model Setup")
+        self.settings_tabs.addTab(obs_scroll, "Obstacles")
+
         # Info panel: Mesh Plan (live, pre-init) + Initialization Results (post-init only)
-        info_font = "font-size: 9pt; color: #333;"
         info_frm = QFrame()
         info_frm.setStyleSheet("background:#eef2f6; border:1px solid #c7d0da; border-radius: 4px;")
         info_frm.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
@@ -119,16 +197,6 @@ class TabGeneral3D(QWidget):
         plan_l = QVBoxLayout(self.grp_mesh_plan)
         plan_l.setContentsMargins(2, 0, 2, 2)
         plan_l.setSpacing(0)
-
-        def _plan_lbl(tip: str = "", parent: QWidget = None) -> QLabel:
-            lbl = QLabel("", parent)
-            lbl.setStyleSheet(info_font + " background: transparent; border: none;")
-            lbl.setWordWrap(True)
-            lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-            if tip:
-                lbl.setToolTip(tip)
-            return lbl
 
         self.lbl_mesh_plan_title = QLabel("Mesh Plan — Before Initialize", self.grp_mesh_plan)
         self.lbl_mesh_plan_title.setStyleSheet(
@@ -149,51 +217,9 @@ class TabGeneral3D(QWidget):
         self.lbl_plan_block_status = _plan_lbl(parent=self.grp_mesh_plan)
         plan_body.addWidget(self.lbl_plan_block_mesh)
         plan_body.addWidget(self.lbl_plan_block_seed)
-        # Text holders for tests / tooltips — owned by the plan group, never shown alone
-        self.lbl_plan_base_grid = _plan_lbl(
-            "Base blockMesh grid from domain extents and Cell Size.", parent=self.grp_mesh_plan
-        )
-        self.lbl_plan_mesh_mode = _plan_lbl(
-            "Fixed mesh or runtime AMR (Wave AMR level / finest wave cell).", parent=self.grp_mesh_plan
-        )
-        self.lbl_plan_init_command = _plan_lbl(
-            "Initialization command selected by the current policy.", parent=self.grp_mesh_plan
-        )
-        self.lbl_plan_charge_seed = _plan_lbl(
-            "Requested/effective charge seed level, estimated smallest charge cell, and estimated charge-cell count.",
-            parent=self.grp_mesh_plan,
-        )
-        self.lbl_plan_charge_capture = _plan_lbl(
-            "Charge capture status for setFieldsDict backup region (not the physical charge size).",
-            parent=self.grp_mesh_plan,
-        )
-        self.lbl_plan_startup_outer = _plan_lbl(
-            "Whether the current configuration emits the startup outer refinement region (chargeRefineOuter).",
-            parent=self.grp_mesh_plan,
-        )
-        self.lbl_plan_initiation = _plan_lbl(
-            "Ignition mode, point, and initiation radius.", parent=self.grp_mesh_plan
-        )
-        for w in (
-            self.lbl_plan_base_grid,
-            self.lbl_plan_mesh_mode,
-            self.lbl_plan_init_command,
-            self.lbl_plan_charge_seed,
-            self.lbl_plan_charge_capture,
-            self.lbl_plan_startup_outer,
-            self.lbl_plan_initiation,
-        ):
-            w.hide()
-
-        self.lbl_charge_resolution_warning = QLabel("")
-        self.lbl_charge_resolution_warning.setStyleSheet(
-            "font-size: 9pt; color: #c00; font-weight: bold; padding: 2px 0; border: none;"
-        )
-        self.lbl_charge_resolution_warning.setWordWrap(True)
-        self.lbl_charge_resolution_warning.setMinimumHeight(36)
-        self.lbl_charge_resolution_warning.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-        # Warning sits above initiation so Phase 1F order is: plan rows → warnings → initiation.
-        plan_body.addWidget(self.lbl_charge_resolution_warning)
+        # Detail labels are relocated into Model Setup; keep base-grid holder for tests.
+        self.lbl_plan_base_grid.hide()
+        # Warning / initiation block retained for update path (initiation detail is relocated).
         plan_body.addWidget(self.lbl_plan_block_status)
         plan_l.addLayout(plan_body)
         il.addWidget(self.grp_mesh_plan)
@@ -208,27 +234,7 @@ class TabGeneral3D(QWidget):
         res_l.setSpacing(2)
         self.lbl_result_block = _plan_lbl(parent=self.grp_init_results)
         res_l.addWidget(self.lbl_result_block)
-        self.lbl_result_total_cells = _plan_lbl(
-            "Actual total cell count after initialization.", parent=self.grp_init_results
-        )
-        self.lbl_result_init_command = _plan_lbl(
-            "Initialization command actually executed.", parent=self.grp_init_results
-        )
-        self.lbl_result_charge_cells = _plan_lbl(
-            "Number of cells with alpha.c4 above threshold in 0/ after init.",
-            parent=self.grp_init_results,
-        )
-        self.lbl_result_ignition_cells = _plan_lbl(
-            "Cells with alpha.c4>thr in the ignition region (when available).",
-            parent=self.grp_init_results,
-        )
-        for w in (
-            self.lbl_result_total_cells,
-            self.lbl_result_init_command,
-            self.lbl_result_charge_cells,
-            self.lbl_result_ignition_cells,
-        ):
-            w.hide()
+        # Detail result labels are relocated into Initialize Method (visible after init).
         self.grp_init_results.hide()
         il.addWidget(self.grp_init_results)
 
@@ -257,17 +263,54 @@ class TabGeneral3D(QWidget):
         self.lbl_expected_emesh.hide()
         self._init_results_available = False
 
-        setup_layout.addWidget(info_frm)
+        # ===== Compact fixed Info panel (does not scroll with settings) =====
+        self._info_panel = QFrame()
+        self._info_panel.setObjectName("general3dInfoPanel")
+        self._info_panel.setStyleSheet(
+            "QFrame#general3dInfoPanel {"
+            "  background:#eef2f6; border:1px solid #c7d0da; border-radius: 4px;"
+            "}"
+        )
+        self._info_panel.setFixedHeight(INFO_PANEL_HEIGHT)
+        self._info_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        info_l = QVBoxLayout(self._info_panel)
+        info_l.setContentsMargins(6, 4, 6, 4)
+        info_l.setSpacing(2)
+        self.lbl_info_title = QLabel("Info")
+        self.lbl_info_title.setStyleSheet(INFO_TITLE_STYLE)
+        info_l.addWidget(self.lbl_info_title)
+        self.lbl_info_total_cells = QLabel("Cells: —")
+        self.lbl_info_base_grid = QLabel("Base grid: —")
+        self.lbl_info_charge_size = QLabel("Charge size: —")
+        self.lbl_info_charge_cells = QLabel("Charge cells: —")
+        for lbl in (
+            self.lbl_info_total_cells,
+            self.lbl_info_base_grid,
+            self.lbl_info_charge_size,
+            self.lbl_info_charge_cells,
+        ):
+            lbl.setStyleSheet(INFO_ROW_STYLE)
+            lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            info_l.addWidget(lbl)
 
-        scroll = QScrollArea()
-        scroll.setWidget(setup_widget)
-        scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(320)
-        # Keep normal horizontal/vertical scrolling (do not force AlwaysOff).
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._left_setup_scroll = scroll
-        splitter.addWidget(scroll)
+        # Keep legacy Mesh Plan / Init Results widgets for tests & detail updates,
+        # but do not show the tall plan block in the fixed panel.
+        info_frm.setParent(self)
+        info_frm.hide()
+        self.grp_mesh_plan.hide()
+        self.grp_init_results.hide()
+        # Warning label is reparented into Charge Properties (see _build_model_tab).
+
+        left_column = QWidget()
+        left_column.setObjectName("general3dLeftColumn")
+        left_v = QVBoxLayout(left_column)
+        left_v.setContentsMargins(4, 4, 4, 4)
+        left_v.setSpacing(4)
+        # Tab selector fixed at top; page content scrolls inside each tab.
+        left_v.addWidget(self.settings_tabs, stretch=1)
+        left_v.addWidget(self._info_panel, stretch=0)
+
+        splitter.addWidget(left_column)
 
         # ===== RIGHT SIDE: Viewport + Execution Controls (stacked vertically) =====
         right_container = QWidget()
@@ -310,11 +353,21 @@ class TabGeneral3D(QWidget):
         splitter.addWidget(right_container)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([450, 700])
+        left_w = COMPUTATIONAL_LEFT_PANEL_WIDTH
+        splitter.setSizes([left_w, max(400, 1200 - left_w)])
         # Expose for tests / diagnostics only (no visible controls).
         self._main_splitter = splitter
         self._right_container = right_container
-        self._left_setup_scroll = scroll
+        self._left_column = left_column
+
+    def get_computational_left_width(self) -> int:
+        sizes = self._main_splitter.sizes()
+        return int(sizes[0]) if sizes else COMPUTATIONAL_LEFT_PANEL_WIDTH
+
+    def set_computational_left_width(self, width: int) -> None:
+        width = max(COMPUTATIONAL_LEFT_PANEL_MIN, int(width))
+        total = sum(self._main_splitter.sizes()) or (width + 800)
+        self._main_splitter.setSizes([width, max(50, total - width)])
 
     def _lbl(self, text: str) -> QLabel:
         """Create a label with fixed width so all field columns align."""
@@ -385,7 +438,25 @@ class TabGeneral3D(QWidget):
         mesh_props_h.setContentsMargins(0, 0, 0, 0)
         mesh_props_h.addWidget(self.btn_mesh_properties)
         mesh_props_h.addStretch()
-        f.addWidget(mesh_props_row, 4, 0, 1, 2)
+        # Seed / outer-region Mesh Plan details live next to Mesh Properties.
+        self.lbl_plan_charge_seed.setStyleSheet(SECONDARY_INFO_STYLE)
+        self.lbl_plan_charge_seed.setWordWrap(True)
+        self.lbl_plan_charge_seed.show()
+        self.lbl_plan_startup_outer.setStyleSheet(SECONDARY_INFO_STYLE)
+        self.lbl_plan_startup_outer.setWordWrap(True)
+        self.lbl_plan_startup_outer.show()
+        self.lbl_plan_charge_capture.setStyleSheet(SECONDARY_INFO_STYLE)
+        self.lbl_plan_charge_capture.setWordWrap(True)
+        self.lbl_plan_charge_capture.show()
+        mesh_props_col = QWidget()
+        mesh_props_v = QVBoxLayout(mesh_props_col)
+        mesh_props_v.setContentsMargins(0, 0, 0, 0)
+        mesh_props_v.setSpacing(2)
+        mesh_props_v.addWidget(mesh_props_row)
+        mesh_props_v.addWidget(self.lbl_plan_charge_seed)
+        mesh_props_v.addWidget(self.lbl_plan_startup_outer)
+        mesh_props_v.addWidget(self.lbl_plan_charge_capture)
+        f.addWidget(mesh_props_col, 4, 0, 1, 2)
         # Mesh mode: Dyn Mesh default (building3D-style AMR); Fixed Mesh available
         self.rad_fixed_mesh = QRadioButton("Fixed Mesh")
         self.rad_dyn_mesh = QRadioButton("Dyn Mesh (AMR)")
@@ -423,6 +494,11 @@ class TabGeneral3D(QWidget):
         wave_h.addWidget(self.lbl_wave_amr_cell)
         wave_h.addStretch()
         mesh_mode_v.addWidget(wave_row)
+        # Relocated Mesh Plan detail: mesh mode + wave AMR status (not deleted).
+        self.lbl_plan_mesh_mode.setStyleSheet(SECONDARY_INFO_STYLE)
+        self.lbl_plan_mesh_mode.setWordWrap(True)
+        self.lbl_plan_mesh_mode.show()
+        mesh_mode_v.addWidget(self.lbl_plan_mesh_mode)
         self.rad_dyn_mesh.toggled.connect(self._on_mesh_mode_changed)
         self.rad_dyn_mesh.toggled.connect(lambda: self._set_provenance_user("enable_dyn_refine"))
         self.spin_refine_min.valueChanged.connect(self._validate_refine_levels)
@@ -695,6 +771,10 @@ class TabGeneral3D(QWidget):
         self._on_ignition_mode_changed(self.combo_ignition_mode.currentText())
         for _w in (self.init_ix, self.init_iy, self.init_iz, self.cx, self.cy, self.cz):
             _w.valueChanged.connect(self._update_mesh_plan_display)
+        self.lbl_plan_initiation.setStyleSheet(SECONDARY_INFO_STYLE)
+        self.lbl_plan_initiation.setWordWrap(True)
+        self.lbl_plan_initiation.show()
+        f2c.addRow(self.lbl_plan_initiation)
         # Density follows selected material; keep field read-only in UI.
         self.c_rho.setEnabled(False)
         self.lbl_density.setEnabled(False)
@@ -778,6 +858,11 @@ class TabGeneral3D(QWidget):
         self._decomposition_simple_delta = 0.001
         charge_main.addWidget(wrap_geom_center)
         charge_main.addWidget(wrap_initiation)
+        # Full warnings near charge / resolution controls (also summarized near Initialize).
+        self.lbl_charge_resolution_warning.setStyleSheet(WARNING_STYLE)
+        self.lbl_charge_resolution_warning.setWordWrap(True)
+        self.lbl_charge_resolution_warning.hide()
+        charge_main.addWidget(self.lbl_charge_resolution_warning)
         l.addWidget(c)
         
         a = QGroupBox("Atmosphere"); f3 = QFormLayout(a)
@@ -848,6 +933,21 @@ class TabGeneral3D(QWidget):
         row_origin_h.addStretch()
         fm.addRow(QLabel("Remap Origin (X, Y, Z)"))
         fm.addRow(row_origin)
+        self.lbl_plan_init_command.setStyleSheet(SECONDARY_INFO_STYLE)
+        self.lbl_plan_init_command.setWordWrap(True)
+        self.lbl_plan_init_command.show()
+        fm.addRow(self.lbl_plan_init_command)
+        # Post-init diagnostics (visible after initialization; not only hidden holders).
+        for lbl in (
+            self.lbl_result_init_command,
+            self.lbl_result_total_cells,
+            self.lbl_result_charge_cells,
+            self.lbl_result_ignition_cells,
+        ):
+            lbl.setStyleSheet(SECONDARY_INFO_STYLE)
+            lbl.setWordWrap(True)
+            lbl.hide()
+            fm.addRow(lbl)
         # Mode A checkbox removed: remap always uses activationModel none (no mass check needed)
         l.addWidget(self.grp_init_method)
 
@@ -1151,6 +1251,130 @@ class TabGeneral3D(QWidget):
             + self._mesh_plan_row("Initiation radius", f"{r_ign:g} m")
         )
         self.lbl_plan_block_status.show()
+        self._update_compact_info_panel(
+            total_cells=total,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            dyn=dyn,
+            planned_charge_cells=est,
+        )
+        self._update_warning_summary(warn_parts)
+
+    def _physical_charge_size_text(self) -> str:
+        """Authoritative physical charge size for the fixed Info panel."""
+        try:
+            from physical_charge_geometry import physical_charge_geometry
+            geom = physical_charge_geometry(self.get_case_inputs())
+            shape = str(getattr(geom, "shape", "") or self.c_shape.currentText()).lower()
+            if "cyl" in shape:
+                r = float(getattr(geom, "cylinder_radius_m", 0.0) or getattr(geom, "radius_m", 0.0) or 0.0)
+                length = float(getattr(geom, "length_m", 0.0) or 0.0)
+                return f"R = {r:.4g} m ; L = {length:.4g} m"
+            if "cub" in shape or "box" in shape:
+                L = float(
+                    getattr(geom, "length_box_m", 0.0)
+                    or getattr(geom, "length_m", 0.0)
+                    or self.c_length.value()
+                )
+                W = float(getattr(geom, "width_m", 0.0) or self.c_width.value())
+                H = float(getattr(geom, "height_m", 0.0) or self.c_height.value())
+                return f"{L:.4g} × {W:.4g} × {H:.4g} m"
+            r = float(getattr(geom, "radius_m", 0.0) or self.c_radius.value())
+            return f"R = {r:.4g} m"
+        except Exception:
+            shape = self.c_shape.currentText()
+            if shape == "Cylinder":
+                return f"R = {self.c_radius.value():.4g} m ; L = {self.c_length.value():.4g} m"
+            if shape == "Cuboid":
+                return (
+                    f"{self.c_length.value():.4g} × {self.c_width.value():.4g} × "
+                    f"{self.c_height.value():.4g} m"
+                )
+            return f"R = {self.c_radius.value():.4g} m"
+
+    def _update_compact_info_panel(
+        self,
+        total_cells=None,
+        nx=None,
+        ny=None,
+        nz=None,
+        dyn: bool = True,
+        planned_charge_cells=None,
+    ) -> None:
+        """Update the four fixed Info rows (no tall Mesh Plan block)."""
+        if not hasattr(self, "lbl_info_total_cells"):
+            return
+        if self._init_results_available:
+            # Prefer actual post-init totals when present on result holders.
+            actual_total = (self.lbl_result_total_cells.text() or "").strip()
+            if actual_total:
+                # "Total cells: N" → "Current cells: N"
+                num = actual_total.split(":")[-1].strip() if ":" in actual_total else actual_total
+                self.lbl_info_total_cells.setText(f"Current cells: {num}")
+            elif total_cells is not None:
+                self.lbl_info_total_cells.setText(f"Current cells: {int(total_cells):,}")
+        else:
+            if total_cells is None:
+                self.lbl_info_total_cells.setText("Cells: —")
+            elif dyn:
+                self.lbl_info_total_cells.setText(f"Estimated cells: {int(total_cells):,}")
+            else:
+                self.lbl_info_total_cells.setText(f"Total cells: {int(total_cells):,}")
+
+        if nx is not None and ny is not None and nz is not None:
+            self.lbl_info_base_grid.setText(f"Base grid: {nx} × {ny} × {nz}")
+        else:
+            self.lbl_info_base_grid.setText("Base grid: —")
+
+        self.lbl_info_charge_size.setText(f"Charge size: {self._physical_charge_size_text()}")
+
+        if self._init_results_available:
+            actual_cc = (self.lbl_result_charge_cells.text() or "").strip()
+            if actual_cc:
+                num = actual_cc.split(":")[-1].strip() if ":" in actual_cc else actual_cc
+                self.lbl_info_charge_cells.setText(f"Charge cells: {num}")
+            elif planned_charge_cells is not None and planned_charge_cells > 0:
+                self.lbl_info_charge_cells.setText(
+                    f"Charge cells (actual pending): {int(round(planned_charge_cells)):,}"
+                )
+            else:
+                self.lbl_info_charge_cells.setText("Charge cells: —")
+        else:
+            if planned_charge_cells is not None and planned_charge_cells > 0:
+                self.lbl_info_charge_cells.setText(
+                    f"Planned charge cells: {int(round(planned_charge_cells)):,}"
+                )
+            else:
+                self.lbl_info_charge_cells.setText("Planned charge cells: —")
+
+    def _update_warning_summary(self, warn_parts) -> None:
+        """Compact warning chip near Initialize; full text on lbl_charge_resolution_warning."""
+        n = len(warn_parts or [])
+        if hasattr(self, "lbl_charge_resolution_warning"):
+            if n > 0:
+                self.lbl_charge_resolution_warning.show()
+            else:
+                self.lbl_charge_resolution_warning.hide()
+        if not hasattr(self, "btn_warning_summary"):
+            return
+        if n <= 0:
+            self.btn_warning_summary.hide()
+            self.btn_warning_summary.setText("")
+            return
+        self.btn_warning_summary.setText(
+            f"⚠ {n} configuration warning" + ("s" if n != 1 else "")
+        )
+        self.btn_warning_summary.setToolTip("\n".join(warn_parts))
+        self.btn_warning_summary.show()
+
+    def _on_warning_summary_clicked(self) -> None:
+        text = (self.lbl_charge_resolution_warning.text() or "").strip()
+        if not text:
+            text = (self.btn_warning_summary.toolTip() or "").strip()
+        if not text:
+            return
+        QMessageBox.warning(self, "Configuration warnings", text)
 
     def _refresh_init_results_block(self) -> None:
         lines = []
@@ -1168,12 +1392,26 @@ class TabGeneral3D(QWidget):
 
     def _set_init_results_visible(self, visible: bool) -> None:
         self._init_results_available = bool(visible)
-        self.grp_init_results.setVisible(bool(visible))
+        # Tall Initialization Results group stays hidden; compact Info + Initialize Method show actuals.
+        self.grp_init_results.hide()
+        detail_labels = (
+            self.lbl_result_init_command,
+            self.lbl_result_total_cells,
+            self.lbl_result_charge_cells,
+            self.lbl_result_ignition_cells,
+        )
         if visible:
             self._refresh_init_results_block()
+            self._update_compact_info_panel(dyn=self.rad_dyn_mesh.isChecked())
+            for lbl in detail_labels:
+                text = (lbl.text() or "").strip()
+                lbl.setVisible(bool(text))
         else:
             self.lbl_result_block.setText("")
+            self._update_mesh_plan_display()
             self.lbl_result_block.setVisible(False)
+            for lbl in detail_labels:
+                lbl.hide()
 
     def _pair(self, a, b):
         w = QWidget(); h = QHBoxLayout(w); h.setContentsMargins(0,0,0,0); h.setSpacing(10)
@@ -1186,28 +1424,120 @@ class TabGeneral3D(QWidget):
 
     def _build_obstacles_tab(self, parent):
         l = QVBoxLayout(parent)
-        btns = QHBoxLayout()
+        l.setContentsMargins(4, 4, 4, 4)
+        l.setSpacing(6)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(4)
         self.btn_add = QPushButton("Import STL")
-        self.btn_clr = QPushButton("Clear")
         self.btn_del = QPushButton("Delete Selected")
-        self.btn_up = QPushButton("↑ Move Up")
-        self.btn_down = QPushButton("↓ Move Down")
-        btns.addWidget(self.btn_add)
-        btns.addWidget(self.btn_clr)
-        btns.addWidget(self.btn_del)
-        btns.addWidget(self.btn_up)
-        btns.addWidget(self.btn_down)
-        l.addLayout(btns)
+        self.btn_clr = QPushButton("Clear")
+        for b in (self.btn_add, self.btn_del, self.btn_clr):
+            b.setMinimumWidth(0)
+            row1.addWidget(b)
+        l.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(4)
+        self.btn_up = QPushButton("Move Up")
+        self.btn_down = QPushButton("Move Down")
+        for b in (self.btn_up, self.btn_down):
+            b.setMinimumWidth(0)
+            row2.addWidget(b)
+        row2.addStretch()
+        l.addLayout(row2)
+
         self.btn_del.clicked.connect(self._del_stl)
         self.btn_up.clicked.connect(self._move_up_stl)
         self.btn_down.clicked.connect(self._move_down_stl)
+        self.btn_add.clicked.connect(self._add_stl)
+        self.btn_clr.clicked.connect(self._clear_stl)
 
-        self.tbl_obs = QTableWidget(0, 6)
-        self.tbl_obs.setHorizontalHeaderLabels(["On", "File", "Scale", "Off X", "Off Y", "Off Z"])
+        # Compact identification table; full properties edit below.
+        self.tbl_obs = QTableWidget(0, 2)
+        self.tbl_obs.setHorizontalHeaderLabels(["On", "File"])
         self.tbl_obs.horizontalHeader().setStretchLastSection(True)
-        l.addWidget(self.tbl_obs)
-        self.btn_add.clicked.connect(self._add_stl); self.btn_clr.clicked.connect(self._clear_stl)
+        self.tbl_obs.setSelectionBehavior(QTableWidget.SelectRows)
+        self.tbl_obs.setSelectionMode(QTableWidget.SingleSelection)
+        self.tbl_obs.setMinimumWidth(0)
+        self.tbl_obs.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        l.addWidget(self.tbl_obs, stretch=1)
         self.tbl_obs.cellChanged.connect(self._on_table_change)
+        self.tbl_obs.itemSelectionChanged.connect(self._on_obstacle_selection_changed)
+
+        self.grp_obs_editor = QGroupBox("Selected Obstacle")
+        ed = QFormLayout(self.grp_obs_editor)
+        ed.setContentsMargins(*GROUP_MARGINS)
+        ed.setVerticalSpacing(FORM_ROW_SPACING)
+        ed.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+        self.spin_obs_scale = QDoubleSpinBox()
+        self.spin_obs_scale.setRange(1e-9, 1e6)
+        self.spin_obs_scale.setDecimals(6)
+        self.spin_obs_scale.setSingleStep(0.001)
+        self.spin_obs_scale.setMaximumWidth(120)
+        self.spin_obs_ox = QDoubleSpinBox()
+        self.spin_obs_oy = QDoubleSpinBox()
+        self.spin_obs_oz = QDoubleSpinBox()
+        for s in (self.spin_obs_ox, self.spin_obs_oy, self.spin_obs_oz):
+            s.setRange(-1e6, 1e6)
+            s.setDecimals(4)
+            s.setSingleStep(0.1)
+            s.setMaximumWidth(100)
+        ed.addRow("Scale", self.spin_obs_scale)
+        ed.addRow("Offset X", self.spin_obs_ox)
+        ed.addRow("Offset Y", self.spin_obs_oy)
+        ed.addRow("Offset Z", self.spin_obs_oz)
+        self.lbl_obs_path = QLabel("")
+        self.lbl_obs_path.setStyleSheet(SECONDARY_INFO_STYLE)
+        self.lbl_obs_path.setWordWrap(True)
+        ed.addRow("Path", self.lbl_obs_path)
+        l.addWidget(self.grp_obs_editor)
+
+        self._obs_editor_widgets = (
+            self.spin_obs_scale,
+            self.spin_obs_ox,
+            self.spin_obs_oy,
+            self.spin_obs_oz,
+        )
+        for w in self._obs_editor_widgets:
+            w.valueChanged.connect(self._on_obstacle_editor_changed)
+        self._set_obstacle_editor_enabled(False)
+
+    def _set_obstacle_editor_enabled(self, enabled: bool) -> None:
+        if hasattr(self, "grp_obs_editor"):
+            self.grp_obs_editor.setEnabled(bool(enabled))
+        if not enabled and hasattr(self, "lbl_obs_path"):
+            self.lbl_obs_path.setText("")
+
+    def _on_obstacle_selection_changed(self) -> None:
+        r = self.tbl_obs.currentRow()
+        if r < 0 or r >= len(self.obstacles):
+            self._set_obstacle_editor_enabled(False)
+            return
+        obs = self.obstacles[r]
+        self._block_obs_editor = True
+        try:
+            self.spin_obs_scale.setValue(float(obs.scale))
+            self.spin_obs_ox.setValue(float(obs.ox))
+            self.spin_obs_oy.setValue(float(obs.oy))
+            self.spin_obs_oz.setValue(float(obs.oz))
+            self.lbl_obs_path.setText(obs.path or "")
+        finally:
+            self._block_obs_editor = False
+        self._set_obstacle_editor_enabled(True)
+
+    def _on_obstacle_editor_changed(self, *_args) -> None:
+        if getattr(self, "_block_obs_editor", False):
+            return
+        r = self.tbl_obs.currentRow()
+        if r < 0 or r >= len(self.obstacles):
+            return
+        o = self.obstacles[r]
+        o.scale = float(self.spin_obs_scale.value())
+        o.ox = float(self.spin_obs_ox.value())
+        o.oy = float(self.spin_obs_oy.value())
+        o.oz = float(self.spin_obs_oz.value())
+        self._update_preview()
 
     def _build_exec_tab(self, parent):
         scroll = QScrollArea()
@@ -1316,6 +1646,11 @@ class TabGeneral3D(QWidget):
         f1.addRow(wrap_steps)
         f1.addRow(wrap_time)
         f1.addRow(self._lbl("cycleWrite"), self.spin_cycle_write)
+        self.lbl_initial_dt_display = QLabel("Initial Δt: — s")
+        self.lbl_initial_dt_display.setObjectName("initialDtDisplay")
+        self.lbl_initial_dt_display.setStyleSheet(SECONDARY_INFO_STYLE)
+        self.lbl_initial_dt_display.setWordWrap(False)
+        f1.addRow(self.lbl_initial_dt_display)
         self.wrap_write_steps = wrap_steps
         self.wrap_write_time = wrap_time
         self._on_write_control_changed(self.combo_write_control.currentText())
@@ -1329,6 +1664,15 @@ class TabGeneral3D(QWidget):
 
         g2 = QGroupBox("Actions"); v2 = QVBoxLayout(g2)
         self.btn_init = QPushButton("Initialize Model (Step 0)"); self.btn_init.clicked.connect(self._on_init_clicked)
+        self.btn_warning_summary = QPushButton("")
+        self.btn_warning_summary.setStyleSheet(
+            "QPushButton { color: #c0392b; font-weight: bold; text-align: left; "
+            "padding: 2px 4px; border: none; background: transparent; }"
+            "QPushButton:hover { text-decoration: underline; }"
+        )
+        self.btn_warning_summary.setCursor(Qt.PointingHandCursor)
+        self.btn_warning_summary.clicked.connect(self._on_warning_summary_clicked)
+        self.btn_warning_summary.hide()
         self.btn_exact_1 = QPushButton("exact 1")
         self.btn_exact_1.setToolTip("Run exactly one time step and stop.")
         self.btn_exact_1.clicked.connect(self.sig_request_run_exact_1.emit)
@@ -1344,6 +1688,7 @@ class TabGeneral3D(QWidget):
         self.btn_exact_end.setStyleSheet("background-color: #1abc9c; color: white; padding: 4px;")
         self.btn_stop.setStyleSheet("background-color: #e67e22; color: white; padding: 5px;")
         v2.addWidget(self.btn_init)
+        v2.addWidget(self.btn_warning_summary)
         v2.addWidget(self.btn_exact_1)
         v2.addWidget(self.btn_exact_end)
         v2.addWidget(self.btn_stop)
@@ -1574,6 +1919,11 @@ class TabGeneral3D(QWidget):
 
     def _update_calculated_dt_label(self):
         safe_dt = self._compute_safe_dt()
+        if hasattr(self, "lbl_initial_dt_display"):
+            if safe_dt is None:
+                self.lbl_initial_dt_display.setText("Initial Δt: — s")
+            else:
+                self.lbl_initial_dt_display.setText(f"Initial Δt: {safe_dt:g} s")
         self.initial_dt_changed.emit(safe_dt)
 
     def _on_write_control_changed(self, write_control: str):
@@ -2889,26 +3239,32 @@ class TabGeneral3D(QWidget):
         self.obstacles = []; self._refresh_table(); self._update_preview()
 
     def _refresh_table(self):
-        self._block_signals = True; self.tbl_obs.setRowCount(0)
+        self._block_signals = True
+        prev = self.tbl_obs.currentRow()
+        self.tbl_obs.setRowCount(0)
         for obs in self.obstacles:
-            r = self.tbl_obs.rowCount(); self.tbl_obs.insertRow(r)
-            it = QTableWidgetItem(); it.setCheckState(Qt.Checked if obs.enabled else Qt.Unchecked)
-            self.tbl_obs.setItem(r,0,it); self.tbl_obs.setItem(r,1,QTableWidgetItem(os.path.basename(obs.path)))
-            self.tbl_obs.setItem(r,2,QTableWidgetItem(str(obs.scale))); self.tbl_obs.setItem(r,3,QTableWidgetItem(str(obs.ox)))
-            self.tbl_obs.setItem(r,4,QTableWidgetItem(str(obs.oy)))
-            self.tbl_obs.setItem(r,5,QTableWidgetItem(str(obs.oz)))
+            r = self.tbl_obs.rowCount()
+            self.tbl_obs.insertRow(r)
+            it = QTableWidgetItem()
+            it.setCheckState(Qt.Checked if obs.enabled else Qt.Unchecked)
+            self.tbl_obs.setItem(r, 0, it)
+            self.tbl_obs.setItem(r, 1, QTableWidgetItem(os.path.basename(obs.path)))
         self._block_signals = False
+        if self.obstacles:
+            sel = prev if 0 <= prev < len(self.obstacles) else 0
+            self.tbl_obs.setCurrentCell(sel, 0)
+            self._on_obstacle_selection_changed()
+        else:
+            self._set_obstacle_editor_enabled(False)
 
     def _on_table_change(self, r, c):
-        if self._block_signals: return
+        if self._block_signals:
+            return
         try:
             o = self.obstacles[r]
-            if c==0: o.enabled = (self.tbl_obs.item(r,0).checkState()==Qt.Checked)
-            elif c==2: o.scale=float(self.tbl_obs.item(r,2).text())
-            elif c==3: o.ox=float(self.tbl_obs.item(r,3).text())
-            elif c==4: o.oy=float(self.tbl_obs.item(r,4).text())
-            elif c==5: o.oz=float(self.tbl_obs.item(r,5).text())
-            self._update_preview()
+            if c == 0:
+                o.enabled = (self.tbl_obs.item(r, 0).checkState() == Qt.Checked)
+                self._update_preview()
         except (IndexError, AttributeError, TypeError, ValueError) as exc:
             QMessageBox.warning(self, "Invalid obstacle value", str(exc))
 
