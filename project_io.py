@@ -11,6 +11,7 @@ from typing import Any, Dict, Protocol
 
 from charge_seed_plan import charge_dims_from_inputs, migrate_case_inputs_seed_fields
 from models import CaseInputs3D, ObstacleData
+from models_2d import CaseInputs2D, MappingSource2D, ProbePoint2D
 
 SCHEMA_VERSION = 1
 PROJECT_SUFFIX = ".ggui.json"
@@ -30,6 +31,11 @@ class _SupportsProbesDict(Protocol):
     def load_dict(self, data: Dict[str, Any]) -> None: ...
 
 
+class _SupportsProjectCapture2D(Protocol):
+    def get_case_inputs(self) -> CaseInputs2D: ...
+    def set_case_inputs(self, data: dict) -> None: ...
+
+
 class ProjectFormatError(ValueError):
     pass
 
@@ -46,8 +52,9 @@ def build_project(
     *,
     probes: Dict[str, Any],
     gui_state: Dict[str, Any],
+    inputs_2d: CaseInputs2D | None = None,
 ) -> Dict[str, Any]:
-    return {
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "application": {
             "name": "GGUI",
@@ -63,15 +70,29 @@ def build_project(
             "contains_runtime_results": False,
         },
     }
+    if inputs_2d is not None:
+        payload["dimensions"] = {
+            "2D": {
+                "model": "axisymmetric-rz-wedge",
+                "case_inputs": asdict(inputs_2d),
+            }
+        }
+    return payload
 
 
-def capture_project_payload(tab: _SupportsProjectCapture, probes_model: _SupportsProbesDict) -> Dict[str, Any]:
+def capture_project_payload(
+    tab: _SupportsProjectCapture,
+    probes_model: _SupportsProbesDict,
+    tab_2d: _SupportsProjectCapture2D | None = None,
+    selected_primary_tab: str = "General 3D",
+) -> Dict[str, Any]:
     """Capture dialog-independent project JSON from the live 3D GUI state."""
     return build_project(
         tab.get_case_inputs(),
         probes=probes_model.to_dict(),
+        inputs_2d=tab_2d.get_case_inputs() if tab_2d is not None else None,
         gui_state={
-            "selected_primary_tab": "General 3D",
+            "selected_primary_tab": selected_primary_tab,
             "sections": [asdict(section) for section in tab.sections],
             "obstacles": [asdict(obstacle) for obstacle in tab.obstacles],
         },
@@ -82,6 +103,7 @@ def apply_project_payload(
     tab: _SupportsProjectCapture,
     probes_model: _SupportsProbesDict,
     project: Dict[str, Any],
+    tab_2d: _SupportsProjectCapture2D | None = None,
 ) -> None:
     """Apply a read_project() result to the 3D tab without file dialogs.
 
@@ -123,6 +145,8 @@ def apply_project_payload(
     tab._refresh_table()
     probes_model.load_dict(project["probes"])
     tab.load_project_gui_state(project["gui_state"])
+    if tab_2d is not None and project.get("inputs_2d") is not None:
+        tab_2d.set_case_inputs(asdict(project["inputs_2d"]))
 
 
 def write_project_atomic(path: str, payload: Dict[str, Any]) -> None:
@@ -277,6 +301,32 @@ def _case_inputs_from_dict(data: Dict[str, Any]) -> CaseInputs3D:
         raise ProjectFormatError(f"Invalid CaseInputs3D data: {exc}") from exc
 
 
+def _case_inputs_2d_from_dict(data: Dict[str, Any]) -> CaseInputs2D:
+    if not isinstance(data, dict):
+        raise ProjectFormatError("dimensions.2D.case_inputs must be a JSON object")
+    allowed = {f.name for f in fields(CaseInputs2D)}
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        raise ProjectFormatError(f"Unknown CaseInputs2D field(s): {', '.join(unknown)}")
+    values = dict(data)
+    mapping = values.get("mapping", {})
+    if isinstance(mapping, dict):
+        values["mapping"] = MappingSource2D(**mapping)
+    probes = values.get("probes", [])
+    if not isinstance(probes, (list, tuple)):
+        raise ProjectFormatError("dimensions.2D.case_inputs.probes must be a list")
+    values["probes"] = tuple(
+        item if isinstance(item, ProbePoint2D) else ProbePoint2D(**item)
+        for item in probes
+    )
+    if "output_fields" in values:
+        values["output_fields"] = tuple(values["output_fields"])
+    try:
+        return CaseInputs2D(**values)
+    except (TypeError, ValueError) as exc:
+        raise ProjectFormatError(f"Invalid CaseInputs2D data: {exc}") from exc
+
+
 def read_project(path: str) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as stream:
@@ -296,6 +346,19 @@ def read_project(path: str) -> Dict[str, Any]:
     if payload.get("project_dimension") != "3D":
         raise ProjectFormatError("Only 3D GGUI projects are supported by this project format")
     inputs = _case_inputs_from_dict(payload.get("case_inputs"))
+    dimensions = payload.get("dimensions", {})
+    if dimensions is None:
+        dimensions = {}
+    if not isinstance(dimensions, dict):
+        raise ProjectFormatError("dimensions must be a JSON object")
+    section_2d = dimensions.get("2D")
+    inputs_2d = None
+    if section_2d is not None:
+        if not isinstance(section_2d, dict):
+            raise ProjectFormatError("dimensions.2D must be a JSON object")
+        if section_2d.get("model") != "axisymmetric-rz-wedge":
+            raise ProjectFormatError("Unsupported dimensions.2D model")
+        inputs_2d = _case_inputs_2d_from_dict(section_2d.get("case_inputs"))
     probes = payload.get("probes", {"probes": []})
     gui_state = payload.get("gui_state", {})
     if not isinstance(probes, dict) or not isinstance(gui_state, dict):
@@ -303,6 +366,7 @@ def read_project(path: str) -> Dict[str, Any]:
     return {
         "payload": payload,
         "inputs": inputs,
+        "inputs_2d": inputs_2d,
         "probes": probes,
         "gui_state": gui_state,
     }

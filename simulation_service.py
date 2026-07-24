@@ -4,7 +4,9 @@ from datetime import datetime
 
 from models import CaseInputs, CaseInputs1D, CaseInputs3D, GenerationResult1D, RecommendedParams1D
 from generator_1d import Generator1D
+from generator_2d import Generator2D
 from generator_3d import Generator3D
+from models_2d import CaseInputs2D
 from profiles import get_profile, compute_recommended_1d
 
 class SimulationService:
@@ -13,6 +15,7 @@ class SimulationService:
         self.openfoam_bashrc = openfoam_bashrc
         # Keep generator instances for accessing post-generation metadata
         self.generator_1d = None
+        self.generator_2d = None
         self.generator_3d = None
 
     def make_case_name(self, prefix: str = "Case") -> str:
@@ -41,6 +44,11 @@ class SimulationService:
             # יצירה
             case_dir = gen.generate(case_name, inputs, rec)
             return case_dir
+
+        # --- 2D axisymmetric path ---
+        elif isinstance(inputs, CaseInputs2D):
+            self.generator_2d = Generator2D(self.base_projects_path, self.openfoam_bashrc)
+            return self.generator_2d.generate(case_name, inputs)
 
         # --- מסלול 3D ---
         elif isinstance(inputs, CaseInputs3D):

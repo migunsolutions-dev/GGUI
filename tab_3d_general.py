@@ -38,6 +38,7 @@ from ui_metrics import (
     FORM_ROW_SPACING,
 )
 from dialogs import RemapConfigDialog
+from material_catalog import materials_copy
 try:
     from bf_option_discovery import get_eos_options, get_activation_options, get_thermo_options, get_decomposition_method_options
 except ImportError:
@@ -67,16 +68,7 @@ class TabGeneral3D(QWidget):
         self.viewer = None
         self._dyn_refine_max = 1  # AMR maxRefinement default (building3D: 1 = moving refinement front)
 
-        self.materials_db = {
-            "TNT":   {"rho": 1630, "energy": 4.29e6},
-            "C4":    {"rho": 1601, "energy": 4.52e6},
-            "PETN":  {"rho": 1770, "energy": 6.11e6},
-            "ANFO":  {"rho": 840,  "energy": 3.79e6},
-            "Custom": {
-                "rho": 1600, "energy": 4.50e6,
-                "A": 300.0e9, "B": 3.0e9, "R1": 4.0, "R2": 1.0, "omega": 0.30,
-            },
-        }
+        self.materials_db = materials_copy()
 
         self._build_ui()
         self._connect_signals()
