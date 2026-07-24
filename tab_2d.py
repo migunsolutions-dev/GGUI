@@ -860,6 +860,12 @@ class Tab2D(QWidget):
             "Mirrored display — computational domain is r ≥ 0"
         )
         self.lbl_mirror_indicator.setStyleSheet(SECONDARY_INFO_STYLE)
+        self.cmb_time = QComboBox()
+        self.cmb_time.setMinimumWidth(110)
+        self.cmb_time.setToolTip(
+            "Simulation time. Cases open at 0. Live follows newest output during exact END."
+        )
+        self.cmb_time.addItems(["0"])
         self.cmb_field = QComboBox()
         self.cmb_field.addItems(["p", "rho", "T", "U", "alpha.c4", "cellLevel"])
         self.chk_view_mesh = QCheckBox("Mesh overlay")
@@ -869,6 +875,8 @@ class Tab2D(QWidget):
         self.btn_fit = QPushButton("Fit")
         controls.addWidget(self.cmb_view_mode)
         controls.addWidget(self.lbl_mirror_indicator, 1)
+        controls.addWidget(QLabel("Time:"))
+        controls.addWidget(self.cmb_time)
         controls.addWidget(QLabel("Field:"))
         controls.addWidget(self.cmb_field)
         controls.addWidget(self.chk_view_mesh)
@@ -922,6 +930,8 @@ class Tab2D(QWidget):
         self.chk_begin_unrefine.toggled.connect(self._apply_enablement)
         self.chk_balancing.toggled.connect(self._apply_enablement)
         self.cmb_view_mode.currentTextChanged.connect(self._on_view_changed)
+        self.cmb_time.currentTextChanged.connect(self._on_time_selector_changed)
+        self.viewer.times_changed.connect(self._on_viewer_times_changed)
         self.cmb_field.currentTextChanged.connect(self.viewer.set_field)
         self.chk_view_mesh.toggled.connect(self.viewer.toggle_mesh_lines)
         self.chk_view_probes.toggled.connect(self._on_probe_view_toggled)
@@ -937,6 +947,7 @@ class Tab2D(QWidget):
 
         view_only = {
             self.cmb_view_mode,
+            self.cmb_time,
             self.cmb_field,
             self.chk_view_mesh,
             self.chk_view_probes,
@@ -1005,6 +1016,45 @@ class Tab2D(QWidget):
         mirrored = text == "Mirrored View"
         self.lbl_mirror_indicator.setVisible(mirrored)
         self.viewer.set_mirrored_view(mirrored)
+
+    def _on_viewer_times_changed(self, labels, selected: str, live_follow: bool) -> None:
+        """Keep the Time combo synchronized without mutating the selection."""
+        from openfoam_times_2d import LIVE_FOLLOW_LABEL
+
+        items = [str(x) for x in (labels or [])]
+        if "0" not in items:
+            items = ["0"] + items
+        if LIVE_FOLLOW_LABEL not in items:
+            items = items + [LIVE_FOLLOW_LABEL]
+        current = LIVE_FOLLOW_LABEL if live_follow else str(selected or "0")
+        self.cmb_time.blockSignals(True)
+        self.cmb_time.clear()
+        self.cmb_time.addItems(items)
+        idx = self.cmb_time.findText(current)
+        if idx < 0 and not live_follow:
+            self.cmb_time.addItem(current)
+            idx = self.cmb_time.findText(current)
+        if idx >= 0:
+            self.cmb_time.setCurrentIndex(idx)
+        self.cmb_time.blockSignals(False)
+
+    def _on_time_selector_changed(self, text: str) -> None:
+        from openfoam_times_2d import LIVE_FOLLOW_LABEL
+
+        label = str(text or "").strip()
+        if not label:
+            return
+        if label == LIVE_FOLLOW_LABEL:
+            self.viewer.enable_live_follow()
+            return
+        self.viewer.set_selected_time_label(label)
+
+    def enter_live_follow_mode(self) -> None:
+        """Called when the user starts exact END."""
+        self.viewer.enable_live_follow()
+
+    def stop_live_follow_keep_time(self) -> None:
+        self.viewer.stop_live_follow_keep_time()
 
     def _on_probe_view_toggled(self, checked: bool) -> None:
         probes = [(p.radius, p.height, 0.0) for p in self._probes()]

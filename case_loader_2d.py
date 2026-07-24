@@ -143,23 +143,9 @@ def _strip(text: str) -> str:
 
 
 def _list_time_dirs(case_dir: str) -> List[str]:
-    times: List[Tuple[float, str]] = []
-    try:
-        for name in os.listdir(case_dir):
-            path = os.path.join(case_dir, name)
-            if not os.path.isdir(path):
-                continue
-            if name in {"constant", "system", "processor0"} or name.startswith("processor"):
-                continue
-            try:
-                tval = float(name)
-            except ValueError:
-                continue
-            times.append((tval, name))
-    except OSError:
-        return []
-    times.sort(key=lambda item: item[0])
-    return [name for _, name in times]
+    from openfoam_times_2d import list_numeric_time_labels
+
+    return list_numeric_time_labels(case_dir)
 
 
 def _discover_fields(case_dir: str, time_name: Optional[str]) -> List[str]:

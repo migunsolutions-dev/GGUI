@@ -3,12 +3,19 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
-from PyQt5.QtCore import QThread, QTimer
+from PyQt5.QtCore import QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import QSizePolicy
 
+from openfoam_times_2d import (
+    LIVE_FOLLOW_LABEL,
+    list_numeric_time_entries,
+    match_reader_time_value,
+    pick_opening_time,
+    poly_mesh_dir_at_or_before,
+)
 from viewer_gl import (
     close_plotter_safely,
     create_embedded_interactor,
@@ -120,6 +127,9 @@ def count_internal_diagonals_in_edge_overlay(surface: "pv.PolyData") -> int:
 class AxisymmetricViewerWidget(BlastViewerWidget):
     """Render an honest r-z setup preview, then a meridional Radius-Height result."""
 
+    # labels (str list), selected label (str), live_follow (bool)
+    times_changed = pyqtSignal(object, str, bool)
+
     @staticmethod
     def meridional_display_bounds(
         radius: float, height: float, mirrored: bool
@@ -143,6 +153,11 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         self._coalesce_timer: Optional[QTimer] = None
         self._last_edge_count: Optional[int] = None
         self._last_surface_cells: Optional[int] = None
+        self._available_time_entries: List[Tuple[float, str]] = []
+        self._selected_time_label: str = "0"
+        self._selected_time_value: float = 0.0
+        self._live_follow: bool = False
+        self._resolved_display_time: Optional[float] = None
         super().__init__(parent)
         self._gui_thread_id = int(QThread.currentThreadId()) if QThread.currentThreadId() else None
         self._coalesce_timer = QTimer(self)
@@ -262,6 +277,11 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         self._mesh_bounds = None
         self._unavailable_field_message = str(message or "")
         self._scalar_bar_actor = None
+        self._live_follow = False
+        self._selected_time_label = "0"
+        self._selected_time_value = 0.0
+        self._available_time_entries = []
+        self._resolved_display_time = None
         if self._plotter and not self._shutdown:
             try:
                 self._plotter.clear()
@@ -299,12 +319,93 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         self._cell_size = cell_size if cell_size is not None and cell_size > 0 else 0.1
         self._scalar_bar_actor = None
         self._dynamic_actors.clear()
+        # Opening always resets to time 0 — never latest, never live-follow.
+        self._live_follow = False
+        entries = list_numeric_time_entries(case_path) if case_path else []
+        self._available_time_entries = list(entries)
+        label, tval = pick_opening_time(entries)
+        self._selected_time_label = label
+        self._selected_time_value = float(tval)
+        self._resolved_display_time = None
+        self._emit_times_changed()
         if self._plotter and self._assert_gui_thread():
             try:
                 self._plotter.clear()
             except Exception as exc:
                 _LOG.warning("load_case clear failed: %s", exc)
         self.request_refresh()
+
+    @property
+    def live_follow(self) -> bool:
+        return bool(self._live_follow)
+
+    @property
+    def selected_time_label(self) -> str:
+        return self._selected_time_label
+
+    @property
+    def selected_time_value(self) -> float:
+        return float(self._selected_time_value)
+
+    def available_time_labels(self) -> List[str]:
+        return [label for _, label in self._available_time_entries]
+
+    def enable_live_follow(self) -> None:
+        """Enter live-follow after the user explicitly starts exact END."""
+        self._live_follow = True
+        self._emit_times_changed()
+        self.request_refresh()
+
+    def stop_live_follow_keep_time(self) -> None:
+        """End live-follow but retain the last displayed selection for this session."""
+        if not self._live_follow:
+            return
+        self._live_follow = False
+        self._emit_times_changed()
+
+    def set_selected_time_label(self, label: str) -> None:
+        """Pin the viewer to a fixed numeric time (disables live-follow)."""
+        text = str(label or "").strip()
+        if not text or text == LIVE_FOLLOW_LABEL:
+            return
+        try:
+            tval = float(text)
+        except ValueError:
+            return
+        # Prefer the on-disk spelling when the directory already exists.
+        matched_label = text
+        for entry_t, entry_label in self._available_time_entries:
+            if entry_label == text or abs(entry_t - tval) <= max(1e-15, abs(tval) * 1e-12):
+                matched_label = entry_label
+                tval = float(entry_t)
+                break
+        self._live_follow = False
+        self._selected_time_label = matched_label
+        self._selected_time_value = float(tval)
+        self._emit_times_changed()
+        self.request_refresh()
+
+    def _emit_times_changed(self) -> None:
+        labels = [label for _, label in self._available_time_entries]
+        try:
+            self.times_changed.emit(labels, self._selected_time_label, bool(self._live_follow))
+        except Exception:
+            pass
+
+    def _sync_available_times_from_case(self) -> None:
+        if not self.current_case_dir:
+            self._available_time_entries = []
+            return
+        previous = [label for _, label in self._available_time_entries]
+        entries = list_numeric_time_entries(self.current_case_dir)
+        self._available_time_entries = list(entries)
+        if self._live_follow and entries:
+            self._selected_time_label = entries[-1][1]
+            self._selected_time_value = float(entries[-1][0])
+        current = [label for _, label in self._available_time_entries]
+        # Refreshing must not change a pinned selection; only grow the Time list.
+        if current != previous:
+            self._emit_times_changed()
 
     def set_field(self, name):
         self.current_field = name
@@ -446,6 +547,10 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
             return os.path.join(case_dir, "constant", "polyMesh")
         return best_path
 
+    def _poly_mesh_for_selected_time(self, case_dir: str) -> Optional[str]:
+        """AMR-aware mesh: latest polyMesh at or before the selected display time."""
+        return poly_mesh_dir_at_or_before(case_dir, self._selected_time_value)
+
     @staticmethod
     def count_owner_cells(poly_mesh_dir: str) -> Optional[int]:
         owner = os.path.join(poly_mesh_dir, "owner")
@@ -512,7 +617,8 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
             except OSError:
                 return
         try:
-            mesh_dir = self._latest_written_poly_mesh_dir(self.current_case_dir)
+            self._sync_available_times_from_case()
+            mesh_dir = self._poly_mesh_for_selected_time(self.current_case_dir)
             owner_count = self.count_owner_cells(mesh_dir) if mesh_dir else None
             if owner_count is not None:
                 self._last_cell_count = int(owner_count)
@@ -526,11 +632,49 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
 
             reader = pv.POpenFOAMReader(foam_file)
             if not reader.time_values:
+                self._plotter.clear()
+                self._clear_dynamic_actors()
+                self._unavailable_field_message = (
+                    f"Time {self._selected_time_label} is selected, but no readable "
+                    "OpenFOAM result times are available yet."
+                )
+                self._plotter.add_text(
+                    self._unavailable_field_message,
+                    position="upper_left",
+                    color="red",
+                    font_size=9,
+                )
+                self._add_time_annotation(self._selected_time_value)
+                if not self._shutdown:
+                    self._plotter.render()
                 return
-            latest = reader.time_values[-1]
-            self._last_refresh_time = latest
-            self._cell_count_time = float(latest)
-            reader.set_active_time_value(latest)
+
+            matched = match_reader_time_value(
+                reader.time_values, self._selected_time_value
+            )
+            if matched is None:
+                self._plotter.clear()
+                self._clear_dynamic_actors()
+                available = ", ".join(f"{float(v):.6g}" for v in reader.time_values[:12])
+                self._unavailable_field_message = (
+                    f"Selected time {self._selected_time_label} is not available in the "
+                    f"case reader (have: {available})."
+                )
+                self._plotter.add_text(
+                    self._unavailable_field_message,
+                    position="upper_left",
+                    color="red",
+                    font_size=9,
+                )
+                self._add_time_annotation(self._selected_time_value)
+                if not self._shutdown:
+                    self._plotter.render()
+                return
+
+            self._last_refresh_time = float(matched)
+            self._resolved_display_time = float(matched)
+            self._cell_count_time = float(matched)
+            reader.set_active_time_value(matched)
             data = reader.read()
             if self._shutdown:
                 return
@@ -670,7 +814,7 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
                 self._dynamic_actors.append(sb)
             elif not field_ok:
                 self._unavailable_field_message = (
-                    f"Field '{field}' is unavailable in the loaded result."
+                    f"Field '{field}' is unavailable at time {self._selected_time_label}."
                 )
                 self._plotter.add_text(
                     self._unavailable_field_message,
@@ -690,15 +834,7 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
             self._dynamic_actors.append(axis_actor)
             self._add_meridional_bounds(r0, radius, 0.0, height)
 
-            # White time label with dark shadow for readability on dark fields.
-            t_shadow = self._plotter.add_text(
-                f"Time: {latest:.6g} s",
-                position="upper_right",
-                color="black",
-                font_size=10,
-                shadow=True,
-            )
-            self._dynamic_actors.append(t_shadow)
+            self._add_time_annotation(float(matched))
 
             if self._show_probes and self._probes_data:
                 marker_r = max(0.02, 2.0 * self._cell_size) if self._cell_size > 0 else 0.05
@@ -736,6 +872,19 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
                 )
             except Exception:
                 pass
+
+    def _add_time_annotation(self, time_value: float) -> None:
+        if not self._plotter or self._shutdown:
+            return
+        suffix = " [Live]" if self._live_follow else ""
+        t_shadow = self._plotter.add_text(
+            f"Time: {float(time_value):.6g} s{suffix}",
+            position="upper_right",
+            color="black",
+            font_size=10,
+            shadow=True,
+        )
+        self._dynamic_actors.append(t_shadow)
 
     def _frame_extents(self, bounds) -> Tuple[float, float]:
         if self._axisymmetric_domain is not None:

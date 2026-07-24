@@ -1198,6 +1198,7 @@ class BlastFoamApp(QMainWindow):
 
         self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_RUNNING)
         self.tab_2d.set_simulation_state(SimulationState2D.RUNNING)
+        self.tab_2d.enter_live_follow_mode()
         self.active_case_dir_2d = wc
         self._start_solver(
             wc,
@@ -1677,6 +1678,7 @@ class BlastFoamApp(QMainWindow):
                 else:
                     raise
             self.tab_2d.set_simulation_state(SimulationState2D.RUNNING)
+            self.tab_2d.enter_live_follow_mode()
             self._start_solver(
                 self.active_case_dir_2d,
                 cores=inputs.cores,
@@ -2226,6 +2228,7 @@ class BlastFoamApp(QMainWindow):
             self.status_bar.stop_et_timing()
             self.status_bar.set_status("Interrupted", "#e67e22")
             if getattr(self, "_active_run_mode", None) == "2D":
+                self.tab_2d.stop_live_follow_keep_time()
                 if getattr(self.tab_2d, "is_imported_mode", False):
                     self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_READY)
                 self.tab_2d.set_simulation_state(SimulationState2D.INTERRUPTED)
@@ -2284,6 +2287,7 @@ class BlastFoamApp(QMainWindow):
             if self.tabs.currentWidget() == self.tab_3d:
                 self.tab_3d.viewer.refresh_view()
             if finished_mode == "2D":
+                self.tab_2d.stop_live_follow_keep_time()
                 if getattr(self.tab_2d, "is_imported_mode", False):
                     self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_READY)
                     # Refresh cell count from newest mesh after AMR writes.
@@ -2303,6 +2307,7 @@ class BlastFoamApp(QMainWindow):
             if "Interrupted" not in self.status_bar.lbl_status.text():
                 self.status_bar.set_status("Stopped/Failed", "#e74c3c")
                 if finished_mode == "2D":
+                    self.tab_2d.stop_live_follow_keep_time()
                     if getattr(self.tab_2d, "is_imported_mode", False):
                         self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_FAILED)
                     self.tab_2d.set_simulation_state(SimulationState2D.FAILED)
