@@ -3,7 +3,8 @@ case_loader.py — Load an existing BlastFoam/OpenFOAM case folder and extract
 parameters that map to the GUI input fields.
 
 Returns a dict with parsed values for keys that have current UI widgets only.
-Also returns _load_summary: { filled, not_filled, unsupported } for transparency.
+Also returns _load_summary with legacy filled/not_filled (for set_case_inputs)
+plus context-aware classifications for the Load Summary popup (report-only).
 """
 
 import math
@@ -1021,9 +1022,10 @@ def load_case(case_dir: str) -> Dict[str, Any]:
 
     Only keys that map to current GUI widgets are parsed and returned.
     The returned dict includes "_load_summary" with:
-      - filled: list of keys that were set from the case
-      - not_filled: list of (key, reason) for UI fields not set (use GUI default)
-      - unsupported: dict file -> list of key names in that file not mapped to UI
+      - filled: list of keys that were set from the case (legacy; drives UNSET)
+      - not_filled: list of (key, reason) for UI fields not set (legacy; drives UNSET)
+      - classifications / counts / provenance: context-aware Load Summary (report-only)
+    Model keys outside "_load_summary" are unchanged by report classification.
     """
     out: Dict[str, Any] = {}
     out["_case_dir"] = case_dir
@@ -1060,35 +1062,15 @@ def load_case(case_dir: str) -> Dict[str, Any]:
     # Detect material from parsed JWL / rho0
     _detect_material(out)
 
-    # Build load summary: filled (LOADED), not_filled (UNSET) with reason, _provenance for tab
-    filled: List[str] = []
-    not_filled: List[Tuple[str, str]] = []
-    charge_shape = out.get("charge_shape") or "Sphere"
-    activation = (out.get("activation_model") or "").lower()
-    is_remap = activation == "none"
-    for key in UI_FIELD_KEYS:
-        if key not in out or out[key] is None:
-            reason = _not_filled_reason(key, charge_shape, is_remap)
-            not_filled.append((key, reason))
-        elif key == "boundaries" and not out.get("boundaries"):
-            not_filled.append((key, "not in case (left UNSET)"))
-        elif key == "stl_obstacles" and not out.get("stl_obstacles"):
-            not_filled.append((key, "no obstacles in case"))
-        else:
-            filled.append(key)
+    # Context-aware Load Summary (report-only). Legacy filled/not_filled preserved
+    # for TabGeneral3D.set_case_inputs UNSET behavior.
+    from load_summary_report import classify_load_fields
+
+    report = classify_load_fields(out, UI_FIELD_KEYS)
+    filled = list(report.filled)
     # Provenance: LOADED for every key we set from case; tab will set UNSET for rest
     out["_provenance"] = {k: "LOADED" for k in filled}
-    unsupported: Dict[str, List[str]] = {}
-    for rel_path in out["_found_files"]:
-        if rel_path in UNSUPPORTED_KEYS_BY_FILE:
-            unsupported[rel_path] = UNSUPPORTED_KEYS_BY_FILE[rel_path]
-
-    out["_load_summary"] = {
-        "filled": filled,
-        "not_filled": not_filled,
-        "unsupported": unsupported,
-        "notes": out.get("_load_notes", []),
-    }
+    out["_load_summary"] = report.to_load_summary_dict()
 
     log.info("load_case(%s): found=%s, missing=%s, filled=%s",
              case_dir, out["_found_files"], out["_missing_files"], len(filled))

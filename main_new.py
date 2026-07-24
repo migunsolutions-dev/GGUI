@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFrame, QProgressBar, QMessageBox, QToolBar, QAction,
     QSplitter, QScrollArea, QGroupBox, QFormLayout, QStatusBar, QFileDialog,
-    QDialog, QTextEdit, QDialogButtonBox,
+    QDialog, QTextEdit, QDialogButtonBox, QCheckBox,
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QIcon
@@ -458,57 +458,41 @@ class BlastFoamApp(QMainWindow):
         self._show_load_summary_dialog(case_dir, load_summary)
 
     def _show_load_summary_dialog(self, case_dir: str, load_summary: dict) -> None:
-        """Show Load Summary (fields filled, not filled, unsupported by file) with Copy button."""
+        """Show context-aware Load Summary with Copy and optional technical details."""
         if not load_summary:
             return
-        filled = load_summary.get("filled", [])
-        not_filled = load_summary.get("not_filled", [])
-        unsupported = load_summary.get("unsupported", {})
-        notes = load_summary.get("notes", [])
-        n_filled = len(filled)
-        n_not = len(not_filled)
-        lines = [
-            f"Loaded: {case_dir}",
-            "",
-            f"Fields filled from case (LOADED): {n_filled}",
-            f"Fields not filled (UNSET): {n_not}",
-            "",
-        ]
-        if filled:
-            lines.append("Filled: " + ", ".join(sorted(filled)))
-            lines.append("")
-        if not_filled:
-            lines.append("Not filled (key — reason):")
-            for k, reason in sorted(not_filled, key=lambda x: x[0]):
-                lines.append(f"  {k} — {reason}")
-            lines.append("")
-        if unsupported:
-            lines.append("Keys in case files not mapped to GUI (not supported yet):")
-            for fpath in sorted(unsupported.keys()):
-                keys = unsupported[fpath]
-                if keys:
-                    lines.append(f"  {fpath}: " + ", ".join(keys))
-        if notes:
-            lines.append("")
-            lines.append("Load notes (seed / charge capture interpretation):")
-            for note in notes:
-                lines.append(f"  - {note}")
-        lines.append("")
-        lines.append("Pre-run parity: To verify generated files match this case (no edits), run:")
-        lines.append(f"  python verification/parity_building3d.py -r \"{case_dir}\"")
-        text = "\n".join(lines)
+        from load_summary_report import format_load_summary_text
+
+        def _text(include_technical: bool) -> str:
+            return format_load_summary_text(
+                load_summary, case_dir, include_technical=include_technical
+            )
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Load Summary")
         layout = QVBoxLayout(dlg)
         te = QTextEdit()
         te.setReadOnly(True)
-        te.setPlainText(text)
-        te.setMinimumSize(480, 320)
+        te.setPlainText(_text(False))
+        te.setMinimumSize(560, 420)
         layout.addWidget(te)
+
+        tech_chk = QCheckBox("Show technical details")
+        layout.addWidget(tech_chk)
+
+        def _refresh_text() -> None:
+            te.setPlainText(_text(tech_chk.isChecked()))
+
+        tech_chk.toggled.connect(lambda _checked: _refresh_text())
+
         bb = QDialogButtonBox(QDialogButtonBox.Ok)
         copy_btn = QPushButton("Copy summary")
-        copy_btn.clicked.connect(lambda: QApplication.instance().clipboard().setText(text))
+
+        def _copy() -> None:
+            # Copy follows the same context rules; include full technical details.
+            QApplication.instance().clipboard().setText(_text(True))
+
+        copy_btn.clicked.connect(_copy)
         bb.addButton(copy_btn, QDialogButtonBox.ActionRole)
         bb.accepted.connect(dlg.accept)
         layout.addWidget(bb)
