@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFrame, QProgressBar, QMessageBox, QToolBar, QAction,
     QSplitter, QScrollArea, QGroupBox, QFormLayout, QStatusBar, QFileDialog,
-    QDialog, QTextEdit, QDialogButtonBox, QSizePolicy,
+    QDialog, QTextEdit, QDialogButtonBox, QSizePolicy, QInputDialog,
 )
 from PyQt5.QtCore import Qt, QTimer, QSize
 from PyQt5.QtGui import QIcon, QFont, QFontMetrics
@@ -34,6 +34,22 @@ from models_2d import CaseInputs2D, SimulationState2D
 from axisymmetric_2d import validate_case_inputs_2d, validate_mapping_source
 from path_utils import get_latest_time_dir, win_to_wsl_path
 from case_loader import load_case
+from case_topology import CaseDimension, classify_case_topology
+from case_loader_2d import (
+    format_imported_case_report_2d,
+    inspect_imported_axisymmetric_case,
+)
+from external_case_workflow_2d import (
+    CopyVerificationError,
+    ImportMode2D,
+    WHITELISTED_UTILITIES,
+    create_automatic_working_copy,
+    gui_values_to_control_updates,
+    inventory_case,
+    preparation_commands_for_case,
+    prepare_working_copy,
+    write_control_dict_entries,
+)
 from initialization_plan import build_initialization_plan
 from startup_capture_guard import UNSAFE_CAPTURE_MESSAGE, require_safe_capture
 from case_init_mode import record_set_cmd_actual
@@ -745,7 +761,7 @@ class BlastFoamApp(QMainWindow):
             QMessageBox.critical(self, "Open Project Error", str(exc))
 
     def _on_open_case(self):
-        """Open an existing BlastFoam case folder and populate the 3D tab."""
+        """Open an existing BlastFoam case; classify topology before mutating GUI state."""
         case_dir = QFileDialog.getExistingDirectory(
             self,
             "Open BlastFoam Case Folder",
@@ -753,44 +769,490 @@ class BlastFoamApp(QMainWindow):
         )
         if not case_dir:
             return
+        self.open_openfoam_case_path(case_dir)
 
-        # Detect nested case: if selected dir contains a sub-folder with system/
-        # (e.g. building3D/building3D/system/), use the inner folder.
-        sys_dir = os.path.join(case_dir, "system")
-        if not os.path.isdir(sys_dir):
-            # Check one level deeper
-            for entry in os.listdir(case_dir):
-                inner = os.path.join(case_dir, entry)
-                if os.path.isdir(inner) and os.path.isdir(os.path.join(inner, "system")):
-                    case_dir = inner
-                    break
+    def open_openfoam_case_path(self, case_dir: str) -> str:
+        """Classify and dispatch an OpenFOAM case path (shared by UI and tests).
 
-        if not os.path.isdir(os.path.join(case_dir, "system")):
+        Returns the classification value string. Does not mutate GUI state when
+        classification is planar/ambiguous (except showing a message box when
+        interactive).
+        """
+        case_dir = self._resolve_openfoam_case_root(case_dir)
+        if case_dir is None:
             QMessageBox.warning(
                 self, "Invalid Case",
                 "The selected folder does not contain a 'system/' sub-directory.\n"
                 "Please select a valid OpenFOAM case folder."
             )
-            return
+            return CaseDimension.AMBIGUOUS_OR_INVALID.value
+
+        try:
+            classification = classify_case_topology(case_dir)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Topology Classification Failed",
+                f"Could not classify case topology:\n{exc}",
+            )
+            return CaseDimension.AMBIGUOUS_OR_INVALID.value
+
+        if classification.classification == CaseDimension.AXISYMMETRIC_WEDGE:
+            self._open_axisymmetric_imported_case(case_dir, classification)
+            return classification.classification.value
+
+        if classification.classification == CaseDimension.PLANAR_2D_EMPTY:
+            patches = ", ".join(classification.evidence.empty_patch_names) or "(unnamed)"
+            QMessageBox.information(
+                self,
+                "Planar 2D Not Supported",
+                "This case has planar front/back patches with type empty "
+                f"({patches}).\n\n"
+                "GGUI Cylindrical–2D is for axisymmetric wedge topology only.\n"
+                "Planar Cartesian 2D is not supported and will not be opened in "
+                "General 3D.",
+            )
+            return classification.classification.value
+
+        if classification.classification == CaseDimension.AMBIGUOUS_OR_INVALID:
+            QMessageBox.warning(
+                self,
+                "Ambiguous or Invalid Topology",
+                "The case topology could not be classified safely.\n\n"
+                f"Reason: {classification.reason}\n"
+                f"Evidence source: {classification.evidence.source}\n"
+                + (
+                    f"Conflict: {classification.evidence.conflict_detail}\n"
+                    if classification.evidence.conflict_detail
+                    else ""
+                ),
+            )
+            return classification.classification.value
 
         try:
             data = load_case(case_dir)
         except Exception as e:
             QMessageBox.critical(self, "Load Error", f"Failed to parse case:\n{e}")
-            return
+            return CaseDimension.GENERAL_3D.value
 
         load_summary = data.pop("_load_summary", None)
-        # Populate 3D tab: full fill (defaults for not_filled, then data)
         self.tab_3d.set_case_inputs(data, load_summary=load_summary)
-
-        # Switch to 3D tab
         self.tabs.setCurrentWidget(self.tab_3d)
         self.active_case_dir_3d = case_dir
         self.active_case_initialized_3d = os.path.isdir(os.path.join(case_dir, "0"))
         self.current_project_path = None
-
-        # Load Summary (non-blocking): fields filled / not filled / unsupported + Copy
         self._show_load_summary_dialog(case_dir, load_summary)
+        return CaseDimension.GENERAL_3D.value
+
+    @staticmethod
+    def _resolve_openfoam_case_root(case_dir: str):
+        if not case_dir:
+            return None
+        case_dir = os.path.normpath(case_dir)
+        if os.path.isdir(os.path.join(case_dir, "system")):
+            return case_dir
+        try:
+            for entry in os.listdir(case_dir):
+                inner = os.path.join(case_dir, entry)
+                if os.path.isdir(inner) and os.path.isdir(os.path.join(inner, "system")):
+                    return inner
+        except OSError:
+            return None
+        return None
+
+    def _resolved_case_root(self) -> str:
+        """Return production WSL Work root when reachable; else explicit local fallback.
+
+        Prefer the same ``base_projects_path`` used by General 3D. Do not silently
+        skip a reachable WSL root — imported 2D must use the proven case location.
+        """
+        root = self.base_projects_path
+        try:
+            if root and os.path.isdir(root):
+                probe = os.path.join(root, ".ggui_write_probe")
+                with open(probe, "w", encoding="utf-8") as handle:
+                    handle.write("ok")
+                os.remove(probe)
+                return root
+        except OSError as exc:
+            print(
+                f"[Import] Production case root unavailable ({root!r}): {exc}; "
+                "falling back to ~/GGUI_imported_cases",
+                file=sys.stderr,
+            )
+        fallback = os.path.join(os.path.expanduser("~"), "GGUI_imported_cases")
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
+    def _open_axisymmetric_imported_case(self, case_dir: str, classification) -> None:
+        """Classify wedge → auto-create working case → populate normal 2D UI."""
+        source_dir = os.path.normpath(case_dir)
+        repo_root = os.path.normpath(
+            getattr(self, "_repo_root", None)
+            or os.path.dirname(os.path.abspath(__file__))
+        )
+        case_root = self._resolved_case_root()
+        print(
+            f"[Import] source={source_dir!r} case_root={case_root!r}",
+            file=sys.stderr,
+        )
+        # Never treat the source as the active case.
+        try:
+            before = inventory_case(source_dir)
+            paths = create_automatic_working_copy(
+                source_dir,
+                case_root,
+                repo_root,
+            )
+            after = inventory_case(source_dir)
+            if before != after:
+                QMessageBox.critical(
+                    self,
+                    "Import Integrity Failure",
+                    "Source case hashes changed during copy — aborting.",
+                )
+                return
+            print(
+                f"[Import] working={paths.working_copy_dir!r} "
+                f"method={paths.copy_method!r} distro={paths.distro!r} "
+                f"src_linux={paths.source_linux!r} dest_linux={paths.dest_linux!r}",
+                file=sys.stderr,
+            )
+        except CopyVerificationError as exc:
+            QMessageBox.critical(
+                self,
+                "Import Failed",
+                "Could not create an automatic working case under:\n"
+                f"{case_root}\n\n"
+                f"Source:\n{source_dir}\n\n"
+                f"{exc}",
+            )
+            return
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Import Failed",
+                "Could not create an automatic working case under:\n"
+                f"{case_root}\n\n"
+                f"Source:\n{source_dir}\n\n"
+                f"{exc}",
+            )
+            return
+
+        try:
+            state = inspect_imported_axisymmetric_case(
+                paths.working_copy_dir,
+                source_dir=paths.source_dir,
+                working_copy_dir=paths.working_copy_dir,
+                mode=ImportMode2D.IMPORTED_2D_UNINITIALIZED,
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "2D Load Error",
+                f"Failed to inspect imported working case:\n{exc}",
+            )
+            return
+
+        if not state.display_compatible:
+            QMessageBox.warning(
+                self,
+                "Display Compatibility",
+                "This wedge case was classified as axisymmetric, but its "
+                "orientation cannot be mapped confidently to the Cylindrical–2D "
+                "Radius–Height viewer.\n\n"
+                + "\n".join(state.compatibility_notes),
+            )
+            return
+
+        self.tabs.setCurrentWidget(self.tab_2d)
+        self.tab_2d.load_imported_case(state)
+        self.active_case_dir_2d = paths.working_copy_dir
+        self.active_case_initialized_2d = False
+        self.current_project_path = None
+        self._show_load_summary_dialog_2d(state)
+
+    def _show_load_summary_dialog_2d(self, state) -> None:
+        """Show the concise 2D imported-case report."""
+        text = format_imported_case_report_2d(state)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Cylindrical–2D Case Load Report")
+        dialog.resize(720, 560)
+        layout = QVBoxLayout(dialog)
+        edit = QTextEdit()
+        edit.setReadOnly(True)
+        edit.setPlainText(text)
+        layout.addWidget(edit)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+        buttons.accepted.connect(dialog.accept)
+        copy_btn = QPushButton("Copy")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(text))
+        buttons.addButton(copy_btn, QDialogButtonBox.ActionRole)
+        layout.addWidget(buttons)
+        dialog.exec_()
+
+    def on_initialize_imported_model_2d(self) -> None:
+        """Whitelisted preparation inside the automatic working case only."""
+        ext = getattr(self.tab_2d, "_imported_case", None)
+        if ext is None or not ext.working_copy_dir:
+            QMessageBox.warning(
+                self, "Initialise Model", "No imported working case is attached."
+            )
+            return
+        source = ext.source_dir or ""
+        wc = ext.working_copy_dir
+        if os.path.normpath(wc) == os.path.normpath(source):
+            QMessageBox.critical(
+                self,
+                "Initialise Model",
+                "Refusing to initialise the source case in place.",
+            )
+            return
+        try:
+            commands = preparation_commands_for_case(wc)
+        except Exception as exc:
+            QMessageBox.critical(self, "Initialise Model", str(exc))
+            return
+
+        self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_INITIALIZING)
+        self.status_bar.set_status("Initialising imported case…", "#f39c12")
+
+        def progress(name: str) -> None:
+            self.tab_2d.set_prepare_progress(name)
+            self.status_bar.set_status(f"Initialising: {name}", "#f39c12")
+
+        result = prepare_working_copy(
+            working_copy_dir=wc,
+            source_dir=source,
+            run_utility=self._run_of_utility,
+            commands=commands,
+            progress=progress,
+        )
+
+        try:
+            state = inspect_imported_axisymmetric_case(
+                wc,
+                source_dir=source,
+                working_copy_dir=wc,
+                mode=(
+                    ImportMode2D.IMPORTED_2D_READY
+                    if result.ok
+                    else ImportMode2D.IMPORTED_2D_FAILED
+                ),
+            )
+        except Exception as exc:
+            self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_FAILED)
+            QMessageBox.critical(self, "Initialise Failed", str(exc))
+            return
+
+        state.prepare_commands = result.commands
+        state.prepare_results = {r.name: r.exit_code for r in result.results}
+        state.check_mesh_ok = result.check_mesh_ok
+        state.charge_cell_count = result.charge_cell_count
+        if result.cell_count is not None:
+            state.cell_count = result.cell_count
+            state.cell_count_source = result.cell_count_source
+            state.mesh_owner_path = result.mesh_owner_path
+        if result.ok:
+            state.mode = ImportMode2D.IMPORTED_2D_READY
+            state.mesh_present = True
+            state.viewable = True
+            state.runnable = True
+            self.tab_2d.load_imported_case(state)
+            self.active_case_dir_2d = wc
+            self.active_case_initialized_2d = True
+            self.status_bar.set_status("Imported case initialized", "#27ae60")
+            codes = ", ".join(f"{k}={v}" for k, v in state.prepare_results.items())
+            QMessageBox.information(
+                self,
+                "Imported Case Initialized",
+                "Preparation succeeded.\n\n"
+                f"Exit codes: {codes}\n"
+                f"checkMesh: {'Mesh OK' if result.check_mesh_ok else 'FAILED'}\n"
+                f"Cells: {result.cell_count} ({result.cell_count_source})\n"
+                f"Owner: {result.mesh_owner_path}\n"
+                f"Charge cells (α.c4>0): {result.charge_cell_count}\n\n"
+                "exact END will run blastFoam directly in the working case.",
+            )
+            self._show_load_summary_dialog_2d(state)
+        else:
+            state.mode = ImportMode2D.IMPORTED_2D_FAILED
+            state.viewable = False
+            state.runnable = False
+            self.tab_2d.load_imported_case(state)
+            self.active_case_initialized_2d = False
+            self.status_bar.set_status("Imported init failed", "#e74c3c")
+            codes = ", ".join(f"{k}={v}" for k, v in state.prepare_results.items())
+            QMessageBox.critical(
+                self,
+                "Initialise Model Failed",
+                f"{result.reason}\n\nExit codes: {codes or '(none)'}\n"
+                "Logs are retained in the working case (log.<utility>).",
+            )
+
+    def run_imported_2d_exact_end(self) -> None:
+        """Direct blastFoam in the imported working case — never generator_2d."""
+        ext = getattr(self.tab_2d, "_imported_case", None)
+        if ext is None or ext.mode != ImportMode2D.IMPORTED_2D_READY:
+            QMessageBox.warning(
+                self,
+                "exact END",
+                "Imported case is not ready. Initialise Model first.",
+            )
+            return
+        wc = ext.working_copy_dir or ext.case_dir
+        source = ext.source_dir or ""
+        if not wc or not os.path.isdir(wc):
+            QMessageBox.critical(self, "exact END", "Working case directory missing.")
+            return
+        if os.path.normpath(wc) == os.path.normpath(source):
+            QMessageBox.critical(
+                self, "exact END", "Refusing to run the source case in place."
+            )
+            return
+        if self.runner is not None and self.runner.isRunning():
+            QMessageBox.warning(self, "exact END", "A solver process is already running.")
+            return
+
+        # Application / mesh / classification preflight
+        app_entries = {}
+        try:
+            from external_case_workflow_2d import read_control_dict_entries
+
+            app_entries = read_control_dict_entries(wc, ("application",))
+        except Exception:
+            app_entries = {}
+        if app_entries.get("application") != "blastFoam":
+            QMessageBox.critical(
+                self,
+                "exact END",
+                f"Expected application blastFoam, got {app_entries.get('application')!r}.",
+            )
+            return
+        if not os.path.isfile(os.path.join(wc, "constant", "polyMesh", "owner")):
+            QMessageBox.critical(self, "exact END", "Mesh missing (constant/polyMesh).")
+            return
+        if not ext.check_mesh_ok:
+            QMessageBox.critical(self, "exact END", "Latest checkMesh did not pass.")
+            return
+        try:
+            cls = classify_case_topology(wc)
+            if cls.classification != CaseDimension.AXISYMMETRIC_WEDGE:
+                QMessageBox.critical(
+                    self, "exact END", "Working case is no longer AXISYMMETRIC_WEDGE."
+                )
+                return
+        except Exception as exc:
+            QMessageBox.critical(self, "exact END", str(exc))
+            return
+
+        # Collect only supported editable GUI values and write to working copy.
+        inputs = self.tab_2d.get_case_inputs()
+        gui_vals = {
+            "end_time_s": inputs.end_time_s,
+            "delta_t": inputs.delta_t,
+            "max_co": inputs.max_co,
+            "write_control_type": inputs.write_control_type,
+            "write_interval_time": inputs.write_interval_time,
+            "write_interval_steps": inputs.write_interval_steps,
+        }
+        # Block if mapping marked non-editable keys as somehow dirty — not tracked
+        # via disabled widgets; unsupported_pending_edits on state.
+        if ext.unsupported_pending_edits:
+            QMessageBox.critical(
+                self,
+                "exact END",
+                "Unsupported pending GUI edits block the run:\n"
+                + ", ".join(ext.unsupported_pending_edits),
+            )
+            return
+
+        updates = gui_values_to_control_updates(gui_vals)
+        write_result = write_control_dict_entries(wc, updates)
+        if not write_result.ok:
+            QMessageBox.critical(
+                self, "exact END", f"controlDict write failed:\n{write_result.reason}"
+            )
+            return
+        if write_result.changed:
+            ext.dirty_control_keys = write_result.changed
+
+        try:
+            build_execution_plan(
+                wc,
+                max(1, int(inputs.cores)),
+                ExecutionIntent.INITIALIZED_SOLVER_RUN,
+            )
+            intent = ExecutionIntent.INITIALIZED_SOLVER_RUN
+        except ExecutionPreparationError as exc:
+            if str(exc).startswith("No resumable saved time exists"):
+                intent = ExecutionIntent.INITIALIZED_SOLVER_RUN
+            else:
+                # Try RESUME if times already exist
+                try:
+                    build_execution_plan(wc, max(1, int(inputs.cores)), ExecutionIntent.RESUME)
+                    intent = ExecutionIntent.RESUME
+                except ExecutionPreparationError:
+                    QMessageBox.critical(self, "exact END", str(exc))
+                    return
+
+        self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_RUNNING)
+        self.tab_2d.set_simulation_state(SimulationState2D.RUNNING)
+        self.active_case_dir_2d = wc
+        self._start_solver(
+            wc,
+            cores=max(1, int(inputs.cores)),
+            mode="2D",
+            intent=intent,
+        )
+
+    def _run_of_utility(self, case_dir: str, utility: str):
+        """Run one whitelisted OpenFOAM utility; return (exit_code, log_text)."""
+        if utility not in WHITELISTED_UTILITIES:
+            return 1, f"Refused non-whitelisted utility: {utility}"
+        import sys
+        from pathlib import Path
+        from solver_runner import SolverRunner
+
+        distro, linux_path = SolverRunner._win_unc_to_wsl_path_and_distro(case_dir)
+        quoted = "'" + linux_path.replace("'", "'\"'\"'") + "'"
+        cmd = f"{utility} > log.{utility} 2>&1"
+        full_cmd = f"source {self.openfoam_bashrc}; cd {quoted}; {cmd}; echo __GGUI_EC__:$?"
+        if distro:
+            wsl_args = ["wsl", "-d", distro, "bash", "-lc", full_cmd]
+        else:
+            wsl_args = ["wsl", "bash", "-lc", full_cmd]
+        log_path = Path(case_dir) / f"log.{utility}"
+        try:
+            completed = subprocess.run(
+                wsl_args, check=False, capture_output=True, text=True
+            )
+            text = ""
+            if log_path.is_file():
+                text = log_path.read_text(encoding="utf-8", errors="ignore")
+            ec = completed.returncode
+            for line in (completed.stdout or "").splitlines()[::-1]:
+                if line.startswith("__GGUI_EC__:"):
+                    try:
+                        ec = int(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+                    break
+            with open(log_path, "a", encoding="utf-8") as handle:
+                handle.write("\n# GGUI runner\n")
+                handle.write(f"utility={utility}\nexit_code={ec}\n")
+                if completed.stdout:
+                    handle.write("runner_stdout:\n")
+                    handle.write(completed.stdout)
+                if completed.stderr:
+                    handle.write("runner_stderr:\n")
+                    handle.write(completed.stderr)
+            if log_path.is_file():
+                text = log_path.read_text(encoding="utf-8", errors="ignore")
+            print(f"[Prepare] {utility} -> {ec} ({log_path})", file=sys.stderr)
+            return ec, text
+        except Exception as exc:
+            return 1, str(exc)
 
     def _show_load_summary_dialog(self, case_dir: str, load_summary: dict) -> None:
         """Show Load Summary (fields filled, not filled, unsupported by file) with Copy button."""
@@ -1042,7 +1504,13 @@ class BlastFoamApp(QMainWindow):
         return norm, None
 
     def on_initialize_model_2d(self, inputs):
-        """Generate and initialize one validated axisymmetric wedge case."""
+        """Generate and initialize one validated axisymmetric wedge case.
+
+        Imported working cases use the separate preparation path — never generator_2d.
+        """
+        if getattr(self.tab_2d, "is_imported_mode", False):
+            self.on_initialize_imported_model_2d()
+            return
         if not isinstance(inputs, CaseInputs2D):
             return
         try:
@@ -1172,6 +1640,9 @@ class BlastFoamApp(QMainWindow):
 
     def run_2d_process_exact_end(self):
         """Initialize if needed, then continue the 2D case to configured endTime."""
+        if getattr(self.tab_2d, "is_imported_mode", False):
+            self.run_imported_2d_exact_end()
+            return
         try:
             inputs = self.tab_2d.get_case_inputs()
             if (
@@ -1755,6 +2226,8 @@ class BlastFoamApp(QMainWindow):
             self.status_bar.stop_et_timing()
             self.status_bar.set_status("Interrupted", "#e67e22")
             if getattr(self, "_active_run_mode", None) == "2D":
+                if getattr(self.tab_2d, "is_imported_mode", False):
+                    self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_READY)
                 self.tab_2d.set_simulation_state(SimulationState2D.INTERRUPTED)
         self.view_timer.stop()
     
@@ -1811,6 +2284,15 @@ class BlastFoamApp(QMainWindow):
             if self.tabs.currentWidget() == self.tab_3d:
                 self.tab_3d.viewer.refresh_view()
             if finished_mode == "2D":
+                if getattr(self.tab_2d, "is_imported_mode", False):
+                    self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_READY)
+                    # Refresh cell count from newest mesh after AMR writes.
+                    cells = self._count_poly_mesh_cells(self.active_case_dir_2d)
+                    if cells is not None:
+                        self.tab_2d._actual_cell_count = cells
+                        if self.tab_2d._imported_case is not None:
+                            self.tab_2d._imported_case.cell_count = cells
+                    self.tab_2d._refresh_info()
                 self.tab_2d.set_simulation_state(SimulationState2D.COMPLETED)
                 request = getattr(self.tab_2d.viewer, "request_refresh", None)
                 if callable(request):
@@ -1821,6 +2303,8 @@ class BlastFoamApp(QMainWindow):
             if "Interrupted" not in self.status_bar.lbl_status.text():
                 self.status_bar.set_status("Stopped/Failed", "#e74c3c")
                 if finished_mode == "2D":
+                    if getattr(self.tab_2d, "is_imported_mode", False):
+                        self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_FAILED)
                     self.tab_2d.set_simulation_state(SimulationState2D.FAILED)
 
     def _on_3d_initial_dt_changed(self, dt_val):

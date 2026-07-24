@@ -1,6 +1,7 @@
 """Production Cylindrical–2D axisymmetric workflow tab."""
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, replace
 from typing import Dict, List
 
@@ -16,6 +17,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -24,6 +26,7 @@ from PyQt5.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -38,6 +41,8 @@ from axisymmetric_2d import (
 )
 from axisymmetric_viewer import AxisymmetricViewerWidget
 from charge_seed_plan import SEED_MODE_AUTO, SEED_MODE_MANUAL, SEED_MODE_OFF
+from external_case_workflow_2d import ImportMode2D, import_mode_label
+from imported_case_mapping_2d import FieldProvenance
 from material_catalog import materials_copy
 from models_2d import (
     CaseInputs2D,
@@ -78,6 +83,11 @@ class Tab2D(QWidget):
         self._loading = False
         self._actual_cell_count = None
         self._active_case_dir = None
+        self._imported_case = None
+        self._import_mode = ImportMode2D.NATIVE_GGUI_2D
+        self._imported_field_meta = {}
+        self._unrecovered_gui_keys = set()
+        self._case_defined_gui_keys = set()
         self._build_ui()
         self.viewer.cell_count_updated.connect(self._on_cell_count_updated)
         self.viewer.log_scale_rejected.connect(self._on_log_scale_rejected)
@@ -89,20 +99,318 @@ class Tab2D(QWidget):
     def simulation_state(self) -> SimulationState2D:
         return self._state
 
+    @property
+    def is_imported_mode(self) -> bool:
+        return self._import_mode != ImportMode2D.NATIVE_GGUI_2D
+
+    @property
+    def import_mode(self) -> ImportMode2D:
+        return self._import_mode
+
+    # Compatibility for older tests / call sites.
+    @property
+    def _external_case(self):
+        return self._imported_case
+
     def set_simulation_state(self, state: SimulationState2D | str) -> None:
         state = SimulationState2D(state)
         self._state = state
-        self.lbl_state.setText(f"State: {state.value}")
-        running = state == SimulationState2D.RUNNING
+        if self.is_imported_mode:
+            self.lbl_state.setText(f"State: {import_mode_label(self._import_mode)}")
+        else:
+            self.lbl_state.setText(f"State: {state.value}")
+        running = state == SimulationState2D.RUNNING or (
+            self._import_mode == ImportMode2D.IMPORTED_2D_RUNNING
+        )
         initialized = state in (
             SimulationState2D.INITIALIZED,
             SimulationState2D.INTERRUPTED,
             SimulationState2D.COMPLETED,
-        )
-        self.btn_initialize.setEnabled(not running)
-        self.btn_exact_end.setEnabled(initialized and not running)
-        self.btn_stop.setEnabled(running)
+        ) or self._import_mode == ImportMode2D.IMPORTED_2D_READY
+        self._apply_action_buttons(running=running, initialized=initialized)
         self.sig_state_changed.emit(state.value)
+
+    def _apply_action_buttons(
+        self, *, running: bool = False, initialized: bool = False
+    ) -> None:
+        self.btn_initialize.setText("Initialise Model")
+        self.btn_initialize.setMinimumWidth(140)
+        if not self.is_imported_mode:
+            self.btn_initialize.setEnabled(not running)
+            self.btn_exact_end.setEnabled(initialized and not running)
+            self.btn_stop.setEnabled(running)
+            return
+
+        mode = self._import_mode
+        if mode == ImportMode2D.IMPORTED_2D_UNINITIALIZED:
+            self.btn_initialize.setEnabled(not running)
+            self.btn_exact_end.setEnabled(False)
+            self.btn_stop.setEnabled(False)
+        elif mode == ImportMode2D.IMPORTED_2D_INITIALIZING:
+            self.btn_initialize.setEnabled(False)
+            self.btn_exact_end.setEnabled(False)
+            self.btn_stop.setEnabled(False)  # prep has no safe interrupt yet
+        elif mode == ImportMode2D.IMPORTED_2D_READY:
+            self.btn_initialize.setText("Reinitialise")
+            self.btn_initialize.setEnabled(not running)
+            self.btn_exact_end.setEnabled(not running)
+            self.btn_stop.setEnabled(False)
+        elif mode == ImportMode2D.IMPORTED_2D_RUNNING:
+            self.btn_initialize.setEnabled(False)
+            self.btn_exact_end.setEnabled(False)
+            self.btn_stop.setEnabled(True)
+        else:  # FAILED
+            self.btn_initialize.setEnabled(not running)
+            self.btn_exact_end.setEnabled(False)
+            self.btn_stop.setEnabled(False)
+        self.lbl_state.setText(f"State: {import_mode_label(mode)}")
+
+    def set_import_mode(self, mode: ImportMode2D) -> None:
+        self._import_mode = mode
+        if self._imported_case is not None:
+            self._imported_case.mode = mode
+        self._apply_action_buttons(
+            running=mode == ImportMode2D.IMPORTED_2D_RUNNING,
+            initialized=mode == ImportMode2D.IMPORTED_2D_READY,
+        )
+        self._update_provenance_banner()
+
+    def load_imported_case(self, state) -> None:
+        """Attach an imported working case and populate normal 2D controls."""
+        self._imported_case = state
+        self._import_mode = state.mode
+        self._active_case_dir = state.active_case_path
+        self._actual_cell_count = state.cell_count
+        self._apply_import_mapping(state)
+        self._update_provenance_banner()
+
+        radius = float(state.radius_m) if state.radius_m is not None else None
+        height = float(state.height_m) if state.height_m is not None else None
+        if radius is not None and height is not None:
+            self.viewer.set_axisymmetric_domain(radius, height)
+
+        if state.mesh_present and state.display_compatible and state.viewable:
+            field = "alpha.c4" if "alpha.c4" in state.fields else (
+                "p" if "p" in state.fields else (state.fields[0] if state.fields else "p")
+            )
+            if self.cmb_field.findText(field) < 0:
+                self.cmb_field.addItem(field)
+            self.cmb_field.setCurrentText(field)
+            self.viewer.load_case(state.active_case_path)
+            self.viewer.set_field(field)
+            self.set_simulation_state(SimulationState2D.INITIALIZED)
+        else:
+            msg = "Imported case — ready to initialise (mesh not generated yet)"
+            self.viewer.clear_simulation_view(msg)
+            self.viewer.is_simulating = False
+            self.set_simulation_state(SimulationState2D.DRAFT)
+            self.chk_view_mesh.setToolTip(msg)
+        self._apply_action_buttons()
+        self._refresh_info()
+
+    # Compatibility aliases.
+    def load_external_case(self, state) -> None:
+        self.load_imported_case(state)
+
+    def attach_working_copy(self, state) -> None:
+        self.load_imported_case(state)
+
+    def clear_imported_case(self) -> None:
+        self._imported_case = None
+        self._import_mode = ImportMode2D.NATIVE_GGUI_2D
+        self._imported_field_meta = {}
+        self._unrecovered_gui_keys = set()
+        self._case_defined_gui_keys = set()
+        self._restore_native_control_editability()
+        if hasattr(self, "lbl_import_banner"):
+            self.lbl_import_banner.setVisible(False)
+        self.btn_initialize.setText("Initialise Model")
+        self.btn_initialize.setMinimumWidth(140)
+        self.btn_initialize.setEnabled(True)
+        self._apply_enablement()
+
+    def clear_external_case(self) -> None:
+        self.clear_imported_case()
+
+    def set_prepare_progress(self, utility: str) -> None:
+        if not self.is_imported_mode:
+            return
+        self.set_import_mode(ImportMode2D.IMPORTED_2D_INITIALIZING)
+        self.lbl_state.setText(f"State: Initialising imported case ({utility})")
+        from PyQt5.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app:
+            app.processEvents()
+
+    def _update_provenance_banner(self) -> None:
+        if not hasattr(self, "lbl_import_banner"):
+            return
+        if not self.is_imported_mode or self._imported_case is None:
+            self.lbl_import_banner.setVisible(False)
+            return
+        src = os.path.basename(self._imported_case.source_dir or "")
+        wc = os.path.basename(
+            self._imported_case.working_copy_dir
+            or self._imported_case.case_dir
+            or ""
+        )
+        self.lbl_import_banner.setText(
+            f"Imported BF case | Source: {src} | Working case: {wc}"
+        )
+        self.lbl_import_banner.setVisible(True)
+        self.lbl_import_banner.setToolTip(
+            f"Source (unchanged):\n{self._imported_case.source_dir}\n\n"
+            f"Working case:\n{self._imported_case.working_copy_dir or self._imported_case.case_dir}"
+        )
+
+    def _apply_import_mapping(self, state) -> None:
+        """Populate Setup/Mesh/Output from mapping; never invent native defaults."""
+        mapping = state.mapping
+        self._imported_field_meta = {}
+        self._unrecovered_gui_keys = set()
+        self._case_defined_gui_keys = set()
+        self._loading = True
+        try:
+            self._restore_native_control_editability()
+            # Clear probes — do not keep native defaults.
+            self.tbl_probes.setRowCount(0)
+            if mapping is None:
+                return
+            # Apply recovered gui values only.
+            values = dict(mapping.gui_values)
+            # Mass / cell_size special handling for unrecovered/case-defined.
+            for key, mf in mapping.fields.items():
+                gui_key = mf.gui_key or key
+                self._imported_field_meta[gui_key] = mf
+                if mf.provenance == FieldProvenance.NOT_RECOVERED:
+                    self._unrecovered_gui_keys.add(gui_key)
+                elif mf.provenance == FieldProvenance.CASE_DEFINED:
+                    self._case_defined_gui_keys.add(gui_key)
+
+            # Use setters without clearing imported mode.
+            was_loading = self._loading
+            self._loading = True
+            try:
+                self._set_control_values(values, clear_imported=False, manage_loading=False)
+            finally:
+                self._loading = was_loading
+
+            # Explicit charge radius display when mass unrecovered.
+            cr = mapping.get("charge_radius")
+            if cr and cr.displayed_value is not None:
+                self.lbl_charge_r.setText(f"{float(cr.displayed_value):.6g} m")
+                self.lbl_charge_d.setText(f"{2 * float(cr.displayed_value):.6g} m")
+
+            # Grid counts from mapping when available.
+            rc = mapping.get("radial_cells")
+            vc = mapping.get("vertical_cells")
+            if rc and rc.displayed_value is not None:
+                self.lbl_radial_cells.setText(str(int(rc.displayed_value)))
+            if vc and vc.displayed_value is not None:
+                self.lbl_vertical_cells.setText(str(int(vc.displayed_value)))
+
+            # Apply editability / unrecovered presentation.
+            self._apply_imported_control_editability(mapping)
+        finally:
+            self._loading = False
+
+    def _widget_for_gui_key(self, key: str):
+        return {
+            "radius": self.spin_radius,
+            "height": self.spin_height,
+            "cell_size": self.spin_cell,
+            "height_of_burst": self.spin_hob,
+            "detonation_height": self.spin_det_height,
+            "charge_aspect": self.spin_ld,
+            "mass_kg": self.spin_mass,
+            "rho_charge": self.spin_density,
+            "energy_j_per_kg": self.spin_energy,
+            "p_atm": self.spin_pressure,
+            "t_atm": self.spin_temperature,
+            "max_co": self.spin_max_co,
+            "end_time_s": self.spin_end_time,
+            "delta_t": self.spin_delta_t,
+            "write_interval_time": self.spin_write_time,
+            "write_interval_steps": self.spin_write_steps,
+            "material_name": self.cmb_material,
+            "charge_shape": self.cmb_shape,
+            "initialization_source": self.cmb_source,
+            "write_control_type": self.cmb_write_control,
+            "mesh_mode": self.cmb_mesh_mode,
+            "charge_seed_mode": self.cmb_seed_mode,
+            "refine_indicator_field": self.cmb_estimator,
+            "charge_refinement_level": self.spin_seed_level,
+            "buffer_layers": self.spin_seed_buffer,
+            "refine_interval": self.spin_refine_interval,
+            "lower_refine_threshold": self.spin_refine_threshold,
+            "unrefine_threshold": self.spin_unrefine_threshold,
+            "n_buffer_layers_dynamic": self.spin_runtime_buffer,
+            "dyn_refine_max": self.spin_runtime_level,
+            "dynamic_max_cells": self.spin_max_cells,
+            "dump_level": self.chk_dump_level,
+            "adjust_time_step": self.chk_adjust,
+            "outer_boundary": self.cmb_outer,
+            "top_boundary": self.cmb_top,
+            "bottom_boundary": self.cmb_bottom,
+        }.get(key)
+
+    def _apply_imported_control_editability(self, mapping) -> None:
+        tip_ro = "Imported case setting — preserved in working copy"
+        tip_nr = "Not recovered from imported case — native default not applied"
+        tip_cd = "Case-defined — preserved in working copy; not representable by this control"
+
+        for key, mf in mapping.fields.items():
+            gui_key = mf.gui_key or key
+            widget = self._widget_for_gui_key(gui_key)
+            if widget is None:
+                continue
+            if mf.provenance == FieldProvenance.NOT_RECOVERED:
+                widget.setEnabled(False)
+                widget.setToolTip(tip_nr + (f": {mf.reason}" if mf.reason else ""))
+                if isinstance(widget, QDoubleSpinBox):
+                    widget.setSpecialValueText("—")
+                    widget.blockSignals(True)
+                    widget.setValue(widget.minimum())
+                    widget.blockSignals(False)
+                continue
+            if mf.provenance == FieldProvenance.CASE_DEFINED or not mf.editable:
+                widget.setEnabled(False)
+                widget.setToolTip(tip_cd if mf.provenance == FieldProvenance.CASE_DEFINED else tip_ro)
+                continue
+            # Editable proven writers
+            widget.setEnabled(True)
+            widget.setToolTip(f"Editable — writes {mf.write_target} in working copy only")
+
+        # cell_size case-defined: keep visible but disabled
+        if "cell_size" in mapping.case_defined_keys or (
+            mapping.get("cell_size")
+            and mapping.get("cell_size").provenance == FieldProvenance.CASE_DEFINED
+        ):
+            self.spin_cell.setEnabled(False)
+            self.spin_cell.setToolTip(tip_cd)
+            self.lbl_effective_domain.setText("Base mesh: case-defined (see blockMeshDict)")
+
+    def _restore_native_control_editability(self) -> None:
+        for key in (
+            "radius", "height", "cell_size", "height_of_burst", "detonation_height",
+            "charge_aspect", "mass_kg", "rho_charge", "energy_j_per_kg", "p_atm",
+            "t_atm", "max_co", "end_time_s", "delta_t", "write_interval_time",
+            "write_interval_steps", "material_name", "charge_shape",
+            "initialization_source", "write_control_type", "mesh_mode",
+            "charge_seed_mode", "refine_indicator_field", "charge_refinement_level",
+            "buffer_layers", "refine_interval", "lower_refine_threshold",
+            "unrefine_threshold", "n_buffer_layers_dynamic", "dyn_refine_max",
+            "dynamic_max_cells", "dump_level", "adjust_time_step",
+            "outer_boundary", "top_boundary", "bottom_boundary",
+        ):
+            widget = self._widget_for_gui_key(key)
+            if widget is None:
+                continue
+            widget.setToolTip("")
+            if isinstance(widget, QDoubleSpinBox):
+                widget.setSpecialValueText("")
+            # Actual enablement is owned by _apply_enablement for native mode.
 
     def mark_initialized(self, case_dir: str, actual_cells: int | None = None) -> None:
         self._active_case_dir = case_dir
@@ -153,6 +461,9 @@ class Tab2D(QWidget):
     def mark_stale(self) -> None:
         if self._loading:
             return
+        if self.is_imported_mode:
+            # Imported mode: only editable controlDict fields may dirty the case.
+            return
         if self._state in (
             SimulationState2D.INITIALIZED,
             SimulationState2D.INTERRUPTED,
@@ -176,6 +487,11 @@ class Tab2D(QWidget):
         ll = QVBoxLayout(left)
         ll.setContentsMargins(5, 5, 5, 5)
         ll.setSpacing(5)
+        self.lbl_import_banner = QLabel("")
+        self.lbl_import_banner.setWordWrap(True)
+        self.lbl_import_banner.setStyleSheet(SECONDARY_INFO_STYLE)
+        self.lbl_import_banner.setVisible(False)
+        ll.addWidget(self.lbl_import_banner, 0)
         self.input_tabs = QTabWidget()
         self.input_tabs.setMinimumWidth(0)
         self.input_tabs.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
@@ -699,6 +1015,29 @@ class Tab2D(QWidget):
         self.viewer.force_refresh_view()
 
     def _refresh_derived(self) -> None:
+        if self.is_imported_mode:
+            # Imported display uses mapping/info panel; avoid native mass→radius derivation.
+            try:
+                if self._imported_case and self._imported_case.radius_m and self._imported_case.height_m:
+                    cr = None
+                    hob = self.spin_hob.value()
+                    if self._imported_case.mapping and self._imported_case.mapping.get("charge_radius"):
+                        cr = self._imported_case.mapping.get("charge_radius").displayed_value
+                    self.viewer.update_axisymmetric_preview(
+                        float(self._imported_case.radius_m),
+                        float(self._imported_case.height_m),
+                        {
+                            "shape": self.cmb_shape.currentText(),
+                            "height": hob,
+                            "radius": float(cr) if cr is not None else 0.0,
+                            "length": 0.0,
+                        },
+                        [(p.radius, p.height) for p in self._probes()],
+                    )
+            except Exception:
+                pass
+            self._refresh_info()
+            return
         try:
             inputs = self.get_case_inputs()
             result = validate_case_inputs_2d(inputs)
@@ -750,6 +1089,54 @@ class Tab2D(QWidget):
 
     def _refresh_info(self) -> None:
         try:
+            if self.is_imported_mode and self._imported_case is not None:
+                ext = self._imported_case
+                self.lbl_info_total.setText(
+                    f"Imported working case: {os.path.basename(ext.active_case_path)}"
+                )
+                rc = (ext.mapping.get("radial_cells").displayed_value
+                      if ext.mapping and ext.mapping.get("radial_cells") else None)
+                vc = (ext.mapping.get("vertical_cells").displayed_value
+                      if ext.mapping and ext.mapping.get("vertical_cells") else None)
+                if rc is not None and vc is not None:
+                    self.lbl_info_grid.setText(
+                        f"Base grid: {int(rc)} radial × {int(vc)} vertical"
+                    )
+                else:
+                    self.lbl_info_grid.setText(
+                        f"Mode: {ext.lifecycle_label} | evidence: "
+                        f"{ext.classification.evidence.source}"
+                    )
+                cr = None
+                if ext.mapping and ext.mapping.get("charge_radius"):
+                    cr = ext.mapping.get("charge_radius").displayed_value
+                centre = None
+                if ext.mapping and ext.mapping.get("charge_centre"):
+                    centre = ext.mapping.get("charge_centre").displayed_value
+                mat = None
+                if ext.mapping and ext.mapping.get("material_name"):
+                    mat = ext.mapping.get("material_name").displayed_value
+                self.lbl_info_charge.setText(
+                    f"Charge: {mat or '—'} | r={cr if cr is not None else '—'} m | "
+                    f"centre={centre if centre is not None else '—'}"
+                )
+                self.lbl_info_resolution.setText(
+                    f"Source unchanged | R={ext.radius_m if ext.radius_m is not None else '—'} "
+                    f"H={ext.height_m if ext.height_m is not None else '—'}"
+                )
+                if ext.cell_count is not None:
+                    owner = os.path.basename(os.path.dirname(ext.mesh_owner_path)) if ext.mesh_owner_path else ""
+                    self.lbl_info_actual.setText(
+                        f"Actual current cells: {ext.cell_count:,} "
+                        f"({ext.cell_count_source}"
+                        + (f" / {owner}" if owner else "")
+                        + ")"
+                    )
+                else:
+                    self.lbl_info_actual.setText(
+                        "Actual current cells: (initialise to generate mesh)"
+                    )
+                return
             inputs = self.get_case_inputs()
             result = validate_case_inputs_2d(inputs)
             if not result.domain:
@@ -918,11 +1305,17 @@ class Tab2D(QWidget):
 
     def set_case_inputs(self, data: dict) -> None:
         values = dict(data)
+        self._set_control_values(values, clear_imported=True, manage_loading=True)
+
+    def _set_control_values(
+        self, values: dict, *, clear_imported: bool, manage_loading: bool = True
+    ) -> None:
         mapping = values.get("mapping", {})
         if isinstance(mapping, MappingSource2D):
             mapping = asdict(mapping)
         probes = values.get("probes", [])
-        self._loading = True
+        if manage_loading:
+            self._loading = True
         try:
             setters = (
                 (self.spin_radius, "radius"),
@@ -986,39 +1379,52 @@ class Tab2D(QWidget):
             for widget, key in checks:
                 if key in values:
                     widget.setChecked(bool(values[key]))
-            self.chk_begin_unrefine.setChecked(values.get("begin_unrefine") is not None)
-            if values.get("begin_unrefine") is not None:
-                self.spin_begin_unrefine.setValue(values["begin_unrefine"])
-            self.cmb_view_mode.setCurrentText(
-                "Mirrored View" if values.get("mirrored_view", True)
-                else "Computational Domain View"
-            )
-            self.txt_source_case.setEditText(str(mapping.get("case_path", "")))
-            self.cmb_source_time_mode.setCurrentText(str(mapping.get("time_mode", "latest")))
-            self.txt_source_time.setEditText(str(mapping.get("specific_time", "")))
-            self.spin_mapped_radius.setValue(float(mapping.get("mapped_radius", 0.5)))
-            self.spin_source_resolution.setValue(
-                float(mapping.get("source_resolution") or 0.01)
-            )
-            self.tbl_probes.setRowCount(0)
-            for item in probes:
-                if isinstance(item, ProbePoint2D):
-                    item = asdict(item)
-                row = self.tbl_probes.rowCount()
-                self.tbl_probes.insertRow(row)
-                for col, key in enumerate(("name", "radius", "height")):
-                    self.tbl_probes.setItem(row, col, QTableWidgetItem(str(item[key])))
-            selected = set(values.get("output_fields", ()))
-            for field, check in self.output_checks.items():
-                check.setChecked(field in selected)
+            if "begin_unrefine" in values:
+                self.chk_begin_unrefine.setChecked(values.get("begin_unrefine") is not None)
+                if values.get("begin_unrefine") is not None:
+                    self.spin_begin_unrefine.setValue(values["begin_unrefine"])
+            if "mirrored_view" in values:
+                self.cmb_view_mode.setCurrentText(
+                    "Mirrored View" if values.get("mirrored_view", True)
+                    else "Computational Domain View"
+                )
+            if mapping:
+                self.txt_source_case.setEditText(str(mapping.get("case_path", "")))
+                self.cmb_source_time_mode.setCurrentText(str(mapping.get("time_mode", "latest")))
+                self.txt_source_time.setEditText(str(mapping.get("specific_time", "")))
+                if mapping.get("mapped_radius") is not None:
+                    self.spin_mapped_radius.setValue(float(mapping.get("mapped_radius", 0.5)))
+                if mapping.get("source_resolution") is not None:
+                    self.spin_source_resolution.setValue(
+                        float(mapping.get("source_resolution") or 0.01)
+                    )
+            if "probes" in values or probes:
+                self.tbl_probes.setRowCount(0)
+                for item in probes:
+                    if isinstance(item, ProbePoint2D):
+                        item = asdict(item)
+                    row = self.tbl_probes.rowCount()
+                    self.tbl_probes.insertRow(row)
+                    for col, key in enumerate(("name", "radius", "height")):
+                        self.tbl_probes.setItem(row, col, QTableWidgetItem(str(item[key])))
+            if "output_fields" in values:
+                selected = set(values.get("output_fields", ()))
+                for field, check in self.output_checks.items():
+                    check.setChecked(field in selected)
         finally:
-            self._loading = False
-        self._active_case_dir = None
-        self._actual_cell_count = None
-        self.set_simulation_state(SimulationState2D.DRAFT)
-        self._apply_enablement()
+            if manage_loading:
+                self._loading = False
+        if clear_imported:
+            self._active_case_dir = None
+            self._actual_cell_count = None
+            self.clear_imported_case()
+            self.set_simulation_state(SimulationState2D.DRAFT)
+            self._apply_enablement()
 
     def _request_initialize(self) -> None:
+        if self.is_imported_mode:
+            self.sig_request_init.emit(self.get_case_inputs())
+            return
         inputs = self.get_case_inputs()
         result = validate_case_inputs_2d(inputs)
         if result.valid:
