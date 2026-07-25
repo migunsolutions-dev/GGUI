@@ -86,6 +86,52 @@ def mirror_meridional(surface: "pv.PolyData") -> "pv.PolyData":
     return surface.merge(mirrored, merge_points=True, tolerance=1e-12)
 
 
+def preview_charge_outline_points(
+    *,
+    shape: str,
+    height: float,
+    radius: float,
+    length: float = 0.0,
+    mirrored: bool,
+    reflecting_ground: bool = False,
+) -> np.ndarray:
+    """Return the meridional charge outline used by Setup Preview.
+
+    A sphere centred on a reflecting ground is clipped to the computational
+    y >= 0 region: a quarter-circle in the r >= 0 view and one upper
+    semicircle in the display-only mirrored view.
+    """
+    zc = float(height)
+    cr = float(radius)
+    if shape == "Cylinder":
+        half = 0.5 * float(length)
+        rr0 = -cr if mirrored else 0.0
+        return np.array(
+            [
+                [rr0, zc - half, 0.0],
+                [cr, zc - half, 0.0],
+                [cr, zc + half, 0.0],
+                [rr0, zc + half, 0.0],
+                [rr0, zc - half, 0.0],
+            ]
+        )
+
+    ground_sphere = reflecting_ground and abs(zc) <= 1e-12
+    if ground_sphere:
+        theta = (
+            np.linspace(0.0, np.pi, 160)
+            if mirrored
+            else np.linspace(0.0, 0.5 * np.pi, 96)
+        )
+    elif mirrored:
+        theta = np.linspace(0.0, 2.0 * np.pi, 160)
+    else:
+        theta = np.linspace(-0.5 * np.pi, 0.5 * np.pi, 96)
+    return np.column_stack(
+        (cr * np.cos(theta), zc + cr * np.sin(theta), np.zeros_like(theta))
+    )
+
+
 def count_internal_diagonals_in_edge_overlay(surface: "pv.PolyData") -> int:
     """Return how many overlay edges are diagonals of uniform quads (expect 0)."""
     if surface.n_cells == 0:
@@ -521,30 +567,14 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
 
         zc = float(charge.get("height", 0.0))
         cr = float(charge.get("radius", 0.0))
-        if charge.get("shape") == "Cylinder":
-            half = 0.5 * float(charge.get("length", 0.0))
-            rr0 = -cr if self.mirrored_view else 0.0
-            points = np.array(
-                [
-                    [rr0, zc - half, 0.0],
-                    [cr, zc - half, 0.0],
-                    [cr, zc + half, 0.0],
-                    [rr0, zc + half, 0.0],
-                    [rr0, zc - half, 0.0],
-                ]
-            )
-        else:
-            if self.mirrored_view:
-                theta = np.linspace(0.0, 2.0 * np.pi, 160)
-            else:
-                # Computational half: r>=0; for HOB=0 show upper semicircle y>=0.
-                if abs(zc) <= 1e-12:
-                    theta = np.linspace(0.0, 0.5 * np.pi, 96)
-                else:
-                    theta = np.linspace(-0.5 * np.pi, 0.5 * np.pi, 96)
-            points = np.column_stack(
-                (cr * np.cos(theta), zc + cr * np.sin(theta), np.zeros_like(theta))
-            )
+        points = preview_charge_outline_points(
+            shape=str(charge.get("shape", "Sphere")),
+            height=zc,
+            radius=cr,
+            length=float(charge.get("length", 0.0)),
+            mirrored=self.mirrored_view,
+            reflecting_ground=bool(charge.get("reflecting_ground", False)),
+        )
         outline = pv.lines_from_points(points, close=True)
         self._plotter.add_mesh(outline, color="#e74c3c", line_width=3)
 

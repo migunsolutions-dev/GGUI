@@ -32,6 +32,7 @@ from PyQt5.QtWidgets import (
 )
 
 from axisymmetric_2d import (
+    BOUNDARY_SLIP,
     DIRECT_SOURCE,
     DYNAMIC_MESH,
     FIXED_MESH,
@@ -1119,6 +1120,9 @@ class Tab2D(QWidget):
                         "shape": inputs.charge_shape,
                         "height": inputs.height_of_burst,
                         "detonation_height": float(inputs.detonation_height),
+                        "reflecting_ground": (
+                            inputs.bottom_boundary == BOUNDARY_SLIP
+                        ),
                         "radius": radius,
                         "length": charge.length_m,
                         "show_grid": bool(self.chk_view_mesh.isChecked()),

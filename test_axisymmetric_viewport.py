@@ -9,7 +9,10 @@ os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
 
 from PyQt5.QtWidgets import QApplication
 
-from axisymmetric_viewer import AxisymmetricViewerWidget
+from axisymmetric_viewer import (
+    AxisymmetricViewerWidget,
+    preview_charge_outline_points,
+)
 from generator_2d import Generator2D
 from models_2d import CaseInputs2D, SimulationState2D
 from tab_2d import Tab2D
@@ -19,6 +22,57 @@ app = QApplication.instance() or QApplication([])
 
 
 class AxisymmetricViewportTests(unittest.TestCase):
+    def test_reflecting_ground_sphere_computational_is_quarter_circle(self):
+        points = preview_charge_outline_points(
+            shape="Sphere",
+            height=0.0,
+            radius=0.25,
+            mirrored=False,
+            reflecting_ground=True,
+        )
+        self.assertAlmostEqual(float(points[:, 0].min()), 0.0, places=12)
+        self.assertAlmostEqual(float(points[:, 0].max()), 0.25, places=12)
+        self.assertAlmostEqual(float(points[:, 1].min()), 0.0, places=12)
+        self.assertAlmostEqual(float(points[:, 1].max()), 0.25, places=12)
+        self.assertTrue((points[:, 1] >= -1e-12).all())
+
+    def test_reflecting_ground_sphere_mirrored_is_upper_semicircle(self):
+        points = preview_charge_outline_points(
+            shape="Sphere",
+            height=0.0,
+            radius=0.25,
+            mirrored=True,
+            reflecting_ground=True,
+        )
+        self.assertAlmostEqual(float(points[:, 0].min()), -0.25, places=12)
+        self.assertAlmostEqual(float(points[:, 0].max()), 0.25, places=12)
+        self.assertAlmostEqual(float(points[:, 1].min()), 0.0, places=12)
+        self.assertAlmostEqual(float(points[:, 1].max()), 0.25, places=4)
+        self.assertTrue((points[:, 1] >= -1e-12).all())
+
+    def test_sphere_above_ground_preserves_existing_sections(self):
+        half = preview_charge_outline_points(
+            shape="Sphere",
+            height=1.0,
+            radius=0.25,
+            mirrored=False,
+            reflecting_ground=True,
+        )
+        full = preview_charge_outline_points(
+            shape="Sphere",
+            height=1.0,
+            radius=0.25,
+            mirrored=True,
+            reflecting_ground=True,
+        )
+        self.assertGreaterEqual(float(half[:, 0].min()), -1e-12)
+        self.assertAlmostEqual(float(half[:, 1].min()), 0.75, places=12)
+        self.assertAlmostEqual(float(half[:, 1].max()), 1.25, places=12)
+        self.assertAlmostEqual(float(full[:, 0].min()), -0.25, places=4)
+        self.assertAlmostEqual(float(full[:, 0].max()), 0.25, places=12)
+        self.assertAlmostEqual(float(full[:, 1].min()), 0.75, places=4)
+        self.assertAlmostEqual(float(full[:, 1].max()), 1.25, places=4)
+
     def test_preview_meridional_extents_mirrored_and_half(self):
         viewer = AxisymmetricViewerWidget()
         self.assertEqual(
