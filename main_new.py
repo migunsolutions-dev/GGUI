@@ -1084,7 +1084,10 @@ class BlastFoamApp(QMainWindow):
                     from axisymmetric_viewer import AxisymmetricViewerWidget
 
                     # Best-effort: count α>0.5 from ASCII field when available.
-                    atxt = open(alpha_path, encoding="utf-8", errors="ignore").read()
+                    with open(
+                        alpha_path, encoding="utf-8", errors="ignore"
+                    ) as alpha_file:
+                        atxt = alpha_file.read()
                     import re as _re
 
                     m = _re.search(

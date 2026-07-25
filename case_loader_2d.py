@@ -226,7 +226,8 @@ def inspect_imported_axisymmetric_case(
         cell_source = "constant_polyMesh"
     if owner_path:
         try:
-            text = open(owner_path, encoding="utf-8", errors="ignore").read()
+            with open(owner_path, encoding="utf-8", errors="ignore") as owner_file:
+                text = owner_file.read()
             note_cells = re.search(r"\bnCells:\s*(\d+)", text)
             if note_cells:
                 cell_count = int(note_cells.group(1))
