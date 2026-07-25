@@ -74,7 +74,8 @@ class Generator2DTests(unittest.TestCase):
             command = _read(case, "Allrun")
             self.assertIn("level 4", fields)
             self.assertIn("maxRefinement 1", dynamic)
-            self.assertIn("unrefineInterval 1", dynamic)
+            self.assertIn("unrefineInterval 3", dynamic)
+            self.assertIn("refineInterval 3", dynamic)
             self.assertIn("errorEstimator densityGradient", dynamic)
             self.assertIn("setRefinedFields", command)
 

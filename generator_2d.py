@@ -438,6 +438,10 @@ snGradSchemes { default corrected; }
             probes.append(
                 f"            ({probe.radius:.12g} {probe.height:.12g} 0)"
             )
+        # Pressure histories only. Probe-driven refinement is the separate
+        # dynamicMeshDict Switch ``refineProbes`` (errorEstimator), which marks
+        # cells at existing ``probes`` / ``blastProbes`` function-object locations.
+        # There is no supported controlDict function type ``refineProbes``.
         probes_block = ""
         if probes:
             probes_block = f"""
@@ -448,19 +452,6 @@ snGradSchemes { default corrected; }
         fields ({' '.join(inputs.output_fields)});
         writeControl timeStep;
         writeInterval 1;
-        probeLocations
-        (
-{os.linesep.join(probes)}
-        );
-    }}
-"""
-        refine_probes = ""
-        if inputs.mesh_mode == DYNAMIC_MESH and inputs.refine_probes and probes:
-            refine_probes = f"""
-    refineProbes
-    {{
-        type refineProbes;
-        libs ("libblastFunctionObjects.so");
         probeLocations
         (
 {os.linesep.join(probes)}
@@ -487,7 +478,7 @@ timePrecision 10;
 runTimeModifiable true;
 functions
 {{
-{probes_block}{refine_probes}}}
+{probes_block}}}
 """
         self._write_text(os.path.join(system, "controlDict"), control)
         decompose = (

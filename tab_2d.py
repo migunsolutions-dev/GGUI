@@ -45,6 +45,7 @@ from external_case_workflow_2d import ImportMode2D, import_mode_label
 from imported_case_mapping_2d import FieldProvenance
 from material_catalog import materials_copy
 from models_2d import (
+    DEFAULT_REFINE_INTERVAL,
     CaseInputs2D,
     MappingSource2D,
     ProbePoint2D,
@@ -740,8 +741,12 @@ class Tab2D(QWidget):
         self.spin_runtime_level = self._int(1, 1, 8)
         self.spin_refine_threshold = self._double(0.1, 0.0, 1e9, 6)
         self.spin_unrefine_threshold = self._double(0.1, 0.0, 1e9, 6)
-        self.spin_refine_interval = self._int(3, 1, 100000)
-        self.spin_unrefine_interval = self._int(1, 1, 100000)
+        self.spin_refine_interval = self._int(DEFAULT_REFINE_INTERVAL, 1, 100000)
+        self.spin_unrefine_interval = self._int(DEFAULT_REFINE_INTERVAL, 1, 100000)
+        self.spin_unrefine_interval.setToolTip(
+            "Solver steps between unrefinement attempts. "
+            "New native Dynamic cases default to the same value as Refine interval."
+        )
         self.spin_begin_unrefine = self._double(0.0, 0.0, 1e9, 9, " s")
         self.chk_begin_unrefine = QCheckBox("Enable")
         self.spin_runtime_buffer = self._int(2, 0, 20)
@@ -750,6 +755,11 @@ class Tab2D(QWidget):
         self.chk_dump_level.setChecked(True)
         self.chk_refine_probes = QCheckBox()
         self.chk_refine_probes.setChecked(True)
+        self.chk_refine_probes.setToolTip(
+            "dynamicMeshDict Switch: when enabled, force refinement at cells "
+            "containing probe locations from the probes2d function object. "
+            "This is not a separate controlDict function type."
+        )
         self.chk_balancing = QCheckBox()
         self.spin_balance_interval = self._int(10, 1, 100000)
         form.addRow("Estimator:", self.cmb_estimator)

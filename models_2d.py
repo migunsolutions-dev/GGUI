@@ -12,6 +12,10 @@ from charge_seed_plan import (
     SEED_MODE_AUTO,
 )
 
+# Authoritative native Cylindrical–2D runtime AMR interval default.
+# New Dynamic cases use the same value for refine and unrefine scheduling.
+DEFAULT_REFINE_INTERVAL = 3
+
 
 class SimulationState2D(str, Enum):
     DRAFT = "Draft"
@@ -95,11 +99,13 @@ class CaseInputs2D:
     charge_seed_max_level: int = DEFAULT_MAX_AUTO_LEVEL
     buffer_layers: int = 5
 
-    # Runtime AMR; defaults follow the approved 3D canonical model.
+    # Runtime AMR; defaults follow the approved 3D canonical model except
+    # unrefine_interval, which matches refine_interval for native 2D cases
+    # (Phase-2 churn evidence). Explicit saved/imported values are preserved.
     refine_indicator_field: str = "densityGradient"
     dyn_refine_max: int = 1
-    refine_interval: int = 3
-    unrefine_interval: int = 1
+    refine_interval: int = DEFAULT_REFINE_INTERVAL
+    unrefine_interval: int = DEFAULT_REFINE_INTERVAL
     lower_refine_threshold: float = 0.1
     upper_refine_level: Optional[float] = None
     unrefine_threshold: float = 0.1
@@ -108,6 +114,8 @@ class CaseInputs2D:
     n_buffer_layers_dynamic: int = 2
     dynamic_max_cells: int = 200000000
     dump_level: bool = True
+    # dynamicMeshDict Switch: force error=1 at cells containing probes/blastProbes.
+    # Not a controlDict function object (no type refineProbes exists in blastFoam).
     refine_probes: bool = True
     enable_balancing: bool = False
     balance_interval: Optional[int] = None
