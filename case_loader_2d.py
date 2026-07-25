@@ -1,6 +1,7 @@
 """Inspect and report imported axisymmetric cases for Cylindrical–2D."""
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -300,6 +301,16 @@ def inspect_external_axisymmetric_case(
 
 def format_imported_case_report_2d(state: ImportedCase2DState) -> str:
     """Structured 2D load report including source/working paths and mapping."""
+    def display_value(value):
+        if isinstance(value, float):
+            nearest = round(value)
+            if math.isclose(value, nearest, rel_tol=0.0, abs_tol=1e-9):
+                return f"{nearest:d}"
+            return f"{value:.9g}"
+        if isinstance(value, tuple):
+            return "(" + ", ".join(str(display_value(item)) for item in value) + ")"
+        return value
+
     ev = state.classification.evidence
     mapping = state.mapping
     lines: List[str] = [
@@ -352,7 +363,11 @@ def format_imported_case_report_2d(state: ImportedCase2DState) -> str:
     if mapping:
         for key in sorted(mapping.fields):
             mf = mapping.fields[key]
-            val = "—" if mf.displayed_value is None else mf.displayed_value
+            val = (
+                "—"
+                if mf.displayed_value is None
+                else display_value(mf.displayed_value)
+            )
             if mf.editable:
                 edit = "editable"
             elif mf.provenance == FieldProvenance.CASE_DEFINED:
@@ -372,7 +387,7 @@ def format_imported_case_report_2d(state: ImportedCase2DState) -> str:
     lines.extend(["", "4. Populated GUI controls"])
     if mapping and mapping.gui_values:
         for key, val in sorted(mapping.gui_values.items()):
-            lines.append(f"  {key} = {val}")
+            lines.append(f"  {key} = {display_value(val)}")
     else:
         lines.append("  (none)")
 

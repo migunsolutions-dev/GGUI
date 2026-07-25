@@ -134,6 +134,29 @@ def _parse_block_mesh(case_dir: str) -> Dict[str, Any]:
     if "cellSize" in macros:
         out["cell_size"] = macros["cellSize"]
 
+    # Generator2D writes explicit numeric vertices instead of R/H macros.
+    vertices = re.search(r"\bvertices\s*\((.*?)\)\s*;", text, re.DOTALL)
+    if vertices:
+        parsed_vertices: List[Tuple[float, float, float]] = []
+        for match in re.finditer(r"\(([^()]+)\)", vertices.group(1)):
+            parts = match.group(1).split()
+            if len(parts) != 3:
+                continue
+            try:
+                parsed_vertices.append(tuple(float(value) for value in parts))
+            except ValueError:
+                continue
+        if parsed_vertices:
+            if "radius" not in out:
+                out["radius"] = max(
+                    math.hypot(point[0], point[2]) for point in parsed_vertices
+                )
+                out["radius_from_vertices"] = True
+            if "height" not in out:
+                ys = [point[1] for point in parsed_vertices]
+                out["height"] = max(ys) - min(ys)
+                out["height_from_vertices"] = True
+
     # Explicit nx/ny assignments via #calc or literals.
     for name in ("nx", "ny"):
         m = re.search(rf"\b{name}\s+#calc\s+\"([^\"]+)\"", text)
@@ -235,37 +258,84 @@ def _parse_setfields(case_dir: str) -> Dict[str, Any]:
     m = re.search(r"\bnBufferLayers\s+(\d+)\s*;", text)
     if m:
         out["nBufferLayers"] = int(m.group(1))
-    body = _extract_brace_block(text, "sphereToCell")
-    if body is not None:
-        out["shape"] = "Sphere"
-        centre = re.search(r"centre\s*\(([^)]+)\)", body)
-        # Prefer primary radius, not backup radius: first radius before 'backup'.
-        primary = body.split("backup", 1)[0]
-        radius = re.search(r"radius\s+([^;]+);", primary)
-        level = re.search(r"level\s+(\d+)\s*;", body)
-        if centre:
-            parts = [float(x) for x in centre.group(1).split()]
-            out["centre"] = tuple(parts)
-        if radius:
-            out["radius"] = float(radius.group(1).strip())
+    def _vector(body: str, key: str) -> Optional[Tuple[float, ...]]:
+        match = re.search(rf"\b{re.escape(key)}\s*\(([^)]+)\)", body)
+        return (
+            tuple(float(value) for value in match.group(1).split())
+            if match
+            else None
+        )
+
+    def _scalar(body: str, key: str) -> Optional[float]:
+        match = re.search(
+            rf"\b{re.escape(key)}\s+"
+            r"([-+]?(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][-+]?\d+)?)\s*;",
+            body,
+        )
+        return float(match.group(1)) if match else None
+
+    def _common(body: str) -> None:
+        for key in ("rho", "mass", "LbyD"):
+            value = _scalar(body, key)
+            if value is not None:
+                out[key] = value
+        centre = _vector(body, "centre")
+        if centre is not None:
+            out["centre"] = centre
+        level = re.search(r"\blevel\s+(\d+)\s*;", body)
         if level:
             out["level"] = int(level.group(1))
         fv = re.search(r"volScalarFieldValue\s+(\S+)\s+1", body)
         if fv:
             out["phase_field"] = fv.group(1)
+
+    # Exact mass-based region names emitted by the installed Generator2D.
+    body = _extract_brace_block(text, "sphericalMassToCell")
+    if body is not None:
+        out["shape"] = "Sphere"
+        out["mass_based"] = True
+        _common(body)
         return out
+
+    body = _extract_brace_block(text, "cylindericalMassToCell")
+    if body is not None:
+        out["shape"] = "Cylinder"
+        out["mass_based"] = True
+        _common(body)
+        direction = _vector(body, "direction")
+        if direction is not None:
+            out["direction"] = direction
+        return out
+
+    body = _extract_brace_block(text, "sphereToCell")
+    if body is not None:
+        out["shape"] = "Sphere"
+        _common(body)
+        # Prefer primary radius, not backup radius.
+        primary = body.split("backup", 1)[0]
+        radius = _scalar(primary, "radius")
+        if radius is not None:
+            out["radius"] = radius
+        return out
+
     body = _extract_brace_block(text, "cylinderToCell")
     if body is not None:
         out["shape"] = "Cylinder"
-        p1 = re.search(r"p1\s*\(([^)]+)\)", body)
-        p2 = re.search(r"p2\s*\(([^)]+)\)", body)
-        radius = re.search(r"radius\s+([^;]+);", body)
-        if p1:
-            out["p1"] = tuple(float(x) for x in p1.group(1).split())
-        if p2:
-            out["p2"] = tuple(float(x) for x in p2.group(1).split())
-        if radius:
-            out["radius"] = float(radius.group(1).strip())
+        _common(body)
+        p1 = _vector(body, "p1")
+        p2 = _vector(body, "p2")
+        radius = _scalar(body, "radius")
+        if p1 is not None:
+            out["p1"] = p1
+        if p2 is not None:
+            out["p2"] = p2
+        if p1 is not None and p2 is not None:
+            out["centre"] = tuple((a + b) / 2.0 for a, b in zip(p1, p2))
+            out["length"] = math.sqrt(sum((b - a) ** 2 for a, b in zip(p1, p2)))
+        if radius is not None:
+            out["radius"] = radius
+        if radius and out.get("length") is not None:
+            out["LbyD"] = float(out["length"]) / (2.0 * radius)
     return out
 
 
@@ -288,6 +358,9 @@ def _parse_phase_properties(case_dir: str) -> Dict[str, Any]:
     points = re.search(r"points\s*\(\(([^)]+)\)\)", text)
     if points:
         out["initiation_point"] = tuple(float(x) for x in points.group(1).split())
+    use_com = re.search(r"\buseCOM\s+(yes|no|true|false)\s*;", text, re.IGNORECASE)
+    if use_com:
+        out["useCOM"] = use_com.group(1).lower() in ("yes", "true")
     return out
 
 
@@ -413,7 +486,11 @@ def map_imported_case_to_gui(
             result,
             "radius",
             float(radius),
-            FieldProvenance.DIRECT if "radius" in block else FieldProvenance.DERIVED,
+            (
+                FieldProvenance.DERIVED
+                if block.get("radius_from_vertices") or "radius" not in block
+                else FieldProvenance.DIRECT
+            ),
             source_file=block.get("path") or "topology",
             reason="blockMeshDict R / topology extent",
         )
@@ -432,7 +509,11 @@ def map_imported_case_to_gui(
             result,
             "height",
             float(height),
-            FieldProvenance.DIRECT if "height" in block else FieldProvenance.DERIVED,
+            (
+                FieldProvenance.DERIVED
+                if block.get("height_from_vertices") or "height" not in block
+                else FieldProvenance.DIRECT
+            ),
             source_file=block.get("path") or "topology",
             reason="blockMeshDict H / topology extent",
         )
@@ -492,15 +573,37 @@ def map_imported_case_to_gui(
 
     grading_ok = bool(block.get("uniform_grading"))
     cell_size = block.get("cell_size")
+    if (
+        cell_size is None
+        and grading_ok
+        and radius is not None
+        and height is not None
+        and radial
+        and vertical
+    ):
+        radial_size = float(radius) / float(radial)
+        axial_size = float(height) / float(vertical)
+        tolerance = max(1e-10, 1e-8 * max(abs(radial_size), abs(axial_size), 1.0))
+        if math.isclose(radial_size, axial_size, rel_tol=1e-8, abs_tol=tolerance):
+            cell_size = 0.5 * (radial_size + axial_size)
+            block["derived_cell_size"] = True
     if cell_size is not None and grading_ok and radial and height and radius:
         # Effective sizes when uniform.
         _add(
             result,
             "cell_size",
             float(cell_size),
-            FieldProvenance.DIRECT,
+            (
+                FieldProvenance.DERIVED
+                if block.get("derived_cell_size")
+                else FieldProvenance.DIRECT
+            ),
             source_file=block.get("path", ""),
-            reason="blockMeshDict cellSize with uniform simpleGrading",
+            reason=(
+                "uniform R/Nr and H/Nz agree"
+                if block.get("derived_cell_size")
+                else "blockMeshDict cellSize with uniform simpleGrading"
+            ),
         )
         _add(
             result,
@@ -592,7 +695,73 @@ def map_imported_case_to_gui(
         )
 
     charge_r = setfields.get("radius")
-    if charge_r is not None and shape == "Sphere":
+    setfields_mass = setfields.get("mass")
+    charge_rho = setfields.get("rho", phases.get("rho0"))
+    if setfields_mass is not None and charge_rho and shape == "Sphere":
+        # Generator2D sphericalMassToCell: mass/rho/centre are authoritative.
+        charge_r = (
+            3.0 * float(setfields_mass) / (4.0 * math.pi * float(charge_rho))
+        ) ** (1.0 / 3.0)
+        _add(
+            result,
+            "charge_radius",
+            charge_r,
+            FieldProvenance.DERIVED,
+            source_file=setfields.get("path", ""),
+            apply_gui=False,
+            reason="derived from sphericalMassToCell mass and rho",
+        )
+        _add(
+            result,
+            "mass_kg",
+            float(setfields_mass),
+            FieldProvenance.DIRECT,
+            source_file=setfields.get("path", ""),
+            reason="sphericalMassToCell nominal full-charge mass",
+            editable=True,
+        )
+    elif setfields_mass is not None and charge_rho and shape == "Cylinder":
+        aspect = setfields.get("LbyD")
+        if aspect and float(aspect) > 0.0:
+            volume = float(setfields_mass) / float(charge_rho)
+            charge_r = (volume / (2.0 * math.pi * float(aspect))) ** (1.0 / 3.0)
+            length = 2.0 * charge_r * float(aspect)
+            _add(
+                result,
+                "charge_aspect",
+                float(aspect),
+                FieldProvenance.DIRECT,
+                source_file=setfields.get("path", ""),
+                reason="cylindericalMassToCell LbyD",
+            )
+            _add(
+                result,
+                "charge_radius",
+                charge_r,
+                FieldProvenance.DERIVED,
+                source_file=setfields.get("path", ""),
+                apply_gui=False,
+                reason="derived from cylindericalMassToCell mass/rho/LbyD",
+            )
+            _add(
+                result,
+                "charge_length",
+                length,
+                FieldProvenance.DERIVED,
+                source_file=setfields.get("path", ""),
+                apply_gui=False,
+                reason="derived cylinder length",
+            )
+        _add(
+            result,
+            "mass_kg",
+            float(setfields_mass),
+            FieldProvenance.DIRECT,
+            source_file=setfields.get("path", ""),
+            reason="cylindericalMassToCell mass",
+            editable=True,
+        )
+    elif charge_r is not None and shape == "Sphere":
         # VIPER convention: Mass is always the nominal complete-sphere mass.
         # HOB=0 on a reflecting bottom is valid — the computational half-domain
         # contains one hemisphere; do not halve mass/radius.
@@ -613,7 +782,7 @@ def map_imported_case_to_gui(
             apply_gui=False,
             reason="setFieldsDict sphereToCell radius",
         )
-        rho = phases.get("rho0")
+        rho = charge_rho
         if off_axis or past_top:
             _add(
                 result,
@@ -648,7 +817,9 @@ def map_imported_case_to_gui(
                 reason="density unavailable for mass derivation",
                 apply_gui=False,
             )
-    elif charge_r is not None:
+    elif charge_r is not None and shape == "Cylinder":
+        length = setfields.get("length")
+        aspect = setfields.get("LbyD")
         _add(
             result,
             "charge_radius",
@@ -657,14 +828,35 @@ def map_imported_case_to_gui(
             source_file=setfields.get("path", ""),
             apply_gui=False,
         )
-        _add(
-            result,
-            "mass_kg",
-            None,
-            FieldProvenance.NOT_RECOVERED,
-            reason="cylinder mass not uniquely determined from setFieldsDict alone",
-            apply_gui=False,
-        )
+        if aspect is not None:
+            _add(
+                result,
+                "charge_aspect",
+                float(aspect),
+                FieldProvenance.DERIVED,
+                source_file=setfields.get("path", ""),
+                reason="cylinderToCell length / diameter",
+            )
+        if length is not None and charge_rho:
+            mass = math.pi * float(charge_r) ** 2 * float(length) * float(charge_rho)
+            _add(
+                result,
+                "mass_kg",
+                mass,
+                FieldProvenance.DERIVED,
+                source_file=setfields.get("path", ""),
+                reason="cylinder volume × phase density",
+                editable=True,
+            )
+        else:
+            _add(
+                result,
+                "mass_kg",
+                None,
+                FieldProvenance.NOT_RECOVERED,
+                reason="cylinder length/density unavailable",
+                apply_gui=False,
+            )
     else:
         _add(
             result,
@@ -688,7 +880,16 @@ def map_imported_case_to_gui(
         )
         catalog = materials_copy()
         props = catalog.get(material, {})
-        if "rho" in props:
+        if setfields.get("rho") is not None:
+            _add(
+                result,
+                "rho_charge",
+                float(setfields["rho"]),
+                FieldProvenance.DIRECT,
+                source_file=setfields.get("path", ""),
+                reason="mass-based setFields region rho",
+            )
+        elif "rho" in props:
             _add(
                 result,
                 "rho_charge",
@@ -764,6 +965,15 @@ def map_imported_case_to_gui(
                 source_file=phases.get("path", ""),
                 reason=f"initiation points {ip}",
             )
+    elif phases.get("useCOM") and centre and len(centre) >= 2:
+        _add(
+            result,
+            "detonation_height",
+            float(centre[1]),
+            FieldProvenance.DERIVED,
+            source_file=phases.get("path", ""),
+            reason="phaseProperties useCOM yes → charge centre",
+        )
 
     _add(
         result,

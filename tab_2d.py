@@ -177,13 +177,18 @@ class Tab2D(QWidget):
         )
         self._update_provenance_banner()
 
-    def load_imported_case(self, state) -> None:
-        """Attach an imported working case and populate normal 2D controls."""
+    def load_imported_case(self, state, *, apply_mapping: bool = True) -> None:
+        """Attach an imported case and optionally populate 2D controls.
+
+        After generation in the same session, validated in-memory controls stay
+        authoritative while inspection contributes only runtime/mesh metadata.
+        """
         self._imported_case = state
         self._import_mode = state.mode
         self._active_case_dir = state.active_case_path
         self._actual_cell_count = state.cell_count
-        self._apply_import_mapping(state)
+        if apply_mapping:
+            self._apply_import_mapping(state)
         self._update_provenance_banner()
 
         radius = float(state.radius_m) if state.radius_m is not None else None

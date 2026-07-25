@@ -1126,7 +1126,9 @@ class BlastFoamApp(QMainWindow):
             state.runnable = True
             state.mode = ImportMode2D.IMPORTED_2D_READY
 
-            self.tab_2d.load_imported_case(state)
+            # The validated in-memory model remains authoritative in this
+            # session; inspection contributes runtime/mesh metadata only.
+            self.tab_2d.load_imported_case(state, apply_mapping=False)
             self.active_case_dir_2d = case_dir
             self.active_case_initialized_2d = True
             selected_field = self.tab_2d.cmb_field.currentText().strip() or "p"

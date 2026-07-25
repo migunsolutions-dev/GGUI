@@ -15,6 +15,8 @@ os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from axisymmetric_2d import BOUNDARY_SLIP, DYNAMIC_MESH, validate_case_inputs_2d
+from case_loader_2d import inspect_imported_axisymmetric_case
+from external_case_workflow_2d import inventory_case
 from generator_2d import Generator2D
 from imported_case_mapping_2d import FieldProvenance, full_sphere_mass_kg, map_imported_case_to_gui
 from models_2d import CaseInputs2D
@@ -143,6 +145,128 @@ class ImportEditableModelTests(unittest.TestCase):
             self.assertNotIn("type refineProbes;", control)
             self.assertIn("refineProbes", dynamic)
             self.assertIn("maxRefinement 4", dynamic)
+
+
+class GeneratedCaseRoundTripTests(unittest.TestCase):
+    def test_reference_sphere_generated_case_round_trip(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = _make_unmeshed_source(Path(td) / "axisymmetricCharge")
+            source_before = inventory_case(str(source))
+            source_mapping = map_imported_case_to_gui(str(source))
+            values = source_mapping.gui_values
+            inputs = replace(
+                CaseInputs2D(),
+                radius=values["radius"],
+                height=values["height"],
+                cell_size=values["cell_size"],
+                mass_kg=values["mass_kg"],
+                rho_charge=values["rho_charge"],
+                material_name=values["material_name"],
+                charge_shape=values["charge_shape"],
+                height_of_burst=values["height_of_burst"],
+                detonation_height=values["detonation_height"],
+                bottom_boundary=values["bottom_boundary"],
+                outer_boundary=values["outer_boundary"],
+                top_boundary=values["top_boundary"],
+                mesh_mode=values["mesh_mode"],
+                charge_seed_mode=values["charge_seed_mode"],
+                charge_refinement_level=values["charge_refinement_level"],
+                buffer_layers=values["buffer_layers"],
+                dyn_refine_max=values["dyn_refine_max"],
+                refine_interval=values["refine_interval"],
+                lower_refine_threshold=values["lower_refine_threshold"],
+                unrefine_threshold=values["unrefine_threshold"],
+                n_buffer_layers_dynamic=values["n_buffer_layers_dynamic"],
+            )
+            generated = Generator2D(td).generate("round_trip_sphere", inputs)
+            reopened = map_imported_case_to_gui(generated)
+
+            for key, expected, tolerance in (
+                ("radius", 20.0, 1e-8),
+                ("height", 20.0, 1e-10),
+                ("cell_size", 1.0, 1e-8),
+                ("mass_kg", inputs.mass_kg, 1e-8),
+                ("rho_charge", 1601.0, 1e-10),
+                ("height_of_burst", 0.0, 1e-12),
+                ("detonation_height", 0.0, 1e-12),
+            ):
+                self.assertAlmostEqual(
+                    reopened.gui_values[key], expected, delta=tolerance, msg=key
+                )
+            self.assertEqual(reopened.gui_values["charge_shape"], "Sphere")
+            self.assertEqual(reopened.gui_values["material_name"], "C4")
+            self.assertEqual(reopened.gui_values["charge_refinement_level"], 5)
+            self.assertEqual(reopened.gui_values["buffer_layers"], 5)
+            self.assertEqual(reopened.gui_values["dyn_refine_max"], 4)
+            self.assertEqual(reopened.gui_values["bottom_boundary"], BOUNDARY_SLIP)
+            for key in (
+                "charge_shape",
+                "mass_kg",
+                "rho_charge",
+                "height_of_burst",
+                "cell_size",
+            ):
+                self.assertNotEqual(
+                    reopened.fields[key].provenance,
+                    FieldProvenance.NOT_RECOVERED,
+                    key,
+                )
+            self.assertEqual(source_before, inventory_case(str(source)))
+
+    def test_generated_mass_based_cylinder_round_trip(self):
+        with tempfile.TemporaryDirectory() as td:
+            inputs = replace(
+                CaseInputs2D(),
+                radius=12.0,
+                height=15.0,
+                cell_size=0.5,
+                mass_kg=50.0,
+                rho_charge=1600.0,
+                material_name="C4",
+                charge_shape="Cylinder",
+                charge_aspect=2.5,
+                height_of_burst=4.0,
+                detonation_height=4.0,
+                mesh_mode=DYNAMIC_MESH,
+                charge_seed_mode="Manual",
+                charge_refinement_level=4,
+                buffer_layers=3,
+                dyn_refine_max=3,
+            )
+            generated = Generator2D(td).generate("round_trip_cylinder", inputs)
+            set_fields = Path(generated, "system", "setFieldsDict").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("cylindericalMassToCell", set_fields)
+            reopened = map_imported_case_to_gui(generated)
+            self.assertEqual(reopened.gui_values["charge_shape"], "Cylinder")
+            self.assertAlmostEqual(reopened.gui_values["mass_kg"], 50.0)
+            self.assertAlmostEqual(reopened.gui_values["rho_charge"], 1600.0)
+            self.assertAlmostEqual(reopened.gui_values["charge_aspect"], 2.5)
+            self.assertAlmostEqual(reopened.gui_values["height_of_burst"], 4.0)
+            self.assertAlmostEqual(reopened.gui_values["detonation_height"], 4.0)
+            self.assertAlmostEqual(reopened.gui_values["cell_size"], 0.5, delta=1e-8)
+            self.assertNotIn("mass_kg", reopened.not_recovered_keys)
+
+    def test_same_session_runtime_attach_preserves_validated_controls(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = _make_unmeshed_source(Path(td) / "axisymmetricCharge")
+            state = inspect_imported_axisymmetric_case(str(source))
+            tab = self._make_tab()
+            try:
+                tab.spin_mass.setValue(50.0)
+                tab.spin_density.setValue(1600.0)
+                tab.load_imported_case(state, apply_mapping=False)
+                self.assertAlmostEqual(tab.spin_mass.value(), 50.0)
+                self.assertAlmostEqual(tab.spin_density.value(), 1600.0)
+            finally:
+                tab.close()
+
+    @staticmethod
+    def _make_tab():
+        from tab_2d import Tab2D
+
+        return Tab2D()
 
 
 class ImportUiEditableTests(unittest.TestCase):
