@@ -363,7 +363,8 @@ class RoutingAndExternalLoadTests(unittest.TestCase):
             text = format_external_case_report_2d(state)
             self.assertIn("Initialise Model", text)
             self.assertIn("Wedge patches", text)
-            self.assertIn("generator_2d: never entered", text)
+            self.assertIn("generator_2d fresh case", text)
+            self.assertIn("editable GGUI model", text)
 
     def test_mirrored_external_view_remains_display_only(self):
         from axisymmetric_viewer import mirror_meridional

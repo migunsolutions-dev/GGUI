@@ -125,10 +125,20 @@ def _charge_fits(inputs: CaseInputs2D, domain: AxisymmetricDomain, charge: Physi
     else:
         radial = charge.cylinder_radius_m
         half_height = 0.5 * charge.length_m
+    if radial > domain.effective_radius + 1e-12:
+        return False
+    if zc + half_height > domain.effective_height + 1e-12:
+        return False
+    # VIPER ground burst: complete sphere may be centred on a reflecting bottom
+    # (HOB=0). The computational domain holds the upper hemisphere; do not
+    # require zc - r >= 0 in that case.
+    if zc - half_height >= -1e-12:
+        return True
     return (
-        radial <= domain.effective_radius + 1e-12
-        and zc - half_height >= -1e-12
-        and zc + half_height <= domain.effective_height + 1e-12
+        charge.shape == "Sphere"
+        and inputs.bottom_boundary == BOUNDARY_SLIP
+        and abs(zc) <= 1e-12
+        and abs(float(inputs.charge_center_r)) <= 1e-12
     )
 
 

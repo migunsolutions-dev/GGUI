@@ -236,16 +236,18 @@ class MappingTests(unittest.TestCase):
             self.assertEqual(mapping.gui_values.get("height_of_burst"), 0.0)
             self.assertEqual(mapping.fields["charge_radius"].displayed_value, 0.25)
             self.assertNotEqual(mapping.gui_values.get("material_name"), "TNT")
-            # Mass unrecovered for boundary-intersecting sphere — no native 1 kg.
+            # VIPER: HOB=0 sphere uses full-sphere mass (not half / unrecovered).
             self.assertEqual(
-                mapping.fields["mass_kg"].provenance, FieldProvenance.NOT_RECOVERED
+                mapping.fields["mass_kg"].provenance, FieldProvenance.DERIVED
             )
-            self.assertNotIn("mass_kg", mapping.gui_values)
+            self.assertAlmostEqual(mapping.gui_values["mass_kg"], 104.785, places=2)
+            self.assertTrue(mapping.fields["mass_kg"].editable)
             self.assertEqual(mapping.fields["radial_cells"].displayed_value, 20)
             self.assertEqual(mapping.fields["vertical_cells"].displayed_value, 20)
             self.assertEqual(mapping.gui_values.get("cell_size"), 1.0)
             self.assertIn("end_time_s", mapping.editable_keys)
             self.assertTrue(mapping.fields["end_time_s"].editable)
+            self.assertIn("mass_kg", mapping.editable_keys)
 
     def test_graded_grid_marked_case_defined(self):
         with tempfile.TemporaryDirectory() as td:
@@ -289,7 +291,7 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(mapping.fields["charge_radius"].displayed_value, 0.25)
         self.assertEqual(mapping.gui_values.get("radius"), 20.0)
         self.assertEqual(mapping.gui_values.get("height"), 20.0)
-        self.assertNotIn("mass_kg", mapping.gui_values)
+        self.assertAlmostEqual(mapping.gui_values["mass_kg"], 104.785, places=2)
 
 
 class PrepareWorkflowTests(unittest.TestCase):
@@ -364,7 +366,8 @@ class PrepareWorkflowTests(unittest.TestCase):
             self.assertEqual(seen, ["blockMesh"])
             self.assertEqual(result.mode, ImportMode2D.IMPORTED_2D_FAILED)
 
-    def test_imported_init_never_calls_generator_2d(self):
+    def test_prepare_working_copy_helper_does_not_call_generator(self):
+        """Legacy prepare helper remains non-generative; UI uses generator_2d."""
         with tempfile.TemporaryDirectory() as td:
             source = _make_unmeshed_source(Path(td) / "src")
             dest = Path(td) / "wc"
@@ -428,7 +431,7 @@ class ImportedUiTests(unittest.TestCase):
             self.assertEqual(self.win.tab_2d.input_tabs.tabText(1), "Mesh & AMR")
             self.assertEqual(self.win.tab_2d.input_tabs.tabText(2), "Output & Probes")
             self.assertTrue(self.win.tab_2d.lbl_import_banner.text())
-            self.assertIn("Imported BF case", self.win.tab_2d.lbl_import_banner.text())
+            self.assertIn("Editable GGUI model", self.win.tab_2d.lbl_import_banner.text())
             # Banner is shown when a case is loaded (may not be visible offscreen).
             self.assertFalse(self.win.tab_2d.lbl_import_banner.isHidden())
             # Populated values

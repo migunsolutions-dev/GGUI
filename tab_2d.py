@@ -200,12 +200,14 @@ class Tab2D(QWidget):
             self.viewer.load_case(state.active_case_path)
             self.viewer.set_field(field)
             self.set_simulation_state(SimulationState2D.INITIALIZED)
+            self._set_result_controls_available(True)
         else:
-            msg = "Imported case — ready to initialise (mesh not generated yet)"
-            self.viewer.clear_simulation_view(msg)
+            # Setup Preview from parsed/UI values — do not blank the viewport
+            # merely because polyMesh has not been generated yet.
             self.viewer.is_simulating = False
             self.set_simulation_state(SimulationState2D.DRAFT)
-            self.chk_view_mesh.setToolTip(msg)
+            self._set_result_controls_available(False)
+            self._refresh_derived()
         self._apply_action_buttons()
         self._refresh_info()
 
@@ -227,8 +229,9 @@ class Tab2D(QWidget):
             self.lbl_import_banner.setVisible(False)
         self.btn_initialize.setText("Initialise Model")
         self.btn_initialize.setMinimumWidth(140)
-        self.btn_initialize.setEnabled(True)
+        self.set_simulation_state(SimulationState2D.DRAFT)
         self._apply_enablement()
+        self._apply_action_buttons(running=False, initialized=False)
 
     def clear_external_case(self) -> None:
         self.clear_imported_case()
@@ -257,12 +260,15 @@ class Tab2D(QWidget):
             or ""
         )
         self.lbl_import_banner.setText(
-            f"Imported BF case | Source: {src} | Working case: {wc}"
+            f"Editable GGUI model from BF source | Source: {src} | Generated case: {wc}"
         )
         self.lbl_import_banner.setVisible(True)
         self.lbl_import_banner.setToolTip(
-            f"Source (unchanged):\n{self._imported_case.source_dir}\n\n"
-            f"Working case:\n{self._imported_case.working_copy_dir or self._imported_case.case_dir}"
+            f"Source (read-only, never modified):\n{self._imported_case.source_dir}\n\n"
+            f"GGUI working / generated case:\n"
+            f"{self._imported_case.working_copy_dir or self._imported_case.case_dir}\n\n"
+            "Controls are editable. Initialise Model regenerates a complete case "
+            "via the GGUI 2D generator (canonical ±5° wedge topology)."
         )
 
     def _apply_import_mapping(self, state) -> None:
@@ -311,8 +317,9 @@ class Tab2D(QWidget):
             if vc and vc.displayed_value is not None:
                 self.lbl_vertical_cells.setText(str(int(vc.displayed_value)))
 
-            # Apply editability / unrecovered presentation.
-            self._apply_imported_control_editability(mapping)
+            # Converted BF → editable GGUI model: normal contextual enablement only.
+            self._restore_native_control_editability()
+            self._apply_enablement()
         finally:
             self._loading = False
 
@@ -344,53 +351,41 @@ class Tab2D(QWidget):
             "charge_refinement_level": self.spin_seed_level,
             "buffer_layers": self.spin_seed_buffer,
             "refine_interval": self.spin_refine_interval,
+            "unrefine_interval": self.spin_unrefine_interval,
             "lower_refine_threshold": self.spin_refine_threshold,
             "unrefine_threshold": self.spin_unrefine_threshold,
             "n_buffer_layers_dynamic": self.spin_runtime_buffer,
             "dyn_refine_max": self.spin_runtime_level,
             "dynamic_max_cells": self.spin_max_cells,
             "dump_level": self.chk_dump_level,
+            "refine_probes": self.chk_refine_probes,
             "adjust_time_step": self.chk_adjust,
             "outer_boundary": self.cmb_outer,
             "top_boundary": self.cmb_top,
             "bottom_boundary": self.cmb_bottom,
+            "enable_balancing": self.chk_balancing,
         }.get(key)
 
     def _apply_imported_control_editability(self, mapping) -> None:
-        tip_ro = "Imported case setting — preserved in working copy"
-        tip_nr = "Not recovered from imported case — native default not applied"
-        tip_cd = "Case-defined — preserved in working copy; not representable by this control"
+        """Deprecated read-only policy — converted imports use normal enablement."""
+        self._restore_native_control_editability()
+        self._apply_enablement()
 
-        for key, mf in mapping.fields.items():
-            gui_key = mf.gui_key or key
-            widget = self._widget_for_gui_key(gui_key)
-            if widget is None:
-                continue
-            if mf.provenance == FieldProvenance.NOT_RECOVERED:
-                widget.setEnabled(False)
-                widget.setToolTip(tip_nr + (f": {mf.reason}" if mf.reason else ""))
-                if isinstance(widget, QDoubleSpinBox):
-                    widget.setSpecialValueText("—")
-                    widget.blockSignals(True)
-                    widget.setValue(widget.minimum())
-                    widget.blockSignals(False)
-                continue
-            if mf.provenance == FieldProvenance.CASE_DEFINED or not mf.editable:
-                widget.setEnabled(False)
-                widget.setToolTip(tip_cd if mf.provenance == FieldProvenance.CASE_DEFINED else tip_ro)
-                continue
-            # Editable proven writers
-            widget.setEnabled(True)
-            widget.setToolTip(f"Editable — writes {mf.write_target} in working copy only")
-
-        # cell_size case-defined: keep visible but disabled
-        if "cell_size" in mapping.case_defined_keys or (
-            mapping.get("cell_size")
-            and mapping.get("cell_size").provenance == FieldProvenance.CASE_DEFINED
-        ):
-            self.spin_cell.setEnabled(False)
-            self.spin_cell.setToolTip(tip_cd)
-            self.lbl_effective_domain.setText("Base mesh: case-defined (see blockMeshDict)")
+    def _set_result_controls_available(self, available: bool) -> None:
+        """Disable result-only field/log controls before initialization."""
+        tip = "" if available else "Unavailable until Initialise Model completes"
+        for widget in (self.cmb_field, self.chk_log_scale):
+            widget.setEnabled(bool(available))
+            widget.setToolTip(tip)
+        # Mesh/probe overlays remain available for Setup Preview.
+        self.chk_view_mesh.setEnabled(True)
+        self.chk_view_probes.setEnabled(True)
+        if not available:
+            self.chk_view_mesh.setToolTip("Setup Preview planned grid overlay")
+            self.chk_view_probes.setToolTip("Setup Preview probe markers")
+        else:
+            self.chk_view_mesh.setToolTip("")
+            self.chk_view_probes.setToolTip("")
 
     def _restore_native_control_editability(self) -> None:
         for key in (
@@ -400,10 +395,11 @@ class Tab2D(QWidget):
             "write_interval_steps", "material_name", "charge_shape",
             "initialization_source", "write_control_type", "mesh_mode",
             "charge_seed_mode", "refine_indicator_field", "charge_refinement_level",
-            "buffer_layers", "refine_interval", "lower_refine_threshold",
-            "unrefine_threshold", "n_buffer_layers_dynamic", "dyn_refine_max",
-            "dynamic_max_cells", "dump_level", "adjust_time_step",
-            "outer_boundary", "top_boundary", "bottom_boundary",
+            "buffer_layers", "refine_interval", "unrefine_interval",
+            "lower_refine_threshold", "unrefine_threshold", "n_buffer_layers_dynamic",
+            "dyn_refine_max", "dynamic_max_cells", "dump_level", "refine_probes",
+            "adjust_time_step", "outer_boundary", "top_boundary", "bottom_boundary",
+            "enable_balancing",
         ):
             widget = self._widget_for_gui_key(key)
             if widget is None:
@@ -411,7 +407,7 @@ class Tab2D(QWidget):
             widget.setToolTip("")
             if isinstance(widget, QDoubleSpinBox):
                 widget.setSpecialValueText("")
-            # Actual enablement is owned by _apply_enablement for native mode.
+            # Actual enablement is owned by _apply_enablement.
 
     def mark_initialized(self, case_dir: str, actual_cells: int | None = None) -> None:
         self._active_case_dir = case_dir
@@ -943,7 +939,7 @@ class Tab2D(QWidget):
         self.cmb_time.currentTextChanged.connect(self._on_time_selector_changed)
         self.viewer.times_changed.connect(self._on_viewer_times_changed)
         self.cmb_field.currentTextChanged.connect(self.viewer.set_field)
-        self.chk_view_mesh.toggled.connect(self.viewer.toggle_mesh_lines)
+        self.chk_view_mesh.toggled.connect(self._on_mesh_overlay_toggled)
         self.chk_view_probes.toggled.connect(self._on_probe_view_toggled)
         self.chk_log_scale.toggled.connect(self._on_log_scale_toggled)
         self.btn_fit.clicked.connect(self.viewer.reset_camera)
@@ -1066,7 +1062,16 @@ class Tab2D(QWidget):
     def stop_live_follow_keep_time(self) -> None:
         self.viewer.stop_live_follow_keep_time()
 
+    def _on_mesh_overlay_toggled(self, checked: bool) -> None:
+        if self.viewer.is_simulating:
+            self.viewer.toggle_mesh_lines(bool(checked))
+        else:
+            self._refresh_derived()
+
     def _on_probe_view_toggled(self, checked: bool) -> None:
+        if not self.viewer.is_simulating:
+            self._refresh_derived()
+            return
         probes = [(p.radius, p.height, 0.0) for p in self._probes()]
         self.viewer.toggle_probes(bool(checked), probes)
 
@@ -1075,29 +1080,8 @@ class Tab2D(QWidget):
         self.viewer.force_refresh_view()
 
     def _refresh_derived(self) -> None:
-        if self.is_imported_mode:
-            # Imported display uses mapping/info panel; avoid native mass→radius derivation.
-            try:
-                if self._imported_case and self._imported_case.radius_m and self._imported_case.height_m:
-                    cr = None
-                    hob = self.spin_hob.value()
-                    if self._imported_case.mapping and self._imported_case.mapping.get("charge_radius"):
-                        cr = self._imported_case.mapping.get("charge_radius").displayed_value
-                    self.viewer.update_axisymmetric_preview(
-                        float(self._imported_case.radius_m),
-                        float(self._imported_case.height_m),
-                        {
-                            "shape": self.cmb_shape.currentText(),
-                            "height": hob,
-                            "radius": float(cr) if cr is not None else 0.0,
-                            "length": 0.0,
-                        },
-                        [(p.radius, p.height) for p in self._probes()],
-                    )
-            except Exception:
-                pass
-            self._refresh_info()
-            return
+        # Converted imports use the same live Setup Preview path as native cases
+        # so mass/HOB/mesh edits update geometry immediately.
         try:
             inputs = self.get_case_inputs()
             result = validate_case_inputs_2d(inputs)
@@ -1127,24 +1111,37 @@ class Tab2D(QWidget):
                 self.lbl_seed_plan.setText("Disabled: Fixed Mesh remains uniform.")
             else:
                 self.lbl_seed_plan.setText("Disabled for From 1D mapping.")
-            if domain:
+            if domain and not self.viewer.is_simulating:
                 self.viewer.update_axisymmetric_preview(
                     domain.effective_radius,
                     domain.effective_height,
                     {
                         "shape": inputs.charge_shape,
                         "height": inputs.height_of_burst,
+                        "detonation_height": float(inputs.detonation_height),
                         "radius": radius,
                         "length": charge.length_m,
+                        "show_grid": bool(self.chk_view_mesh.isChecked()),
+                        "cell_size": float(inputs.cell_size),
+                        "seed_level": (
+                            int(result.seed_plan.level_effective)
+                            if result.seed_plan is not None
+                            else int(inputs.charge_refinement_level)
+                        ),
+                        "buffer_layers": int(inputs.buffer_layers),
                     },
                     [(p.radius, p.height) for p in inputs.probes],
                 )
-            self.set_simulation_state(
-                SimulationState2D.VALIDATED if result.valid and self._state == SimulationState2D.DRAFT
-                else self._state
-            )
-        except Exception:
-            pass
+            if not self.is_imported_mode:
+                self.set_simulation_state(
+                    SimulationState2D.VALIDATED
+                    if result.valid and self._state == SimulationState2D.DRAFT
+                    else self._state
+                )
+        except Exception as exc:
+            import sys
+
+            print(f"[2D Setup Preview] {exc}", file=sys.stderr)
         self._refresh_info()
 
     def _refresh_info(self) -> None:
@@ -1443,6 +1440,9 @@ class Tab2D(QWidget):
                 self.chk_begin_unrefine.setChecked(values.get("begin_unrefine") is not None)
                 if values.get("begin_unrefine") is not None:
                     self.spin_begin_unrefine.setValue(values["begin_unrefine"])
+            if "balance_interval" in values and values.get("balance_interval") is not None:
+                self.chk_balancing.setChecked(True)
+                self.spin_balance_interval.setValue(int(values["balance_interval"]))
             if "mirrored_view" in values:
                 self.cmb_view_mode.setCurrentText(
                     "Mirrored View" if values.get("mirrored_view", True)

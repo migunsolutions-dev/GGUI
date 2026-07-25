@@ -1,6 +1,8 @@
 """Map an imported axisymmetric blastFoam case onto Cylindrical–2D GUI fields.
 
-Provenance is explicit per field. Unknown values are NOT filled with native defaults.
+Provenance is explicit per field. Recovered values populate the editable GGUI model.
+Unknown values are not invented from native defaults; permanent GUI controls retain
+their widget defaults so the case remains fully editable and generatable.
 """
 from __future__ import annotations
 
@@ -61,7 +63,9 @@ class ImportMappingResult:
         return self.fields.get(key)
 
 
-# controlDict keys with proven one-to-one writers (working copy only).
+# Legacy controlDict write targets (retained for optional patch helpers).
+# Converted imported cases regenerate via generator_2d; all recovered fields
+# are treated as editable GGUI model inputs.
 EDITABLE_CONTROL_KEYS = {
     "end_time_s": ("system/controlDict", "endTime"),
     "delta_t": ("system/controlDict", "deltaT"),
@@ -70,6 +74,13 @@ EDITABLE_CONTROL_KEYS = {
     "write_interval_time": ("system/controlDict", "writeInterval"),
     "write_interval_steps": ("system/controlDict", "writeInterval"),
 }
+
+
+def full_sphere_mass_kg(radius_m: float, density_kg_m3: float) -> float:
+    """VIPER-compatible nominal full-sphere mass from radius and density."""
+    r = float(radius_m)
+    rho = float(density_kg_m3)
+    return (4.0 / 3.0) * math.pi * (r ** 3) * rho
 
 
 def _parse_macros(text: str) -> Dict[str, float]:
@@ -290,12 +301,17 @@ def _parse_dynamic_mesh(case_dir: str) -> Dict[str, Any]:
         "dynamicFvMesh",
         "errorEstimator",
         "refineInterval",
+        "unrefineInterval",
         "lowerRefineLevel",
         "unrefineLevel",
         "nBufferLayers",
         "maxRefinement",
         "maxCells",
         "dumpLevel",
+        "refineProbes",
+        "beginUnrefine",
+        "enableBalancing",
+        "balanceInterval",
     ):
         m = re.search(rf"\b{key}\s+([^;]+);", text)
         if m:
@@ -577,20 +593,17 @@ def map_imported_case_to_gui(
 
     charge_r = setfields.get("radius")
     if charge_r is not None and shape == "Sphere":
-        # Native GUI stores mass; radius is derived. For import we store a
-        # synthetic mass that reproduces radius ONLY when full-sphere is valid.
-        # Sphere at (0,0,0) with ground at y=0 intersects the domain boundary —
-        # do not invent mass.
-        intersects_boundary = False
-        if centre is not None and height is not None and radius is not None:
+        # VIPER convention: Mass is always the nominal complete-sphere mass.
+        # HOB=0 on a reflecting bottom is valid — the computational half-domain
+        # contains one hemisphere; do not halve mass/radius.
+        off_axis = False
+        past_top = False
+        if centre is not None:
             cy = float(centre[1])
-            if cy - float(charge_r) < -1e-12 or cy + float(charge_r) > float(height) + 1e-12:
-                intersects_boundary = True
             if float(centre[0]) ** 2 + (float(centre[2]) if len(centre) > 2 else 0.0) ** 2 > 1e-18:
-                intersects_boundary = True
-            # Centre on ground plane with positive radius → half outside.
-            if abs(cy) < 1e-12 and float(charge_r) > 0:
-                intersects_boundary = True
+                off_axis = True
+            if height is not None and cy + float(charge_r) > float(height) + 1e-12:
+                past_top = True
         _add(
             result,
             "charge_radius",
@@ -600,44 +613,41 @@ def map_imported_case_to_gui(
             apply_gui=False,
             reason="setFieldsDict sphereToCell radius",
         )
-        if intersects_boundary:
+        rho = phases.get("rho0")
+        if off_axis or past_top:
             _add(
                 result,
                 "mass_kg",
                 None,
                 FieldProvenance.NOT_RECOVERED,
                 source_file=setfields.get("path", ""),
-                reason=(
-                    "sphere intersects domain boundary — full-sphere mass formula unsafe"
-                ),
+                reason="sphere centre off-axis or past domain top — mass not derived",
                 apply_gui=False,
             )
             notes.append(
                 f"Charge radius {charge_r} m loaded; mass left unrecovered "
-                "(sphere intersects domain boundary)."
+                "(unsafe centre placement for VIPER full-sphere mass)."
+            )
+        elif rho:
+            mass = full_sphere_mass_kg(float(charge_r), float(rho))
+            _add(
+                result,
+                "mass_kg",
+                mass,
+                FieldProvenance.DERIVED,
+                source_file=setfields.get("path", "") + " + phaseProperties",
+                reason="VIPER full-sphere mass = (4/3)π r³ ρ (HOB=0 does not halve)",
+                editable=True,
             )
         else:
-            # Safe full-sphere mass only when density known and fully inside.
-            rho = phases.get("rho0")
-            if rho:
-                mass = (4.0 / 3.0) * math.pi * (float(charge_r) ** 3) * float(rho)
-                _add(
-                    result,
-                    "mass_kg",
-                    mass,
-                    FieldProvenance.DERIVED,
-                    source_file=setfields.get("path", "") + " + phaseProperties",
-                    reason="full sphere volume × rho0",
-                )
-            else:
-                _add(
-                    result,
-                    "mass_kg",
-                    None,
-                    FieldProvenance.NOT_RECOVERED,
-                    reason="density unavailable for mass derivation",
-                    apply_gui=False,
-                )
+            _add(
+                result,
+                "mass_kg",
+                None,
+                FieldProvenance.NOT_RECOVERED,
+                reason="density unavailable for mass derivation",
+                apply_gui=False,
+            )
     elif charge_r is not None:
         _add(
             result,
@@ -802,20 +812,131 @@ def map_imported_case_to_gui(
             apply_gui=False,
         )
 
-    # Boundaries — only when proven equivalent (conservative: leave unrecovered).
-    for key, label in (
-        ("outer_boundary", "outlet/outer"),
-        ("top_boundary", "top"),
-        ("bottom_boundary", "ground/bottom"),
-    ):
-        _add(
-            result,
-            key,
-            None,
-            FieldProvenance.NOT_RECOVERED,
-            reason=f"OpenFOAM BC for {label} has no proven GGUI Open/Reflecting equivalent",
-            apply_gui=False,
+    # Boundaries: prefer 0/ field BC types (authoritative physics), then blockMeshDict.
+    # Official axisymmetricCharge uses ground type patch + U=slip / p=zeroGradient.
+    bm_text = ""
+    if block.get("path") and os.path.isfile(block["path"]):
+        bm_text = _strip(_read_text(block["path"]))
+
+    def _field_boundary_text(*candidates: str) -> Tuple[str, str]:
+        for folder in ("0", "0.orig"):
+            for fname in candidates:
+                path = os.path.join(case_dir, folder, fname)
+                if os.path.isfile(path):
+                    return _strip(_read_text(path)), path
+        return "", ""
+
+    u_text, u_path = _field_boundary_text("U", "U.orig")
+    p_text, p_path = _field_boundary_text("p", "p.orig")
+
+    def _bc_type_for_patch(text: str, patch: str) -> Optional[str]:
+        if not text:
+            return None
+        m = re.search(
+            rf"\b{re.escape(patch)}\s*\{{[^}}]*?type\s+(\w+)\s*;",
+            text,
+            re.IGNORECASE | re.DOTALL,
         )
+        return m.group(1) if m else None
+
+    def _boundary_from_fields(names: Tuple[str, ...]) -> Tuple[Optional[str], str]:
+        reflecting = {
+            "slip",
+            "symmetry",
+            "symmetryplane",
+            "wall",
+            "noSlip",
+            "fixedValue",
+        }
+        openish = {
+            "pressureWaveTransmissive",
+            "waveTransmissive",
+            "inletOutlet",
+            "zeroGradient",
+            "freestream",
+        }
+        for name in names:
+            ut = _bc_type_for_patch(u_text, name)
+            pt = _bc_type_for_patch(p_text, name)
+            if ut and ut.lower() in {x.lower() for x in reflecting}:
+                # zeroGradient on U is not reflecting; slip/wall/symmetry are.
+                if ut.lower() == "zerogradient":
+                    pass
+                else:
+                    src = u_path or "0/U"
+                    return "Reflecting slip wall", f"{src}:{name} type {ut}"
+            if pt and pt in openish:
+                src = p_path or "0/p"
+                return "Open", f"{src}:{name} type {pt}"
+            if ut and ut in openish:
+                src = u_path or "0/U"
+                return "Open", f"{src}:{name} type {ut}"
+        return None, ""
+
+    def _boundary_from_patch(names: Tuple[str, ...], default: Optional[str] = None) -> Optional[str]:
+        for name in names:
+            m = re.search(
+                rf"\b{name}\s*\{{[^}}]*?type\s+(\w+)\s*;",
+                bm_text,
+                re.IGNORECASE | re.DOTALL,
+            )
+            if not m:
+                continue
+            ptype = m.group(1).lower()
+            if ptype in ("wall", "symmetryplane", "symmetry"):
+                return "Reflecting slip wall"
+            if ptype in ("patch", "inletoutlet", "wavetransmissive", "zerogradient"):
+                # Ambiguous: many reflecting grounds are still type patch.
+                return None
+        return default
+
+    bottom_names = ("ground", "bottom", "floor")
+    outer_names = ("outer", "outerRadius", "outlet", "sides")
+    top_names = ("top", "atmosphere", "sky")
+
+    bottom_bc, bottom_reason = _boundary_from_fields(bottom_names)
+    if bottom_bc is None:
+        bottom_bc = _boundary_from_patch(bottom_names, "Reflecting slip wall")
+        bottom_reason = "blockMeshDict patch type → GGUI Reflecting (default/ground)"
+        if bottom_bc == "Open":
+            bottom_reason = "blockMeshDict patch type → GGUI Open"
+
+    outer_bc, outer_reason = _boundary_from_fields(outer_names)
+    if outer_bc is None:
+        outer_bc = _boundary_from_patch(outer_names, "Open") or "Open"
+        outer_reason = "blockMeshDict / default → Open"
+
+    top_bc, top_reason = _boundary_from_fields(top_names)
+    if top_bc is None:
+        # Tutorial often merges top into outlet — inherit Open when unrecovered.
+        mapped_top = _boundary_from_patch(top_names, None)
+        top_bc = mapped_top if mapped_top is not None else "Open"
+        top_reason = "blockMeshDict / default → Open (top may share outlet)"
+
+    for key, val, label, reason in (
+        ("bottom_boundary", bottom_bc, "ground/bottom", bottom_reason),
+        ("outer_boundary", outer_bc, "outlet/outer", outer_reason),
+        ("top_boundary", top_bc, "top", top_reason),
+    ):
+        if val is None:
+            _add(
+                result,
+                key,
+                None,
+                FieldProvenance.NOT_RECOVERED,
+                reason=f"OpenFOAM BC for {label} not mapped",
+                apply_gui=False,
+            )
+        else:
+            _add(
+                result,
+                key,
+                val,
+                FieldProvenance.DERIVED,
+                source_file=(u_path or p_path or block.get("path", "")),
+                editable=True,
+                reason=reason or f"boundary mapping for {label}",
+            )
 
     # Solver / controlDict — editable when keys exist
     def _float_ctrl(of_key: str, gui_key: str) -> None:
@@ -930,8 +1051,8 @@ def map_imported_case_to_gui(
             adj,
             FieldProvenance.DIRECT,
             source_file=control.get("path", ""),
-            editable=False,
-            reason="imported adjustTimeStep — preserved; no dedicated writer yet",
+            editable=True,
+            reason="Recovered for editable GGUI model",
         )
 
     # Mesh / AMR
@@ -978,6 +1099,7 @@ def map_imported_case_to_gui(
                 )
         for of_key, gui_key, cast in (
             ("refineInterval", "refine_interval", int),
+            ("unrefineInterval", "unrefine_interval", int),
             ("lowerRefineLevel", "lower_refine_threshold", float),
             ("unrefineLevel", "unrefine_threshold", float),
             ("nBufferLayers", "n_buffer_layers_dynamic", int),
@@ -1004,8 +1126,8 @@ def map_imported_case_to_gui(
                 val,
                 FieldProvenance.DIRECT,
                 source_file=dyn["path"],
-                editable=False,
-                reason="Imported case setting — preserved in working copy",
+                editable=True,
+                reason="Recovered for editable GGUI model",
             )
         if "dumpLevel" in dyn:
             dump = str(dyn["dumpLevel"]).lower() in ("true", "yes", "on", "1")
@@ -1015,9 +1137,59 @@ def map_imported_case_to_gui(
                 dump,
                 FieldProvenance.DIRECT,
                 source_file=dyn["path"],
-                editable=False,
-                reason="Imported case setting — preserved in working copy",
+                editable=True,
+                reason="Recovered for editable GGUI model",
             )
+        if "refineProbes" in dyn:
+            rp = str(dyn["refineProbes"]).lower() in ("true", "yes", "on", "1")
+            _add(
+                result,
+                "refine_probes",
+                rp,
+                FieldProvenance.DIRECT,
+                source_file=dyn["path"],
+                editable=True,
+                reason="dynamicMeshDict Switch refineProbes",
+            )
+        if "beginUnrefine" in dyn:
+            try:
+                _add(
+                    result,
+                    "begin_unrefine",
+                    float(dyn["beginUnrefine"]),
+                    FieldProvenance.DIRECT,
+                    source_file=dyn["path"],
+                    editable=True,
+                    reason="Recovered for editable GGUI model",
+                )
+            except ValueError:
+                pass
+        if "enableBalancing" in dyn or "balance" in dyn:
+            raw_bal = dyn.get("enableBalancing", dyn.get("balance"))
+            if raw_bal is not None:
+                bal = str(raw_bal).lower() in ("true", "yes", "on", "1")
+                _add(
+                    result,
+                    "enable_balancing",
+                    bal,
+                    FieldProvenance.DIRECT,
+                    source_file=dyn["path"],
+                    editable=True,
+                    reason="Recovered for editable GGUI model",
+                )
+        if "balanceInterval" in dyn:
+            try:
+                _add(
+                    result,
+                    "balance_interval",
+                    int(dyn["balanceInterval"]),
+                    FieldProvenance.DIRECT,
+                    source_file=dyn["path"],
+                    editable=True,
+                    reason="Recovered for editable GGUI model",
+                )
+            except ValueError:
+                pass
         # Startup refinement from setFields
         if setfields.get("level") is not None:
             _add(
@@ -1027,6 +1199,7 @@ def map_imported_case_to_gui(
                 FieldProvenance.DERIVED,
                 source_file=setfields.get("path", ""),
                 reason=f"setFieldsDict level {setfields['level']}",
+                editable=True,
             )
             _add(
                 result,
@@ -1034,8 +1207,8 @@ def map_imported_case_to_gui(
                 int(setfields["level"]),
                 FieldProvenance.DIRECT,
                 source_file=setfields.get("path", ""),
-                editable=False,
-                reason="Imported case setting — preserved in working copy",
+                editable=True,
+                reason="Recovered for editable GGUI model",
             )
         if setfields.get("nBufferLayers") is not None:
             _add(
@@ -1044,8 +1217,8 @@ def map_imported_case_to_gui(
                 int(setfields["nBufferLayers"]),
                 FieldProvenance.DIRECT,
                 source_file=setfields.get("path", ""),
-                editable=False,
-                reason="Imported case setting — preserved in working copy",
+                editable=True,
+                reason="Recovered for editable GGUI model",
             )
     else:
         _add(
@@ -1063,6 +1236,16 @@ def map_imported_case_to_gui(
     if not os.path.isfile(probes_path):
         notes.append("No compatible probe table found — probe list left empty.")
 
+    # Converted imported cases are fully editable GGUI models: mark every
+    # recovered DIRECT/DERIVED field that applies to the GUI as editable.
+    for key, mf in list(result.fields.items()):
+        if (
+            mf.provenance in (FieldProvenance.DIRECT, FieldProvenance.DERIVED)
+            and mf.displayed_value is not None
+            and (mf.gui_key or key) in result.gui_values
+        ):
+            mf.editable = True
+
     # Summaries
     case_defined = []
     not_recovered = []
@@ -1075,15 +1258,15 @@ def map_imported_case_to_gui(
             not_recovered.append(key)
         if mf.editable:
             editable.append(key)
-        elif mf.provenance in (
-            FieldProvenance.DIRECT,
-            FieldProvenance.DERIVED,
-            FieldProvenance.CASE_DEFINED,
-        ):
+        elif mf.provenance == FieldProvenance.CASE_DEFINED:
             read_only.append(key)
     result.case_defined_keys = tuple(sorted(case_defined))
     result.not_recovered_keys = tuple(sorted(not_recovered))
     result.editable_keys = tuple(sorted(editable))
     result.read_only_keys = tuple(sorted(read_only))
+    notes.append(
+        "Converted editable GGUI model: Initialise Model regenerates a fresh case "
+        "via generator_2d (source remains read-only)."
+    )
     result.notes = tuple(notes)
     return result

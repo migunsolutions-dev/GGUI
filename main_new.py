@@ -992,106 +992,181 @@ class BlastFoamApp(QMainWindow):
         dialog.exec_()
 
     def on_initialize_imported_model_2d(self) -> None:
-        """Whitelisted preparation inside the automatic working case only."""
+        """Regenerate a complete GGUI 2D case from the editable imported model.
+
+        The BF source directory stays read-only. Initialise Model never patches
+        or prepares the copied source dictionaries as the runtime case.
+        """
         ext = getattr(self.tab_2d, "_imported_case", None)
-        if ext is None or not ext.working_copy_dir:
+        if ext is None:
             QMessageBox.warning(
                 self, "Initialise Model", "No imported working case is attached."
             )
             return
-        source = ext.source_dir or ""
-        wc = ext.working_copy_dir
-        if os.path.normpath(wc) == os.path.normpath(source):
+        source = os.path.normpath(ext.source_dir or "")
+        if not source or not os.path.isdir(source):
             QMessageBox.critical(
-                self,
-                "Initialise Model",
-                "Refusing to initialise the source case in place.",
+                self, "Initialise Model", "Source case path is missing."
             )
             return
-        try:
-            commands = preparation_commands_for_case(wc)
-        except Exception as exc:
-            QMessageBox.critical(self, "Initialise Model", str(exc))
+
+        inputs = self.tab_2d.get_case_inputs()
+        if not isinstance(inputs, CaseInputs2D):
+            return
+        checked = validate_case_inputs_2d(inputs)
+        if not checked.valid:
+            QMessageBox.critical(
+                self, "2D Preflight", "\n".join(checked.errors)
+            )
+            self.status_bar.set_status("2D validation failed", "#e74c3c")
             return
 
         self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_INITIALIZING)
-        self.status_bar.set_status("Initialising imported case…", "#f39c12")
-
-        def progress(name: str) -> None:
-            self.tab_2d.set_prepare_progress(name)
-            self.status_bar.set_status(f"Initialising: {name}", "#f39c12")
-
-        result = prepare_working_copy(
-            working_copy_dir=wc,
-            source_dir=source,
-            run_utility=self._run_of_utility,
-            commands=commands,
-            progress=progress,
-        )
+        self.status_bar.set_status("Generating GGUI case from imported model…", "#f39c12")
+        QApplication.processEvents()
 
         try:
-            state = inspect_imported_axisymmetric_case(
-                wc,
-                source_dir=source,
-                working_copy_dir=wc,
-                mode=(
-                    ImportMode2D.IMPORTED_2D_READY
-                    if result.ok
-                    else ImportMode2D.IMPORTED_2D_FAILED
-                ),
-            )
-        except Exception as exc:
-            self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_FAILED)
-            QMessageBox.critical(self, "Initialise Failed", str(exc))
-            return
+            case_root = self._resolved_case_root()
+            src_base = os.path.basename(source.rstrip("\\/")) or "imported"
+            # Prefer a fresh generated revision when a previous generated case exists.
+            case_name = self.service.make_case_name(f"Case_2D_from_{src_base}")
+            case_dir = self.service.generate_case(case_name, inputs)
+            if os.path.normpath(case_dir) == source:
+                raise RuntimeError("Refusing to generate into the source directory.")
+            # Prefer the generator instance created by generate_case; fall back
+            # so initialization_command remains available if generate was wrapped.
+            gen2d = self.service.generator_2d
+            if gen2d is None:
+                from generator_2d import Generator2D
 
-        state.prepare_commands = result.commands
-        state.prepare_results = {r.name: r.exit_code for r in result.results}
-        state.check_mesh_ok = result.check_mesh_ok
-        state.charge_cell_count = result.charge_cell_count
-        if result.cell_count is not None:
-            state.cell_count = result.cell_count
-            state.cell_count_source = result.cell_count_source
-            state.mesh_owner_path = result.mesh_owner_path
-        if result.ok:
-            state.mode = ImportMode2D.IMPORTED_2D_READY
+                gen2d = Generator2D(case_root, self.openfoam_bashrc)
+                self.service.generator_2d = gen2d
+            command = gen2d.initialization_command(inputs)
+            success = self._run_wsl_commands(case_dir, command)
+            if not success:
+                self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_FAILED)
+                self.active_case_initialized_2d = False
+                self.status_bar.set_status("2D Init Failed", "#e74c3c")
+                QMessageBox.critical(
+                    self,
+                    "Initialise Model Failed",
+                    "blockMesh / setRefinedFields / checkMesh failed in the "
+                    "generated GGUI case. See log.initialize. Source was not modified.",
+                )
+                return
+
+            # Require checkMesh "Mesh OK" before marking the case initialized.
+            check_ok = False
+            for log_name in ("log.checkMesh", "log.initialize"):
+                log_path = os.path.join(case_dir, log_name)
+                if os.path.isfile(log_path):
+                    with open(log_path, encoding="utf-8", errors="ignore") as handle:
+                        text = handle.read()
+                    if "Mesh OK" in text:
+                        check_ok = True
+                        break
+            if not check_ok:
+                self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_FAILED)
+                self.active_case_initialized_2d = False
+                self.status_bar.set_status("2D Init Failed — Mesh not OK", "#e74c3c")
+                QMessageBox.critical(
+                    self,
+                    "Initialise Model Failed",
+                    "checkMesh did not report Mesh OK in the generated GGUI case.\n"
+                    "Source was not modified. See log.checkMesh / log.initialize.",
+                )
+                return
+            actual_cells = self._count_poly_mesh_cells(case_dir)
+            charge_cells = None
+            alpha_path = os.path.join(case_dir, "0", "alpha.c4")
+            if os.path.isfile(alpha_path):
+                try:
+                    from axisymmetric_viewer import AxisymmetricViewerWidget
+
+                    # Best-effort: count α>0.5 from ASCII field when available.
+                    atxt = open(alpha_path, encoding="utf-8", errors="ignore").read()
+                    import re as _re
+
+                    m = _re.search(
+                        r"internalField\s+nonuniform\s+List<scalar>\s*\n\s*(\d+)\s*\n\((.*?)\)",
+                        atxt,
+                        _re.S,
+                    )
+                    if m:
+                        vals = [float(x) for x in m.group(2).split() if x[:1].isdigit() or x[:1] == "-"]
+                        charge_cells = sum(1 for v in vals if v > 0.5)
+                except Exception:
+                    charge_cells = None
+
+            state = inspect_imported_axisymmetric_case(
+                case_dir,
+                source_dir=source,
+                working_copy_dir=case_dir,
+                mode=ImportMode2D.IMPORTED_2D_READY,
+            )
+            state.prepare_commands = tuple(
+                p.strip() for p in command.replace("&&", ";").split(";") if p.strip()
+            )
+            state.prepare_results = {
+                "blockMesh": 0,
+                "setRefinedFields": 0 if "setRefinedFields" in command else None,
+                "setFields": 0 if "setFields" in command and "setRefinedFields" not in command else None,
+                "checkMesh": 0 if check_ok else 1,
+            }
+            state.prepare_results = {
+                k: v for k, v in state.prepare_results.items() if v is not None
+            }
+            state.check_mesh_ok = check_ok
+            state.charge_cell_count = charge_cells
+            if actual_cells is not None:
+                state.cell_count = actual_cells
+                state.cell_count_source = "generated polyMesh owner"
             state.mesh_present = True
             state.viewable = True
             state.runnable = True
+            state.mode = ImportMode2D.IMPORTED_2D_READY
+
             self.tab_2d.load_imported_case(state)
-            self.active_case_dir_2d = wc
+            self.active_case_dir_2d = case_dir
             self.active_case_initialized_2d = True
-            self.status_bar.set_status("Imported case initialized", "#27ae60")
+            selected_field = self.tab_2d.cmb_field.currentText().strip() or "p"
+            self.tab_2d.viewer.set_axisymmetric_domain(inputs.radius, inputs.height)
+            self.tab_2d.viewer.load_case(
+                case_dir,
+                charge_center=(0.0, inputs.height_of_burst, 0.0),
+                cell_size=inputs.cell_size,
+            )
+            self.tab_2d.cmb_field.blockSignals(True)
+            if self.tab_2d.cmb_field.findText(selected_field) >= 0:
+                self.tab_2d.cmb_field.setCurrentText(selected_field)
+            self.tab_2d.cmb_field.blockSignals(False)
+            self.tab_2d.viewer.set_field(selected_field)
+            self.tab_2d._set_result_controls_available(True)
+            self.tab_2d.mark_initialized(case_dir, actual_cells)
+            self.status_bar.set_status("GGUI case generated from import", "#27ae60")
             codes = ", ".join(f"{k}={v}" for k, v in state.prepare_results.items())
             QMessageBox.information(
                 self,
-                "Imported Case Initialized",
-                "Preparation succeeded.\n\n"
+                "Case Initialized",
+                "Fresh GGUI case generated from the editable imported model.\n\n"
+                f"Source (unchanged):\n{source}\n\n"
+                f"Generated case:\n{case_dir}\n\n"
+                f"Init plan: {command}\n"
                 f"Exit codes: {codes}\n"
-                f"checkMesh: {'Mesh OK' if result.check_mesh_ok else 'FAILED'}\n"
-                f"Cells: {result.cell_count} ({result.cell_count_source})\n"
-                f"Owner: {result.mesh_owner_path}\n"
-                f"Charge cells (α.c4>0): {result.charge_cell_count}\n\n"
-                "exact END will run blastFoam directly in the working case.",
+                f"checkMesh: {'Mesh OK' if check_ok else 'see log'}\n"
+                f"Cells: {actual_cells}\n"
+                f"Charge cells (α.c4>0): {charge_cells}\n\n"
+                "exact END runs blastFoam in the generated GGUI case only.",
             )
             self._show_load_summary_dialog_2d(state)
-        else:
-            state.mode = ImportMode2D.IMPORTED_2D_FAILED
-            state.viewable = False
-            state.runnable = False
-            self.tab_2d.load_imported_case(state)
+        except Exception as exc:
+            self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_FAILED)
             self.active_case_initialized_2d = False
             self.status_bar.set_status("Imported init failed", "#e74c3c")
-            codes = ", ".join(f"{k}={v}" for k, v in state.prepare_results.items())
-            QMessageBox.critical(
-                self,
-                "Initialise Model Failed",
-                f"{result.reason}\n\nExit codes: {codes or '(none)'}\n"
-                "Logs are retained in the working case (log.<utility>).",
-            )
+            QMessageBox.critical(self, "Initialise Model Failed", str(exc))
 
     def run_imported_2d_exact_end(self) -> None:
-        """Direct blastFoam in the imported working case — never generator_2d."""
+        """Direct blastFoam in the generated GGUI case (never the BF source)."""
         ext = getattr(self.tab_2d, "_imported_case", None)
         if ext is None or ext.mode != ImportMode2D.IMPORTED_2D_READY:
             QMessageBox.warning(
@@ -1507,7 +1582,7 @@ class BlastFoamApp(QMainWindow):
     def on_initialize_model_2d(self, inputs):
         """Generate and initialize one validated axisymmetric wedge case.
 
-        Imported working cases use the separate preparation path — never generator_2d.
+        Converted imported models regenerate via generator_2d into a fresh case.
         """
         if getattr(self.tab_2d, "is_imported_mode", False):
             self.on_initialize_imported_model_2d()

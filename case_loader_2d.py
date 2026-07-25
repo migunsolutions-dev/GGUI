@@ -353,7 +353,14 @@ def format_imported_case_report_2d(state: ImportedCase2DState) -> str:
         for key in sorted(mapping.fields):
             mf = mapping.fields[key]
             val = "—" if mf.displayed_value is None else mf.displayed_value
-            edit = "editable" if mf.editable else "read-only"
+            if mf.editable:
+                edit = "editable"
+            elif mf.provenance == FieldProvenance.CASE_DEFINED:
+                edit = "case-defined"
+            elif mf.provenance == FieldProvenance.NOT_RECOVERED:
+                edit = "unrecovered"
+            else:
+                edit = "info"
             lines.append(
                 f"  {key}: {val}  [{mf.provenance.value}|{edit}]"
                 + (f"  src={mf.source_file}" if mf.source_file else "")
@@ -369,14 +376,16 @@ def format_imported_case_report_2d(state: ImportedCase2DState) -> str:
     else:
         lines.append("  (none)")
 
-    lines.extend(["", "5. Case-defined / disabled controls"])
+    lines.extend(["", "5. Case-defined (kept for report; controls remain editable)"])
     if mapping and mapping.case_defined_keys:
         for key in mapping.case_defined_keys:
             lines.append(f"  - {key}")
     else:
         lines.append("  (none)")
 
-    lines.extend(["", "6. Not recovered (no native defaults applied)"])
+    lines.extend(
+        ["", "6. Not recovered from source (permanent GUI defaults remain available)"]
+    )
     if mapping and mapping.not_recovered_keys:
         for key in mapping.not_recovered_keys:
             mf = mapping.fields.get(key)
@@ -388,16 +397,24 @@ def format_imported_case_report_2d(state: ImportedCase2DState) -> str:
     lines.extend(["", "7. Initialization / solver compatibility"])
     lines.append(
         f"  Initialise Model: "
-        f"{'allowed (imported prepare path)' if state.initialize_allowed else 'blocked'}"
+        f"{'allowed (GGUI generator path)' if state.initialize_allowed else 'blocked'}"
     )
     lines.append(
         f"  exact END: "
         f"{'allowed after ready' if state.mode == ImportMode2D.IMPORTED_2D_READY else 'disabled until initialized'}"
     )
-    lines.append("  generator_2d: never entered for imported cases")
-    lines.append("  Solver path: direct blastFoam in working case only")
+    lines.append(
+        "  Architecture: BF source → editable GGUI model → generator_2d fresh case"
+    )
+    lines.append("  Source directory: never modified")
+    lines.append("  Solver path: blastFoam in the generated GGUI case only")
+    lines.append("  Topology: canonical GGUI ±5° wedge (not user-editable)")
     for note in state.compatibility_notes:
         lines.append(f"  - {note}")
+    if mapping and mapping.notes:
+        lines.extend(["", "8. Mapping notes"])
+        for note in mapping.notes:
+            lines.append(f"  - {note}")
     return "\n".join(lines) + "\n"
 
 

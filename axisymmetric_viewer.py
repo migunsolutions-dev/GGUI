@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Iterable, List, Optional, Tuple
 
@@ -478,6 +479,46 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
             line_width=2,
         )
 
+        # Planned base grid (optional overlay — not a solver mesh).
+        if charge.get("show_grid"):
+            dx = float(charge.get("cell_size") or 0.0)
+            if dx > 0 and math.isfinite(dx):
+                nr = max(1, int(round(radius / dx)))
+                nz = max(1, int(round(height / dx)))
+                # Cap line count for interactive preview.
+                step_r = max(1, nr // 40)
+                step_z = max(1, nz // 40)
+                for i in range(0, nr + 1, step_r):
+                    x = min(radius, i * dx)
+                    self._plotter.add_mesh(
+                        pv.Line((x, 0.0, 0.0), (x, height, 0.0)),
+                        color="#bdc3c7",
+                        line_width=1,
+                        opacity=0.55,
+                    )
+                    if self.mirrored_view and x > 0:
+                        self._plotter.add_mesh(
+                            pv.Line((-x, 0.0, 0.0), (-x, height, 0.0)),
+                            color="#bdc3c7",
+                            line_width=1,
+                            opacity=0.35,
+                        )
+                for j in range(0, nz + 1, step_z):
+                    y = min(height, j * dx)
+                    self._plotter.add_mesh(
+                        pv.Line((r0, y, 0.0), (radius, y, 0.0)),
+                        color="#bdc3c7",
+                        line_width=1,
+                        opacity=0.55,
+                    )
+
+        # Reflecting bottom / ground marker.
+        self._plotter.add_mesh(
+            pv.Line((r0, 0.0, 0.0), (radius, 0.0, 0.0)),
+            color="#8e44ad",
+            line_width=3,
+        )
+
         zc = float(charge.get("height", 0.0))
         cr = float(charge.get("radius", 0.0))
         if charge.get("shape") == "Cylinder":
@@ -496,12 +537,24 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
             if self.mirrored_view:
                 theta = np.linspace(0.0, 2.0 * np.pi, 160)
             else:
-                theta = np.linspace(-0.5 * np.pi, 0.5 * np.pi, 96)
+                # Computational half: r>=0; for HOB=0 show upper semicircle y>=0.
+                if abs(zc) <= 1e-12:
+                    theta = np.linspace(0.0, 0.5 * np.pi, 96)
+                else:
+                    theta = np.linspace(-0.5 * np.pi, 0.5 * np.pi, 96)
             points = np.column_stack(
                 (cr * np.cos(theta), zc + cr * np.sin(theta), np.zeros_like(theta))
             )
         outline = pv.lines_from_points(points, close=True)
         self._plotter.add_mesh(outline, color="#e74c3c", line_width=3)
+
+        # Detonation point (on axis). Prefer explicit detonation height.
+        det_y = float(charge.get("detonation_height", zc))
+        det_r = max(0.004, min(radius, height) * 0.012)
+        self._plotter.add_mesh(
+            pv.Sphere(radius=det_r, center=(0.0, det_y, 0.0)),
+            color="#e67e22",
+        )
 
         for r, z in probes:
             marker = pv.Sphere(
@@ -515,8 +568,12 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
                     center=(-r, z, 0.0),
                 )
                 self._plotter.add_mesh(mirror, color="yellow", opacity=0.45)
+        seed_level = charge.get("seed_level")
+        label = "Setup preview — not solver contours"
+        if seed_level is not None:
+            label += f" | planned seed L{seed_level}"
         self._plotter.add_text(
-            "Setup preview — not solver contours",
+            label,
             position="upper_left",
             color="black",
             font_size=9,
