@@ -261,7 +261,7 @@ def inspect_imported_axisymmetric_case(
 
     prepare_cmds: Tuple[str, ...] = ()
     try:
-        prepare_cmds = preparation_commands_for_case(case_dir)
+        prepare_cmds = tuple(cmd.display() for cmd in preparation_commands_for_case(case_dir))
     except Exception:
         prepare_cmds = ()
 

@@ -134,18 +134,23 @@ class AllrunSequenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = _make_unmeshed_source(Path(td))
             seq = parse_allrun_preprocess_sequence(str(root))
-            self.assertEqual(seq, ("blockMesh", "setRefinedFields"))
+            self.assertEqual(tuple(c.utility for c in seq), ("blockMesh", "setRefinedFields"))
             cmds = preparation_commands_for_case(str(root))
-            self.assertEqual(cmds, ("blockMesh", "setRefinedFields", "checkMesh"))
+            self.assertEqual(
+                tuple(c.display() for c in cmds),
+                ("blockMesh", "setRefinedFields", "checkMesh"),
+            )
 
     def test_arbitrary_allrun_commands_never_executed(self):
+        from allrun_commands import AllrunParseError
+
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             _write(
                 root / "Allrun",
                 "#!/bin/sh\nrunApplication blockMesh\nrunApplication curl http://evil\n",
             )
-            with self.assertRaises(ValueError):
+            with self.assertRaises(AllrunParseError):
                 parse_allrun_preprocess_sequence(str(root))
 
 
@@ -295,7 +300,12 @@ class MappingTests(unittest.TestCase):
 
 
 class PrepareWorkflowTests(unittest.TestCase):
-    def _runner_ok(self, case_dir, utility):
+    @staticmethod
+    def _utility_name(command):
+        return getattr(command, "utility", str(command))
+
+    def _runner_ok(self, case_dir, command):
+        utility = self._utility_name(command)
         if utility == "blockMesh":
             mesh = Path(case_dir) / "constant" / "polyMesh"
             for name in ("points", "faces", "owner", "neighbour", "boundary"):
@@ -333,9 +343,9 @@ class PrepareWorkflowTests(unittest.TestCase):
             create_working_copy(str(source), str(dest), str(REPO))
             seen = []
 
-            def runner(case_dir, utility):
-                seen.append((os.path.normpath(case_dir), utility))
-                return self._runner_ok(case_dir, utility)
+            def runner(case_dir, command):
+                seen.append((os.path.normpath(case_dir), self._utility_name(command)))
+                return self._runner_ok(case_dir, command)
 
             result = prepare_working_copy(str(dest), str(source), runner)
             self.assertTrue(result.ok)
@@ -355,7 +365,8 @@ class PrepareWorkflowTests(unittest.TestCase):
             create_working_copy(str(source), str(dest), str(REPO))
             seen = []
 
-            def runner(case_dir, utility):
+            def runner(case_dir, command):
+                utility = self._utility_name(command)
                 seen.append(utility)
                 if utility == "blockMesh":
                     return 1, "FAILED"

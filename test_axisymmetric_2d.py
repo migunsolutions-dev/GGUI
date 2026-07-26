@@ -18,9 +18,12 @@ from models_2d import CaseInputs2D, MappingSource2D, ProbePoint2D
 
 class Axisymmetric2DValidationTests(unittest.TestCase):
     def test_exact_fixed_cell_count_and_alignment(self):
+        # ceil policy: never shrink below the requested minimum dimensions.
         domain = align_axisymmetric_domain(1.03, 2.02, 0.1)
-        self.assertEqual((domain.radial_cells, domain.vertical_cells), (10, 20))
-        self.assertEqual(domain.total_cells, 200)
+        self.assertEqual((domain.radial_cells, domain.vertical_cells), (11, 21))
+        self.assertEqual(domain.total_cells, 231)
+        self.assertGreaterEqual(domain.effective_radius, 1.03 - 1e-12)
+        self.assertGreaterEqual(domain.effective_height, 2.02 - 1e-12)
         self.assertTrue(domain.adjusted)
 
     def test_axis_coordinates_are_locked(self):

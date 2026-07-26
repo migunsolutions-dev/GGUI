@@ -93,14 +93,20 @@ class MappingValidationReport:
 
 
 def align_axisymmetric_domain(radius: float, height: float, cell_size: float) -> AxisymmetricDomain:
-    """Apply the repository's round-to-nearest integer-cell alignment policy."""
+    """Align domain to integer cells without shrinking below the request.
+
+    User-entered radius and height are minimum requested dimensions. Domain size
+    affects wave propagation and boundary-reflection timing, so reducing either
+    dimension below the request is not acceptable. Cell counts therefore use
+    ``math.ceil(requested / cell_size)`` rather than rounding to nearest.
+    """
     r = float(radius)
     h = float(height)
     dx = float(cell_size)
     if not all(math.isfinite(v) for v in (r, h, dx)) or min(r, h, dx) <= 0:
         raise ValueError("Radius, Height and Base Cell Size must be finite and > 0.")
-    nr = max(1, int(round(r / dx)))
-    nz = max(1, int(round(h / dx)))
+    nr = max(1, int(math.ceil(r / dx - 1e-15)))
+    nz = max(1, int(math.ceil(h / dx - 1e-15)))
     er = nr * dx
     eh = nz * dx
     tol_r = 1e-9 * max(1.0, r)
@@ -277,21 +283,14 @@ def validate_mapping_source(
     if not os.path.isdir(source_case):
         errors.append("The selected 1D source case does not exist.")
     else:
-        boundary_candidates = (
-            os.path.join(source_case, "constant", "polyMesh", "boundary"),
-            os.path.join(source_case, "system", "blockMeshDict"),
-        )
-        wedge_verified = False
-        for candidate in boundary_candidates:
-            try:
-                with open(candidate, "r", encoding="utf-8", errors="ignore") as stream:
-                    if "type" in (text := stream.read()) and "wedge" in text:
-                        wedge_verified = True
-                        break
-            except OSError:
-                continue
-        if not wedge_verified:
-            errors.append("The source case is not verified as an axisymmetric wedge.")
+        from case_topology import CaseDimension, classify_case_topology
+
+        classification = classify_case_topology(source_case)
+        if classification.classification != CaseDimension.AXISYMMETRIC_WEDGE:
+            errors.append(
+                "The source case is not verified as an axisymmetric wedge "
+                f"({classification.classification.value}: {classification.reason})."
+            )
         phase_path = os.path.join(source_case, "constant", "phaseProperties")
         try:
             with open(phase_path, "r", encoding="utf-8", errors="ignore") as stream:

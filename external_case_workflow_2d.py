@@ -21,7 +21,17 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from allrun_commands import (
+    AllrunCommand,
+    AllrunParseError,
+    WHITELISTED_UTILITIES,
+    preparation_commands_for_case,
+    parse_allrun_preprocess_sequence,
+)
 from case_topology import CaseDimension, classify_case_topology
+
+# Streaming SHA-256 chunk size for case inventory hashing (4 MiB).
+INVENTORY_HASH_CHUNK_SIZE = 4 * 1024 * 1024
 
 
 class ImportMode2D(str, Enum):
@@ -36,29 +46,6 @@ class ImportMode2D(str, Enum):
 # Backward-compatible aliases used by older call sites during transition.
 ExternalLifecycle = ImportMode2D  # type: ignore[misc,assignment]
 
-
-WHITELISTED_UTILITIES = frozenset(
-    {"blockMesh", "setFields", "setRefinedFields", "checkMesh"}
-)
-
-_FORBIDDEN_ALLRUN_TOKENS = frozenset(
-    {
-        "blastFoam",
-        "paraFoam",
-        "mpirun",
-        "decomposePar",
-        "reconstructPar",
-        "Allrun",
-        "bash",
-        "sh",
-        "rm",
-        "curl",
-        "wget",
-        "python",
-        "perl",
-    }
-)
-
 REQUIRED_POLYMESH_FILES = ("points", "faces", "owner", "neighbour", "boundary")
 
 SUPPORTED_CONTROL_WRITERS = frozenset(
@@ -68,7 +55,8 @@ SUPPORTED_CONTROL_WRITERS = frozenset(
 # Windows Mark-of-the-Web ADS may materialize on 9P as sibling files; not case content.
 _ZONE_ID_MARKERS = ("Zone.Identifier", "\uf03aZone.Identifier", ":Zone.Identifier")
 
-RunUtilityFn = Callable[[str, str], Tuple[int, str]]
+# (case_dir, command) -> (exit_code, log_text)
+RunUtilityFn = Callable[[str, AllrunCommand], Tuple[int, str]]
 
 
 @dataclass(frozen=True)
@@ -82,15 +70,31 @@ class InventoryEntry:
     link_target: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class InventoryReadError:
+    """A file that could not be read while building a case inventory."""
+
+    rel: str
+    exception_type: str
+    message: str
+
+
 @dataclass
 class CaseInventory:
     files: Dict[str, str]  # relative posix path -> sha256 (compat)
     dirs: Tuple[str, ...]
     entries: Dict[str, InventoryEntry] = field(default_factory=dict)
+    read_errors: Tuple[InventoryReadError, ...] = ()
+
+    @property
+    def is_valid(self) -> bool:
+        return not self.read_errors
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, CaseInventory):
             return NotImplemented
+        if self.read_errors or other.read_errors:
+            return False
         if self.entries and other.entries:
             return self.entries == other.entries
         return self.files == other.files and self.dirs == other.dirs
@@ -189,16 +193,90 @@ def _is_wsl_unc_path(path: str) -> bool:
     return len(parts) >= 2 and parts[0].lower() in ("wsl.localhost", "wsl$")
 
 
+def _sha256_file_chunked(path: Path, *, expected_size: Optional[int] = None) -> Tuple[str, int]:
+    """Stream SHA-256 of a file in INVENTORY_HASH_CHUNK_SIZE chunks.
+
+    Returns (hex_digest, bytes_hashed). Raises OSError on I/O failure and
+    RuntimeError if the file size changes during the read (TOCTOU).
+    """
+    digest = hashlib.sha256()
+    total = 0
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(INVENTORY_HASH_CHUNK_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+    if expected_size is not None and total != int(expected_size):
+        raise RuntimeError(
+            f"File size changed during hashing for {path}: "
+            f"expected {expected_size} bytes, hashed {total} bytes"
+        )
+    try:
+        final_size = path.stat().st_size
+    except OSError as exc:
+        raise RuntimeError(f"Could not re-stat {path} after hashing: {exc}") from exc
+    if final_size != total:
+        raise RuntimeError(
+            f"File size changed during hashing for {path}: "
+            f"hashed {total} bytes, now {final_size} bytes"
+        )
+    return digest.hexdigest(), total
+
+
 def inventory_case(case_dir: str) -> CaseInventory:
-    """Semantic inventory: relative paths, types, sizes, SHA-256 (no metadata)."""
+    """Semantic inventory: relative paths, types, sizes, chunked SHA-256.
+
+    Any unreadable / disappearing / mutating file is recorded in
+    ``read_errors``. An inventory with read errors is invalid and must fail
+    closed in verification.
+    """
     root = Path(case_dir)
     files: Dict[str, str] = {}
     dirs: List[str] = []
     entries: Dict[str, InventoryEntry] = {}
+    read_errors: List[InventoryReadError] = []
     if not root.is_dir():
-        return CaseInventory(files={}, dirs=(), entries={})
-    for path in sorted(root.rglob("*")):
-        rel = path.relative_to(root).as_posix()
+        return CaseInventory(
+            files={},
+            dirs=(),
+            entries={},
+            read_errors=(
+                InventoryReadError(
+                    rel=".",
+                    exception_type="NotADirectoryError",
+                    message=f"Case directory is missing or not a directory: {case_dir}",
+                ),
+            ),
+        )
+    try:
+        paths = sorted(root.rglob("*"))
+    except OSError as exc:
+        return CaseInventory(
+            files={},
+            dirs=(),
+            entries={},
+            read_errors=(
+                InventoryReadError(
+                    rel=".",
+                    exception_type=type(exc).__name__,
+                    message=f"Failed to enumerate case directory: {exc}",
+                ),
+            ),
+        )
+    for path in paths:
+        try:
+            rel = path.relative_to(root).as_posix()
+        except ValueError as exc:
+            read_errors.append(
+                InventoryReadError(
+                    rel=str(path),
+                    exception_type=type(exc).__name__,
+                    message=str(exc),
+                )
+            )
+            continue
         if _is_zone_identifier_rel(rel):
             continue
         try:
@@ -212,15 +290,37 @@ def inventory_case(case_dir: str) -> CaseInventory:
                 dirs.append(rel + "/")
                 entries[rel + "/"] = InventoryEntry(rel=rel + "/", kind="dir")
             elif path.is_file():
-                data = path.read_bytes()
-                digest = hashlib.sha256(data).hexdigest()
+                try:
+                    size = path.stat().st_size
+                except OSError as exc:
+                    raise OSError(f"stat failed: {exc}") from exc
+                digest, hashed = _sha256_file_chunked(path, expected_size=size)
                 files[rel] = digest
                 entries[rel] = InventoryEntry(
-                    rel=rel, kind="file", size=len(data), sha256=digest
+                    rel=rel, kind="file", size=hashed, sha256=digest
                 )
-        except OSError:
-            continue
-    return CaseInventory(files=files, dirs=tuple(dirs), entries=entries)
+            else:
+                read_errors.append(
+                    InventoryReadError(
+                        rel=rel,
+                        exception_type="UnsupportedFileType",
+                        message=f"Unsupported filesystem object type for {rel}",
+                    )
+                )
+        except (OSError, RuntimeError) as exc:
+            read_errors.append(
+                InventoryReadError(
+                    rel=rel,
+                    exception_type=type(exc).__name__,
+                    message=str(exc),
+                )
+            )
+    return CaseInventory(
+        files=files,
+        dirs=tuple(dirs),
+        entries=entries,
+        read_errors=tuple(read_errors),
+    )
 
 
 def compare_inventories(
@@ -232,6 +332,22 @@ def compare_inventories(
 ) -> InventoryComparison:
     """Compare semantic inventories; optionally write a full mismatch report."""
     mismatches: List[InventoryMismatch] = []
+
+    for inv, label in ((source, "source"), (destination, "destination")):
+        for err in inv.read_errors:
+            mismatches.append(
+                InventoryMismatch(
+                    category="inventory_read_error",
+                    relative_path=err.rel,
+                    detail=(
+                        f"{label} inventory read failure "
+                        f"({err.exception_type}): {err.message}"
+                    ),
+                    source_value=err.message if label == "source" else "",
+                    destination_value=err.message if label == "destination" else "",
+                )
+            )
+
     src_keys = set(source.entries) if source.entries else set(source.files) | set(source.dirs)
     dst_keys = (
         set(destination.entries)
@@ -354,6 +470,17 @@ def format_copy_verification_error(comparison: InventoryComparison) -> str:
     if first.source_value or first.destination_value:
         lines.append(f"Expected: {first.source_value}")
         lines.append(f"Actual:   {first.destination_value}")
+    read_error_paths = sorted(
+        {
+            m.relative_path
+            for m in comparison.mismatches
+            if m.category == "inventory_read_error"
+        }
+    )
+    if read_error_paths:
+        lines.append(
+            "Unreadable or unstable file(s): " + ", ".join(read_error_paths)
+        )
     if comparison.report_path:
         lines.append(f"Full report: {comparison.report_path}")
     return "\n".join(lines)
@@ -369,63 +496,6 @@ def make_imported_working_case_name(source_dir: str, when: Optional[datetime] = 
     stem = sanitize_case_stem(Path(source_dir).name)
     ts = (when or datetime.now()).strftime("%Y%m%d_%H%M%S")
     return f"Case_2D_imported_{stem}_{ts}"
-
-
-def parse_allrun_preprocess_sequence(case_dir: str) -> Tuple[str, ...]:
-    """Extract whitelisted preprocessing utilities from Allrun, in order."""
-    allrun = Path(case_dir) / "Allrun"
-    if not allrun.is_file():
-        raise ValueError(f"No Allrun found in {case_dir}")
-    text = allrun.read_text(encoding="utf-8", errors="ignore")
-    lines = []
-    for line in text.splitlines():
-        stripped = line.split("#", 1)[0].strip()
-        if stripped:
-            lines.append(stripped)
-    body = "\n".join(lines)
-
-    for token in _FORBIDDEN_ALLRUN_TOKENS:
-        if token == "blastFoam":
-            continue
-        if re.search(rf"(?<![\w.]){re.escape(token)}(?![\w.])", body):
-            if token == "paraFoam":
-                continue
-            if token in {"bash", "sh"} and "bash -" not in body and "./" not in body:
-                continue
-
-    sequence: List[str] = []
-    for match in re.finditer(r"runApplication\s+(.+)", body):
-        args = match.group(1).strip()
-        if not args:
-            continue
-        first = args.split()[0]
-        if first.startswith("$") or first in {"getApplication", "blastFoam"}:
-            continue
-        if first == "paraFoam":
-            continue
-        if first in WHITELISTED_UTILITIES:
-            if first not in sequence:
-                sequence.append(first)
-            continue
-        raise ValueError(
-            f"Allrun references unrecognized utility '{first}'. "
-            f"Only {sorted(WHITELISTED_UTILITIES)} are allowed."
-        )
-
-    if not sequence:
-        raise ValueError(
-            "Allrun contains no whitelisted preprocessing utilities "
-            f"(expected one of {sorted(WHITELISTED_UTILITIES)})"
-        )
-    return tuple(sequence)
-
-
-def preparation_commands_for_case(case_dir: str) -> Tuple[str, ...]:
-    """Proven preprocess sequence from Allrun, plus checkMesh validation."""
-    seq = list(parse_allrun_preprocess_sequence(case_dir))
-    if "checkMesh" not in seq:
-        seq.append("checkMesh")
-    return tuple(seq)
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -610,6 +680,7 @@ def create_working_copy(
             created_staging = True
 
         # Verify immediately after copy — before *.orig restore or OF mutation.
+        # Inventories are computed once per side for this transaction (no stale cache).
         src_inv = inventory_case(str(source))
         dst_inv = inventory_case(str(staging))
         comparison = compare_inventories(
@@ -809,7 +880,7 @@ def prepare_working_copy(
     working_copy_dir: str,
     source_dir: str,
     run_utility: RunUtilityFn,
-    commands: Optional[Sequence[str]] = None,
+    commands: Optional[Sequence[AllrunCommand | str]] = None,
     progress: Optional[Callable[[str], None]] = None,
 ) -> PrepareResult:
     """Run whitelisted preprocess utilities only inside the working copy."""
@@ -824,8 +895,8 @@ def prepare_working_copy(
         )
 
     try:
-        commands = tuple(commands or preparation_commands_for_case(wc))
-    except ValueError as exc:
+        raw_commands = tuple(commands or preparation_commands_for_case(wc))
+    except (ValueError, AllrunParseError) as exc:
         return PrepareResult(
             ok=False,
             mode=ImportMode2D.IMPORTED_2D_FAILED,
@@ -833,26 +904,37 @@ def prepare_working_copy(
             reason=str(exc),
         )
 
-    for name in commands:
-        if name not in WHITELISTED_UTILITIES:
+    normalized: List[AllrunCommand] = []
+    for item in raw_commands:
+        if isinstance(item, AllrunCommand):
+            cmd = item
+        else:
+            name = str(item)
+            cmd = AllrunCommand(utility=name, arguments=(), source_line=f"runApplication {name}")
+        if not cmd.valid or cmd.utility not in WHITELISTED_UTILITIES:
             return PrepareResult(
                 ok=False,
                 mode=ImportMode2D.IMPORTED_2D_FAILED,
-                commands=commands,
-                reason=f"Refusing non-whitelisted utility: {name}",
+                commands=tuple(c.display() for c in normalized),
+                reason=(
+                    cmd.rejection_reason
+                    or f"Refusing non-whitelisted utility: {cmd.utility}"
+                ),
             )
+        normalized.append(cmd)
+    command_labels = tuple(cmd.display() for cmd in normalized)
 
     restore_zero_orig_fields(wc)
 
     results: List[UtilityResult] = []
-    for name in commands:
+    for cmd in normalized:
         if progress:
-            progress(name)
-        code, log_text = run_utility(wc, name)
-        log_path = os.path.join(wc, f"log.{name}")
+            progress(cmd.display())
+        code, log_text = run_utility(wc, cmd)
+        log_path = os.path.join(wc, f"log.{cmd.utility}")
         results.append(
             UtilityResult(
-                name=name,
+                name=cmd.display(),
                 exit_code=code,
                 log_path=log_path,
                 log_excerpt=(log_text or "")[-4000:],
@@ -862,17 +944,17 @@ def prepare_working_copy(
             return PrepareResult(
                 ok=False,
                 mode=ImportMode2D.IMPORTED_2D_FAILED,
-                commands=commands,
+                commands=command_labels,
                 results=tuple(results),
-                reason=f"{name} failed with exit code {code}",
+                reason=f"{cmd.display()} failed with exit code {code}",
             )
 
-        if name == "blockMesh":
+        if cmd.utility == "blockMesh":
             if not _polymesh_complete(wc):
                 return PrepareResult(
                     ok=False,
                     mode=ImportMode2D.IMPORTED_2D_FAILED,
-                    commands=commands,
+                    commands=command_labels,
                     results=tuple(results),
                     reason="blockMesh finished but constant/polyMesh is incomplete",
                 )
@@ -881,7 +963,7 @@ def prepare_working_copy(
                 return PrepareResult(
                     ok=False,
                     mode=ImportMode2D.IMPORTED_2D_FAILED,
-                    commands=commands,
+                    commands=command_labels,
                     results=tuple(results),
                     reason=(
                         "Post-mesh topology is not AXISYMMETRIC_WEDGE: "
@@ -893,7 +975,7 @@ def prepare_working_copy(
                 return PrepareResult(
                     ok=False,
                     mode=ImportMode2D.IMPORTED_2D_FAILED,
-                    commands=commands,
+                    commands=command_labels,
                     results=tuple(results),
                     reason="Expected polyMesh/boundary evidence after blockMesh",
                     classification=classification.classification.value,
@@ -903,7 +985,7 @@ def prepare_working_copy(
         return PrepareResult(
             ok=False,
             mode=ImportMode2D.IMPORTED_2D_FAILED,
-            commands=commands,
+            commands=command_labels,
             results=tuple(results),
             reason="polyMesh missing after preparation",
         )
@@ -913,13 +995,15 @@ def prepare_working_copy(
         return PrepareResult(
             ok=False,
             mode=ImportMode2D.IMPORTED_2D_FAILED,
-            commands=commands,
+            commands=command_labels,
             results=tuple(results),
             reason=f"Final classification failed: {classification.reason}",
             classification=classification.classification.value,
         )
 
-    check_logs = [r for r in results if r.name == "checkMesh"]
+    check_logs = [
+        r for r in results if r.name == "checkMesh" or r.name.startswith("checkMesh ")
+    ]
     check_ok = bool(check_logs) and check_logs[-1].ok and _check_mesh_ok(
         check_logs[-1].log_excerpt
         or (
@@ -938,7 +1022,7 @@ def prepare_working_copy(
             return PrepareResult(
                 ok=False,
                 mode=ImportMode2D.IMPORTED_2D_FAILED,
-                commands=commands,
+                commands=command_labels,
                 results=tuple(results),
                 reason="checkMesh did not report Mesh OK",
                 classification=classification.classification.value,
@@ -960,7 +1044,7 @@ def prepare_working_copy(
     return PrepareResult(
         ok=True,
         mode=ImportMode2D.IMPORTED_2D_READY,
-        commands=commands,
+        commands=command_labels,
         results=tuple(results),
         cell_count=cell_count,
         cell_count_source=cell_source,

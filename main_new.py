@@ -1306,17 +1306,37 @@ class BlastFoamApp(QMainWindow):
             intent=intent,
         )
 
-    def _run_of_utility(self, case_dir: str, utility: str):
-        """Run one whitelisted OpenFOAM utility; return (exit_code, log_text)."""
-        if utility not in WHITELISTED_UTILITIES:
-            return 1, f"Refused non-whitelisted utility: {utility}"
+    def _run_of_utility(self, case_dir: str, command):
+        """Run one whitelisted OpenFOAM utility; return (exit_code, log_text).
+
+        ``command`` may be an ``AllrunCommand`` or a bare utility name string.
+        """
+        import shlex
         import sys
         from pathlib import Path
+
+        from allrun_commands import AllrunCommand
         from solver_runner import SolverRunner
+
+        if isinstance(command, AllrunCommand):
+            if not command.valid or command.utility not in WHITELISTED_UTILITIES:
+                return 1, (
+                    command.rejection_reason
+                    or f"Refused non-whitelisted utility: {command.utility}"
+                )
+            utility = command.utility
+            arg_tokens = list(command.arguments)
+        else:
+            utility = str(command)
+            arg_tokens = []
+            if utility not in WHITELISTED_UTILITIES:
+                return 1, f"Refused non-whitelisted utility: {utility}"
 
         distro, linux_path = SolverRunner._win_unc_to_wsl_path_and_distro(case_dir)
         quoted = "'" + linux_path.replace("'", "'\"'\"'") + "'"
-        cmd = f"{utility} > log.{utility} 2>&1"
+        arg_str = " ".join(shlex.quote(tok) for tok in arg_tokens)
+        rendered = f"{utility} {arg_str}".strip()
+        cmd = f"{rendered} > log.{utility} 2>&1"
         full_cmd = f"source {self.openfoam_bashrc}; cd {quoted}; {cmd}; echo __GGUI_EC__:$?"
         if distro:
             wsl_args = ["wsl", "-d", distro, "bash", "-lc", full_cmd]
@@ -1340,7 +1360,7 @@ class BlastFoamApp(QMainWindow):
                     break
             with open(log_path, "a", encoding="utf-8") as handle:
                 handle.write("\n# GGUI runner\n")
-                handle.write(f"utility={utility}\nexit_code={ec}\n")
+                handle.write(f"utility={rendered}\nexit_code={ec}\n")
                 if completed.stdout:
                     handle.write("runner_stdout:\n")
                     handle.write(completed.stdout)
@@ -1349,7 +1369,7 @@ class BlastFoamApp(QMainWindow):
                     handle.write(completed.stderr)
             if log_path.is_file():
                 text = log_path.read_text(encoding="utf-8", errors="ignore")
-            print(f"[Prepare] {utility} -> {ec} ({log_path})", file=sys.stderr)
+            print(f"[Prepare] {rendered} -> {ec} ({log_path})", file=sys.stderr)
             return ec, text
         except Exception as exc:
             return 1, str(exc)
