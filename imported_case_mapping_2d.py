@@ -213,6 +213,7 @@ def _parse_control(case_dir: str) -> Dict[str, Any]:
     if not out["path"]:
         return out
     text = _strip(_read_text(path))
+    out["text"] = text
     for key in (
         "application",
         "endTime",
@@ -227,6 +228,52 @@ def _parse_control(case_dir: str) -> Dict[str, Any]:
         if m:
             out[key] = m.group(1).strip()
     return out
+
+
+def _parse_decompose(case_dir: str) -> Dict[str, Any]:
+    path = os.path.join(case_dir, "system", "decomposeParDict")
+    out: Dict[str, Any] = {"path": path if os.path.isfile(path) else ""}
+    if not out["path"]:
+        return out
+    text = _strip(_read_text(path))
+    match = re.search(r"\bnumberOfSubdomains\s+(\d+)\s*;", text)
+    if match:
+        out["cores"] = int(match.group(1))
+    return out
+
+
+def _parse_control_probes(
+    control: Dict[str, Any],
+) -> Tuple[Tuple[Dict[str, Any], ...], Tuple[str, ...]]:
+    text = str(control.get("text") or "")
+    body = _extract_brace_block(text, "probes2d")
+    if body is None or not re.search(r"\btype\s+probes\s*;", body):
+        return (), ()
+    fields_match = re.search(r"\bfields\s*\(([^)]*)\)\s*;", body, re.DOTALL)
+    fields = (
+        tuple(fields_match.group(1).split())
+        if fields_match
+        else ()
+    )
+    locations = re.search(
+        r"\bprobeLocations\s*\((.*?)\)\s*;",
+        body,
+        re.DOTALL,
+    )
+    probes: List[Dict[str, Any]] = []
+    if locations:
+        for index, point in enumerate(
+            re.finditer(r"\(([^()]+)\)", locations.group(1)), start=1
+        ):
+            parts = point.group(1).split()
+            if len(parts) != 3:
+                continue
+            try:
+                radius, height, _ = (float(value) for value in parts)
+            except ValueError:
+                continue
+            probes.append({"name": f"P{index}", "radius": radius, "height": height})
+    return tuple(probes), fields
 
 
 def _extract_brace_block(text: str, keyword: str) -> Optional[str]:
@@ -473,6 +520,8 @@ def map_imported_case_to_gui(
 
     block = _parse_block_mesh(case_dir)
     control = _parse_control(case_dir)
+    decompose = _parse_decompose(case_dir)
+    control_probes, control_output_fields = _parse_control_probes(control)
     setfields = _parse_setfields(case_dir)
     phases = _parse_phase_properties(case_dir)
     dyn = _parse_dynamic_mesh(case_dir)
@@ -889,15 +938,6 @@ def map_imported_case_to_gui(
                 source_file=setfields.get("path", ""),
                 reason="mass-based setFields region rho",
             )
-        elif "rho" in props:
-            _add(
-                result,
-                "rho_charge",
-                float(props["rho"]),
-                FieldProvenance.DERIVED,
-                source_file="material_catalog",
-                reason=f"catalog density for {material}",
-            )
         elif phases.get("rho0") is not None:
             _add(
                 result,
@@ -906,6 +946,15 @@ def map_imported_case_to_gui(
                 FieldProvenance.DIRECT,
                 source_file=phases.get("path", ""),
                 reason="phaseProperties rho0",
+            )
+        elif "rho" in props:
+            _add(
+                result,
+                "rho_charge",
+                float(props["rho"]),
+                FieldProvenance.DERIVED,
+                source_file="material_catalog",
+                reason=f"catalog density for {material}",
             )
         if "energy" in props:
             _add(
@@ -1264,16 +1313,42 @@ def map_imported_case_to_gui(
             editable=True,
             reason="Recovered for editable GGUI model",
         )
+    if "purgeWrite" in control:
+        try:
+            _add(
+                result,
+                "cycle_write",
+                int(float(control["purgeWrite"])),
+                FieldProvenance.DIRECT,
+                source_file=control.get("path", ""),
+                editable=True,
+                reason="controlDict purgeWrite",
+            )
+        except ValueError:
+            pass
+    if decompose.get("cores") is not None:
+        _add(
+            result,
+            "cores",
+            int(decompose["cores"]),
+            FieldProvenance.DIRECT,
+            source_file=decompose.get("path", ""),
+            editable=True,
+            reason="decomposeParDict numberOfSubdomains",
+        )
 
     # Mesh / AMR
-    if dyn.get("path"):
+    dynamic_mesh = bool(
+        dyn.get("path") and dyn.get("dynamicFvMesh") != "staticFvMesh"
+    )
+    if dynamic_mesh:
         _add(
             result,
             "mesh_mode",
             "Dynamic Mesh (AMR)",
             FieldProvenance.DERIVED,
             source_file=dyn["path"],
-            reason="dynamicMeshDict present",
+            reason="adaptive dynamicMeshDict",
         )
         if "dynamicFvMesh" in dyn:
             _add(
@@ -1420,30 +1495,48 @@ def map_imported_case_to_gui(
                 editable=True,
                 reason="Recovered for editable GGUI model",
             )
-        if setfields.get("nBufferLayers") is not None:
-            _add(
-                result,
-                "buffer_layers",
-                int(setfields["nBufferLayers"]),
-                FieldProvenance.DIRECT,
-                source_file=setfields.get("path", ""),
-                editable=True,
-                reason="Recovered for editable GGUI model",
-            )
     else:
         _add(
             result,
             "mesh_mode",
             "Fixed Mesh",
             FieldProvenance.DERIVED,
-            reason="no dynamicMeshDict",
+            source_file=dyn.get("path", ""),
+            reason=(
+                "dynamicFvMesh staticFvMesh"
+                if dyn.get("path")
+                else "no dynamicMeshDict"
+            ),
         )
 
-    # Probes — empty unless compatible probes exist (tutorial has none in probes dict)
-    probes_path = os.path.join(case_dir, "system", "probes")
-    # Also check controlDict functions — skip inventing.
-    result.probes = ()
-    if not os.path.isfile(probes_path):
+    if shape and setfields.get("level") is None:
+        _add(
+            result,
+            "charge_seed_mode",
+            "Off",
+            FieldProvenance.DERIVED,
+            source_file=setfields.get("path", ""),
+            editable=True,
+            reason="setFields region has no refineInternal level",
+        )
+    if setfields.get("nBufferLayers") is not None:
+        _add(
+            result,
+            "buffer_layers",
+            int(setfields["nBufferLayers"]),
+            FieldProvenance.DIRECT,
+            source_file=setfields.get("path", ""),
+            editable=True,
+            reason="setFieldsDict nBufferLayers",
+        )
+
+    # Generator2D writes native probes in controlDict/functions/probes2d.
+    result.probes = control_probes
+    if control_probes:
+        result.gui_values["probes"] = list(control_probes)
+    if control_output_fields:
+        result.gui_values["output_fields"] = tuple(control_output_fields)
+    if not control_probes:
         notes.append("No compatible probe table found — probe list left empty.")
 
     # Converted imported cases are fully editable GGUI models: mark every

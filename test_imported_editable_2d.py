@@ -19,7 +19,7 @@ from case_loader_2d import inspect_imported_axisymmetric_case
 from external_case_workflow_2d import inventory_case
 from generator_2d import Generator2D
 from imported_case_mapping_2d import FieldProvenance, full_sphere_mass_kg, map_imported_case_to_gui
-from models_2d import CaseInputs2D
+from models_2d import CaseInputs2D, ProbePoint2D
 from physical_charge_geometry import physical_charge_geometry
 from test_external_working_copy_2d import _make_unmeshed_source
 from main_new import BlastFoamApp
@@ -232,6 +232,10 @@ class GeneratedCaseRoundTripTests(unittest.TestCase):
                 charge_refinement_level=4,
                 buffer_layers=3,
                 dyn_refine_max=3,
+                cycle_write=4,
+                cores=3,
+                probes=(ProbePoint2D("near", 0.5, 4.0),),
+                output_fields=("p", "alpha.c4"),
             )
             generated = Generator2D(td).generate("round_trip_cylinder", inputs)
             set_fields = Path(generated, "system", "setFieldsDict").read_text(
@@ -246,7 +250,36 @@ class GeneratedCaseRoundTripTests(unittest.TestCase):
             self.assertAlmostEqual(reopened.gui_values["height_of_burst"], 4.0)
             self.assertAlmostEqual(reopened.gui_values["detonation_height"], 4.0)
             self.assertAlmostEqual(reopened.gui_values["cell_size"], 0.5, delta=1e-8)
+            self.assertEqual(reopened.gui_values["cycle_write"], 4)
+            self.assertEqual(reopened.gui_values["cores"], 3)
+            self.assertEqual(reopened.gui_values["output_fields"], ("p", "alpha.c4"))
+            self.assertEqual(
+                reopened.gui_values["probes"],
+                [{"name": "P1", "radius": 0.5, "height": 4.0}],
+            )
             self.assertNotIn("mass_kg", reopened.not_recovered_keys)
+
+    def test_generated_fixed_mesh_round_trip_stays_fixed(self):
+        with tempfile.TemporaryDirectory() as td:
+            inputs = replace(
+                CaseInputs2D(),
+                radius=2.0,
+                height=3.0,
+                cell_size=0.01,
+                mass_kg=2.0,
+                rho_charge=1600.0,
+                material_name="C4",
+                charge_shape="Sphere",
+                height_of_burst=1.0,
+                detonation_height=1.0,
+                mesh_mode="Fixed Mesh",
+            )
+            generated = Generator2D(td).generate("round_trip_fixed", inputs)
+            reopened = map_imported_case_to_gui(generated)
+            self.assertEqual(reopened.gui_values["mesh_mode"], "Fixed Mesh")
+            self.assertEqual(reopened.gui_values["charge_seed_mode"], "Off")
+            self.assertAlmostEqual(reopened.gui_values["cell_size"], 0.01, delta=1e-8)
+            self.assertAlmostEqual(reopened.gui_values["mass_kg"], 2.0, delta=1e-6)
 
     def test_same_session_runtime_attach_preserves_validated_controls(self):
         with tempfile.TemporaryDirectory() as td:
