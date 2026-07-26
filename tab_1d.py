@@ -399,7 +399,8 @@ class Tab1D(QWidget):
                 r_min = max(1e-6, min(r_min_geom, 0.2 * r_ch))
                 self.last_r_min = r_min
                 self.last_r_max = radius
-            except:
+            except (TypeError, ValueError, ZeroDivisionError, AttributeError):
+                # Probe radius bounds are display-only; keep last good range.
                 self.last_r_min = 0.0
                 self.last_r_max = 1.0
 

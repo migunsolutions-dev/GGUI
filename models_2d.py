@@ -20,6 +20,7 @@ DEFAULT_REFINE_INTERVAL = 3
 class SimulationState2D(str, Enum):
     DRAFT = "Draft"
     VALIDATED = "Validated"
+    INITIALIZING = "Initializing"
     INITIALIZED = "Initialized"
     RUNNING = "Running"
     INTERRUPTED = "Interrupted"

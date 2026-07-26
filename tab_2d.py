@@ -130,11 +130,19 @@ class Tab2D(QWidget):
         running = state == SimulationState2D.RUNNING or (
             self._import_mode == ImportMode2D.IMPORTED_2D_RUNNING
         )
-        initialized = state in (
-            SimulationState2D.INITIALIZED,
-            SimulationState2D.INTERRUPTED,
-            SimulationState2D.COMPLETED,
-        ) or self._import_mode == ImportMode2D.IMPORTED_2D_READY
+        from state_machine_2d import can_run
+
+        # Buttons derive from the explicit state machine; STALE/FAILED/INITIALIZING
+        # never look initialized. Imported-ready mode is an additional enablement path.
+        initialized = can_run(state) or (
+            self._import_mode == ImportMode2D.IMPORTED_2D_READY
+            and state
+            not in (
+                SimulationState2D.INITIALIZING,
+                SimulationState2D.FAILED,
+                SimulationState2D.STALE,
+            )
+        )
         self._apply_action_buttons(running=running, initialized=initialized)
         self.sig_state_changed.emit(state.value)
 
@@ -579,15 +587,11 @@ class Tab2D(QWidget):
         if self.is_imported_mode:
             # Imported mode: only editable controlDict fields may dirty the case.
             return
-        if self._state in (
-            SimulationState2D.INITIALIZED,
-            SimulationState2D.INTERRUPTED,
-            SimulationState2D.COMPLETED,
-            SimulationState2D.FAILED,
-        ):
-            self.set_simulation_state(SimulationState2D.STALE)
-        elif self._state != SimulationState2D.RUNNING:
-            self.set_simulation_state(SimulationState2D.DRAFT)
+        from state_machine_2d import state_after_input_edit
+
+        next_state = state_after_input_edit(self._state)
+        if next_state != self._state:
+            self.set_simulation_state(next_state)
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -1293,9 +1297,18 @@ class Tab2D(QWidget):
                     else self._state
                 )
         except Exception as exc:
-            import sys
+            # Timer/preview refresh: log without flooding the user with dialogs.
+            from ggui_logging import log_operation
 
-            print(f"[2D Setup Preview] {exc}", file=sys.stderr)
+            import logging
+
+            log_operation(
+                "tab_2d",
+                "setup_preview_refresh",
+                case_dir=getattr(self, "active_case_dir", None),
+                exc=exc,
+                level=logging.ERROR,
+            )
         self._refresh_info()
 
     def _refresh_info(self) -> None:

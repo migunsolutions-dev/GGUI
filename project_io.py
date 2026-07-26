@@ -13,8 +13,16 @@ from charge_seed_plan import charge_dims_from_inputs, migrate_case_inputs_seed_f
 from models import CaseInputs3D, ObstacleData
 from models_2d import CaseInputs2D, MappingSource2D, ProbePoint2D
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PROJECT_SUFFIX = ".ggui.json"
+
+# Display-only 2D fields: persisted for UI restore, never consumed by generation.
+_DISPLAY_ONLY_2D_FIELDS = (
+    "mirrored_view",
+    "show_mesh",
+    "show_probes",
+    "log_scale",
+)
 
 
 class _SupportsProjectCapture(Protocol):
@@ -40,11 +48,90 @@ class ProjectFormatError(ValueError):
     pass
 
 
-def _migrate_v1(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return payload
+def _normalize_v2(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure a schema-v2 payload has the nested dimensions layout."""
+    out = dict(payload)
+    out["schema_version"] = SCHEMA_VERSION
+    dimensions = out.get("dimensions")
+    if not isinstance(dimensions, dict):
+        dimensions = {}
+    else:
+        dimensions = dict(dimensions)
+
+    case_inputs = out.get("case_inputs")
+    if "3D" not in dimensions and isinstance(case_inputs, dict):
+        dimensions["3D"] = {
+            "case_inputs": case_inputs,
+            "input_fields": sorted(case_inputs.keys()),
+            "display_only_fields": [],
+        }
+    elif "3D" in dimensions and isinstance(dimensions["3D"], dict):
+        section = dict(dimensions["3D"])
+        nested = section.get("case_inputs")
+        if isinstance(nested, dict):
+            out["case_inputs"] = nested
+            section.setdefault("input_fields", sorted(nested.keys()))
+            section.setdefault("display_only_fields", [])
+        dimensions["3D"] = section
+
+    section_2d = dimensions.get("2D")
+    if isinstance(section_2d, dict):
+        section = dict(section_2d)
+        nested_2d = section.get("case_inputs")
+        if isinstance(nested_2d, dict):
+            undefined = nested_2d.get("undefined_keys") or section.get("undefined_keys") or []
+            section["undefined_keys"] = list(undefined)
+            imported_meta = section.get("imported_case_metadata")
+            if not isinstance(imported_meta, dict):
+                mapping = nested_2d.get("mapping") or {}
+                imported_meta = {
+                    "mapping_source": mapping if isinstance(mapping, dict) else {},
+                    "undefined_keys": list(undefined),
+                }
+            section["imported_case_metadata"] = imported_meta
+            section.setdefault(
+                "input_fields",
+                sorted(
+                    k for k in nested_2d.keys() if k not in _DISPLAY_ONLY_2D_FIELDS
+                ),
+            )
+            section.setdefault("display_only_fields", list(_DISPLAY_ONLY_2D_FIELDS))
+        dimensions["2D"] = section
+
+    out["dimensions"] = dimensions
+    available = out.get("dimensions_available")
+    if not isinstance(available, list) or not available:
+        available = ["3D"]
+        if "2D" in dimensions:
+            available.append("2D")
+        out["dimensions_available"] = available
+    gui_state = out.get("gui_state") if isinstance(out.get("gui_state"), dict) else {}
+    out.setdefault(
+        "active_tab",
+        gui_state.get("selected_primary_tab") or out.get("project_dimension") or "General 3D",
+    )
+    out.setdefault("project_dimension", "3D")
+    provenance = out.get("provenance")
+    if not isinstance(provenance, dict):
+        provenance = {}
+    provenance.setdefault("format", "explicit-json")
+    provenance["contains_runtime_results"] = False
+    out["provenance"] = provenance
+    return out
 
 
-_MIGRATIONS = {1: _migrate_v1}
+def _migrate_v1_to_v2(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Deterministic schema 1 → 2 migration. Preserves undefined 2D keys as undefined."""
+    out = dict(payload)
+    # Legacy v1 kept 3D inputs at the top level and optional dimensions.2D.
+    return _normalize_v2(out)
+
+
+def _migrate_v2(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _normalize_v2(payload)
+
+
+_MIGRATIONS = {1: _migrate_v1_to_v2, 2: _migrate_v2}
 
 
 def build_project(
@@ -53,7 +140,41 @@ def build_project(
     probes: Dict[str, Any],
     gui_state: Dict[str, Any],
     inputs_2d: CaseInputs2D | None = None,
+    simulation_state_2d: str | None = None,
 ) -> Dict[str, Any]:
+    case_inputs_3d = asdict(inputs)
+    dimensions: Dict[str, Any] = {
+        "3D": {
+            "case_inputs": case_inputs_3d,
+            "input_fields": sorted(case_inputs_3d.keys()),
+            "display_only_fields": [],
+        }
+    }
+    dimensions_available = ["3D"]
+    if inputs_2d is not None:
+        case_inputs_2d = asdict(inputs_2d)
+        undefined = list(getattr(inputs_2d, "undefined_keys", ()) or ())
+        mapping = case_inputs_2d.get("mapping") or {}
+        dimensions["2D"] = {
+            "model": "axisymmetric-rz-wedge",
+            "case_inputs": case_inputs_2d,
+            "undefined_keys": undefined,
+            "imported_case_metadata": {
+                "mapping_source": mapping if isinstance(mapping, dict) else {},
+                "undefined_keys": undefined,
+            },
+            "input_fields": sorted(
+                k for k in case_inputs_2d.keys() if k not in _DISPLAY_ONLY_2D_FIELDS
+            ),
+            "display_only_fields": list(_DISPLAY_ONLY_2D_FIELDS),
+            "simulation_state": simulation_state_2d,
+        }
+        dimensions_available.append("2D")
+    active_tab = (
+        gui_state.get("selected_primary_tab")
+        if isinstance(gui_state, dict)
+        else None
+    ) or "General 3D"
     payload = {
         "schema_version": SCHEMA_VERSION,
         "application": {
@@ -61,8 +182,11 @@ def build_project(
             "version": "4.0",
             "saved_utc": datetime.now(timezone.utc).isoformat(),
         },
+        "dimensions_available": dimensions_available,
+        "active_tab": active_tab,
         "project_dimension": "3D",
-        "case_inputs": asdict(inputs),
+        "case_inputs": case_inputs_3d,
+        "dimensions": dimensions,
         "probes": probes,
         "gui_state": gui_state,
         "provenance": {
@@ -70,13 +194,6 @@ def build_project(
             "contains_runtime_results": False,
         },
     }
-    if inputs_2d is not None:
-        payload["dimensions"] = {
-            "2D": {
-                "model": "axisymmetric-rz-wedge",
-                "case_inputs": asdict(inputs_2d),
-            }
-        }
     return payload
 
 
@@ -350,14 +467,19 @@ def read_project(path: str) -> Dict[str, Any]:
             f"{', '.join(str(v) for v in sorted(_MIGRATIONS))}."
         )
     payload = migration(payload)
-    if payload.get("project_dimension") != "3D":
+    available = payload.get("dimensions_available") or []
+    if payload.get("project_dimension") != "3D" and "3D" not in available:
         raise ProjectFormatError("Only 3D GGUI projects are supported by this project format")
-    inputs = _case_inputs_from_dict(payload.get("case_inputs"))
+    case_inputs_raw = payload.get("case_inputs")
     dimensions = payload.get("dimensions", {})
     if dimensions is None:
         dimensions = {}
     if not isinstance(dimensions, dict):
         raise ProjectFormatError("dimensions must be a JSON object")
+    section_3d = dimensions.get("3D")
+    if isinstance(section_3d, dict) and isinstance(section_3d.get("case_inputs"), dict):
+        case_inputs_raw = section_3d["case_inputs"]
+    inputs = _case_inputs_from_dict(case_inputs_raw)
     section_2d = dimensions.get("2D")
     inputs_2d = None
     if section_2d is not None:
@@ -370,6 +492,12 @@ def read_project(path: str) -> Dict[str, Any]:
     gui_state = payload.get("gui_state", {})
     if not isinstance(probes, dict) or not isinstance(gui_state, dict):
         raise ProjectFormatError("probes and gui_state must be JSON objects")
+    # Never persist solver results; reject if a file claims otherwise after migration.
+    provenance = payload.get("provenance") or {}
+    if provenance.get("contains_runtime_results"):
+        raise ProjectFormatError(
+            "Project files must not contain solver results or large run outputs."
+        )
     return {
         "payload": payload,
         "inputs": inputs,

@@ -1,0 +1,11 @@
+# Reproducible constraint pin set for CI / local installs.
+# Install with: pip install -c constraints.txt -e ".[test]"
+# Generated against a known-good Windows development environment (2026-07).
+
+PyQt5==5.15.11
+PyQt5-Qt5==5.15.2
+PyQt5-sip==12.17.0
+numpy==2.4.1
+matplotlib==3.10.8
+pyvista==0.46.5
+vtk==9.5.2

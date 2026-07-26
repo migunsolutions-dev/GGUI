@@ -1992,6 +1992,11 @@ dumpLevel      true;
         if init_pt is None or (isinstance(init_pt, (list, tuple)) and len(init_pt) < 3):
             init_pt = inputs.charge_center
         # Canonical material catalog shared with dimensional workflows.
+        # Density/energy completeness is enforced here; jwl_parameters validates
+        # JWL-specific Custom keys only (see material_catalog responsibility split).
+        from material_validation import validate_required_values
+
+        validate_required_values(inputs).raise_if_invalid()
         j = jwl_parameters(inputs.material_name, getattr(inputs, "material_props", None))
         eos = f"equationOfState {{ rho0 {inputs.rho_charge}; A {j['A']:.4g}; B {j['B']:.4g}; R1 {j['R1']}; R2 {j['R2']}; omega {j['omega']}; }}"
         cv_coeffs = j.get("CvCoeffs", (413.15, 2.1538))

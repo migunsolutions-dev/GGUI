@@ -56,7 +56,12 @@ _wsl_*.log
 _commit_msg.txt
 _inspect_*.sh
 _test_*.py
+_refactor_*.py
 *.bak
 *.tmp
 *.npy
 *.gif
+
+# --- Local debug / agent dumps --------------------------------------------
+debug_summary.txt
+/debug_*.txt

@@ -1043,6 +1043,7 @@ class BlastFoamApp(QMainWindow):
             return
 
         self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_INITIALIZING)
+        self.tab_2d.set_simulation_state(SimulationState2D.INITIALIZING)
         self.active_case_initialized_2d = False
         self.status_bar.set_status("Generating GGUI case from imported model…", "#f39c12")
         self._set_preparation_controls_enabled(False)
@@ -2523,6 +2524,9 @@ class BlastFoamApp(QMainWindow):
 
 def main():
     """Application entry point"""
+    from ggui_logging import configure_logging
+
+    configure_logging()
     app = QApplication(sys.argv)
     
     # Set application style

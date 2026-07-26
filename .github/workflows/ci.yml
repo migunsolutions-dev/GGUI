@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Compile, import, and unit tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -c constraints.txt \
+            "PyQt5>=5.15.0,<5.16" \
+            "numpy>=1.24,<3" \
+            "matplotlib>=3.7,<4" \
+            "pyvista>=0.43,<0.47" \
+            "vtk>=9.2,<9.6"
+
+      - name: Syntax / compile check
+        run: |
+          python -m compileall -q \
+            allrun_commands.py \
+            axisymmetric_2d.py \
+            case_topology.py \
+            charge_seed_plan.py \
+            execution_plan.py \
+            external_case_workflow_2d.py \
+            generator_2d.py \
+            ggui_logging.py \
+            imported_case_mapping_2d.py \
+            material_catalog.py \
+            material_validation.py \
+            models_2d.py \
+            preparation_worker_qt.py \
+            project_io.py \
+            solver_runner.py \
+            state_machine_2d.py \
+            wsl_runtime.py
+
+      - name: Core-module import checks
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python - <<'PY'
+          import importlib
+          modules = [
+              "execution_plan",
+              "wsl_runtime",
+              "material_catalog",
+              "material_validation",
+              "project_io",
+              "state_machine_2d",
+              "ggui_logging",
+              "charge_seed_plan",
+              "case_topology",
+              "allrun_commands",
+          ]
+          for name in modules:
+              importlib.import_module(name)
+              print("imported", name)
+          import execution_plan
+          import wsl_runtime
+          assert "PyQt5" not in execution_plan.__dict__.get("__file__", "")
+          import ast, pathlib
+          for mod in (execution_plan, wsl_runtime):
+              tree = ast.parse(pathlib.Path(mod.__file__).read_text(encoding="utf-8"))
+              for node in ast.walk(tree):
+                  if isinstance(node, (ast.Import, ast.ImportFrom)):
+                      names = []
+                      if isinstance(node, ast.Import):
+                          names = [a.name for a in node.names]
+                      else:
+                          names = [node.module or ""]
+                      assert not any(n and n.startswith("PyQt5") for n in names), mod.__file__
+          print("pure-module PyQt guard ok")
+          PY
+
+      - name: Forbid tracked run / debug artifacts
+        run: |
+          python - <<'PY'
+          import subprocess, sys
+          tracked = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
+          banned_prefixes = ("log.", "debug_summary")
+          banned_suffixes = (".foam",)
+          banned_names = {"debug_summary.txt"}
+          bad = []
+          for path in tracked:
+              base = path.rsplit("/", 1)[-1]
+              if base in banned_names or base.startswith(banned_prefixes) or base.endswith(banned_suffixes):
+                  # Allow documentation mentions only if not actual artifact names at repo root tooling?
+                  if path.startswith("tools/") and path.endswith(".py"):
+                      continue
+                  bad.append(path)
+          if bad:
+              print("Tracked prohibited artifacts:")
+              for p in bad:
+                  print(" ", p)
+              sys.exit(1)
+          print("artifact policy ok")
+          PY
+
+      - name: Full unit test suite (no OpenFOAM)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m unittest discover -v
+
+      - name: Note on OpenFOAM / BlastFoam
+        run: |
+          echo "OpenFOAM and BlastFoam integration tests are not run in this workflow."
+          echo "They require a WSL/Linux OpenFOAM+BlastFoam environment and remain manual/self-hosted."
