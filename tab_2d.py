@@ -45,6 +45,7 @@ from charge_seed_plan import SEED_MODE_AUTO, SEED_MODE_MANUAL, SEED_MODE_OFF
 from external_case_workflow_2d import ImportMode2D, import_mode_label
 from imported_case_mapping_2d import FieldProvenance
 from material_catalog import materials_copy
+from material_validation import REQUIRED_IMPORTED_PHYSICS_KEYS, UNSUPPORTED_IMPORT_KEYS
 from models_2d import (
     DEFAULT_REFINE_INTERVAL,
     CaseInputs2D,
@@ -52,6 +53,9 @@ from models_2d import (
     ProbePoint2D,
     SimulationState2D,
 )
+
+MATERIAL_UNDEFINED_PLACEHOLDER = "— select material —"
+UNDEFINED_CONTROL_STYLE = "background-color: #fff3cd;"
 from physical_charge_geometry import physical_charge_geometry
 from ui_metrics import (
     ACTION_BUTTON_FONT_PT,
@@ -90,6 +94,8 @@ class Tab2D(QWidget):
         self._imported_field_meta = {}
         self._unrecovered_gui_keys = set()
         self._case_defined_gui_keys = set()
+        self._undefined_gui_keys = set()
+        self._unsupported_features = []
         self._build_ui()
         self.viewer.cell_count_updated.connect(self._on_cell_count_updated)
         self.viewer.log_scale_rejected.connect(self._on_log_scale_rejected)
@@ -230,6 +236,8 @@ class Tab2D(QWidget):
         self._imported_field_meta = {}
         self._unrecovered_gui_keys = set()
         self._case_defined_gui_keys = set()
+        self._clear_all_undefined_controls()
+        self._unsupported_features = []
         self._restore_native_control_editability()
         if hasattr(self, "lbl_import_banner"):
             self.lbl_import_banner.setVisible(False)
@@ -283,6 +291,8 @@ class Tab2D(QWidget):
         self._imported_field_meta = {}
         self._unrecovered_gui_keys = set()
         self._case_defined_gui_keys = set()
+        self._clear_all_undefined_controls()
+        self._unsupported_features = list(getattr(mapping, "unsupported_features", ()) or ())
         self._loading = True
         try:
             self._restore_native_control_editability()
@@ -309,6 +319,17 @@ class Tab2D(QWidget):
             finally:
                 self._loading = was_loading
 
+            # Required physics / unsupported keys without recovered values stay undefined.
+            pending_undefined = set()
+            for key in REQUIRED_IMPORTED_PHYSICS_KEYS:
+                if key not in values or values.get(key) is None:
+                    pending_undefined.add(key)
+            for key in UNSUPPORTED_IMPORT_KEYS:
+                if key in self._case_defined_gui_keys and key not in values:
+                    pending_undefined.add(key)
+            for key in sorted(pending_undefined):
+                self._mark_control_undefined(key)
+
             # Explicit charge radius display when mass unrecovered.
             cr = mapping.get("charge_radius")
             if cr and cr.displayed_value is not None:
@@ -328,6 +349,97 @@ class Tab2D(QWidget):
             self._apply_enablement()
         finally:
             self._loading = False
+
+    def _prepare_spin_undefined(self, spin: QDoubleSpinBox) -> None:
+        if getattr(spin, "_ggui_undef_prepared", False):
+            return
+        spin._ggui_real_min = float(spin.minimum())
+        sentinel = spin._ggui_real_min - 1.0
+        spin.setMinimum(sentinel)
+        spin.setSpecialValueText("required")
+        spin._ggui_undef_prepared = True
+
+    def _restore_spin_undefined(self, spin: QDoubleSpinBox) -> None:
+        if not getattr(spin, "_ggui_undef_prepared", False):
+            return
+        real_min = float(getattr(spin, "_ggui_real_min", 0.0))
+        spin.setSpecialValueText("")
+        spin.setMinimum(real_min)
+        if spin.value() < real_min:
+            spin.setValue(real_min)
+        spin._ggui_undef_prepared = False
+        spin.setStyleSheet("")
+
+    def _mark_control_undefined(self, key: str) -> None:
+        self._undefined_gui_keys.add(key)
+        widget = self._widget_for_gui_key(key)
+        if widget is None:
+            return
+        was_loading = self._loading
+        self._loading = True
+        try:
+            if key == "material_name" and isinstance(widget, QComboBox):
+                if widget.findText(MATERIAL_UNDEFINED_PLACEHOLDER) < 0:
+                    widget.insertItem(0, MATERIAL_UNDEFINED_PLACEHOLDER)
+                widget.setCurrentText(MATERIAL_UNDEFINED_PLACEHOLDER)
+                widget.setStyleSheet(UNDEFINED_CONTROL_STYLE)
+                widget.setToolTip("Required: select a material explicitly.")
+            elif isinstance(widget, QDoubleSpinBox):
+                self._prepare_spin_undefined(widget)
+                widget.setValue(widget.minimum())
+                widget.setStyleSheet(UNDEFINED_CONTROL_STYLE)
+                widget.setToolTip("Required: enter an explicit value.")
+            elif isinstance(widget, QComboBox):
+                widget.setStyleSheet(UNDEFINED_CONTROL_STYLE)
+                widget.setToolTip("Required: select an explicit value.")
+        finally:
+            self._loading = was_loading
+
+    def _clear_control_undefined(self, key: str) -> None:
+        if key not in self._undefined_gui_keys:
+            return
+        self._undefined_gui_keys.discard(key)
+        widget = self._widget_for_gui_key(key)
+        if widget is None:
+            return
+        if key == "material_name" and isinstance(widget, QComboBox):
+            idx = widget.findText(MATERIAL_UNDEFINED_PLACEHOLDER)
+            current = widget.currentText()
+            if idx >= 0:
+                widget.removeItem(idx)
+            if current == MATERIAL_UNDEFINED_PLACEHOLDER and widget.count():
+                # Leave selection to caller; default to first real catalog item only
+                # when restoring native mode, not while still imported.
+                pass
+            widget.setStyleSheet("")
+            widget.setToolTip("")
+        elif isinstance(widget, QDoubleSpinBox):
+            self._restore_spin_undefined(widget)
+            widget.setToolTip("")
+        elif isinstance(widget, QComboBox):
+            widget.setStyleSheet("")
+            widget.setToolTip("")
+
+    def _clear_all_undefined_controls(self) -> None:
+        for key in list(self._undefined_gui_keys):
+            self._clear_control_undefined(key)
+        self._undefined_gui_keys.clear()
+        # Ensure placeholder is removed when leaving imported undefined state.
+        if hasattr(self, "cmb_material"):
+            idx = self.cmb_material.findText(MATERIAL_UNDEFINED_PLACEHOLDER)
+            if idx >= 0:
+                current = self.cmb_material.currentText()
+                self.cmb_material.removeItem(idx)
+                if current == MATERIAL_UNDEFINED_PLACEHOLDER:
+                    self.cmb_material.setCurrentText("TNT")
+            self.cmb_material.setStyleSheet("")
+            self.cmb_material.setToolTip("")
+
+    def undefined_gui_keys(self) -> tuple[str, ...]:
+        return tuple(sorted(self._undefined_gui_keys))
+
+    def unsupported_import_features(self) -> tuple:
+        return tuple(self._unsupported_features)
 
     def _widget_for_gui_key(self, key: str):
         return {
@@ -985,7 +1097,15 @@ class Tab2D(QWidget):
     def _on_material_changed(self, name: str) -> None:
         if self._loading:
             return
-        props = self.materials_db.get(name, self.materials_db["Custom"])
+        if name == MATERIAL_UNDEFINED_PLACEHOLDER or not name:
+            return
+        if name not in self.materials_db:
+            # Never map an unknown label onto Custom / another catalog entry.
+            return
+        self._clear_control_undefined("material_name")
+        props = self.materials_db[name]
+        self._clear_control_undefined("rho_charge")
+        self._clear_control_undefined("energy_j_per_kg")
         self.spin_density.setValue(float(props["rho"]))
         self.spin_energy.setValue(float(props["energy"]))
 
@@ -1021,6 +1141,23 @@ class Tab2D(QWidget):
     def _on_model_changed(self, *_args) -> None:
         if self._loading:
             return
+        sender = self.sender()
+        if sender is not None and self._undefined_gui_keys:
+            for key in list(self._undefined_gui_keys):
+                widget = self._widget_for_gui_key(key)
+                if widget is not sender:
+                    continue
+                if key == "material_name":
+                    if self.cmb_material.currentText() != MATERIAL_UNDEFINED_PLACEHOLDER:
+                        self._clear_control_undefined(key)
+                elif isinstance(widget, QDoubleSpinBox):
+                    if getattr(widget, "_ggui_undef_prepared", False):
+                        if widget.value() > widget.minimum() + 1e-15:
+                            self._clear_control_undefined(key)
+                    else:
+                        self._clear_control_undefined(key)
+                else:
+                    self._clear_control_undefined(key)
         self.mark_stale()
         self._refresh_derived()
 
@@ -1089,6 +1226,14 @@ class Tab2D(QWidget):
         # Converted imports use the same live Setup Preview path as native cases
         # so mass/HOB/mesh edits update geometry immediately.
         try:
+            if self._undefined_gui_keys & (
+                set(REQUIRED_IMPORTED_PHYSICS_KEYS) | {"cell_size"}
+            ):
+                self.lbl_charge_r.setText("—")
+                self.lbl_charge_d.setText("—")
+                self.lbl_charge_l.setText("—")
+                self._refresh_info()
+                return
             inputs = self.get_case_inputs()
             result = validate_case_inputs_2d(inputs)
             domain = result.domain
@@ -1289,12 +1434,42 @@ class Tab2D(QWidget):
 
     def get_case_inputs(self) -> CaseInputs2D:
         name = self.cmb_material.currentText()
-        props = dict(self.materials_db.get(name, {}))
-        if name == "Custom":
-            props.update(
-                rho=self.spin_density.value(),
-                energy=self.spin_energy.value(),
-            )
+        material_undefined = (
+            "material_name" in self._undefined_gui_keys
+            or name == MATERIAL_UNDEFINED_PLACEHOLDER
+            or not name
+        )
+        if material_undefined:
+            name = ""
+            props: dict = {}
+        else:
+            props = dict(self.materials_db.get(name, {}))
+            if name == "Custom":
+                if "rho_charge" not in self._undefined_gui_keys:
+                    props.update(rho=self.spin_density.value())
+                if "energy_j_per_kg" not in self._undefined_gui_keys:
+                    props.update(energy=self.spin_energy.value())
+            elif name and name not in self.materials_db:
+                # Unknown combo text must not inherit another material's props.
+                props = {}
+
+        def _num_or_none(key: str, spin: QDoubleSpinBox):
+            if key in self._undefined_gui_keys:
+                return None
+            if getattr(spin, "_ggui_undef_prepared", False) and abs(
+                spin.value() - spin.minimum()
+            ) < 1e-15:
+                return None
+            return float(spin.value())
+
+        rho_charge = _num_or_none("rho_charge", self.spin_density)
+        energy_j_per_kg = _num_or_none("energy_j_per_kg", self.spin_energy)
+        mass_kg = _num_or_none("mass_kg", self.spin_mass)
+        if "cell_size" in self._undefined_gui_keys:
+            cell_size = None
+        else:
+            cell_size = float(self.spin_cell.value())
+
         mapping = MappingSource2D(
             case_path=self.txt_source_case.currentText().strip(),
             time_mode=self.cmb_source_time_mode.currentText(),
@@ -1305,16 +1480,16 @@ class Tab2D(QWidget):
         return CaseInputs2D(
             radius=self.spin_radius.value(),
             height=self.spin_height.value(),
-            cell_size=self.spin_cell.value(),
+            cell_size=cell_size,
             initialization_source=self.cmb_source.currentText(),
             charge_shape=self.cmb_shape.currentText(),
             height_of_burst=self.spin_hob.value(),
             detonation_height=self.spin_det_height.value(),
             charge_aspect=self.spin_ld.value(),
-            mass_kg=self.spin_mass.value(),
-            material_name=name,
-            rho_charge=self.spin_density.value(),
-            energy_j_per_kg=self.spin_energy.value(),
+            mass_kg=mass_kg,
+            material_name=name or "",
+            rho_charge=rho_charge,
+            energy_j_per_kg=energy_j_per_kg,
             material_props=props,
             p_atm=self.spin_pressure.value(),
             t_atm=self.spin_temperature.value(),
@@ -1367,6 +1542,7 @@ class Tab2D(QWidget):
             show_mesh=self.chk_view_mesh.isChecked(),
             show_probes=self.chk_view_probes.isChecked(),
             log_scale=self.chk_log_scale.isChecked(),
+            undefined_keys=tuple(sorted(self._undefined_gui_keys)),
         )
 
     def set_case_inputs(self, data: dict) -> None:
@@ -1431,8 +1607,11 @@ class Tab2D(QWidget):
                 (self.cmb_estimator, "refine_indicator_field"),
             )
             for widget, key in combos:
-                if key in values:
-                    widget.setCurrentText(str(values[key]))
+                if key not in values:
+                    continue
+                if key == "material_name" and not values[key]:
+                    continue
+                widget.setCurrentText(str(values[key]))
             checks = (
                 (self.chk_adjust, "adjust_time_step"),
                 (self.chk_dump_level, "dump_level"),
@@ -1483,12 +1662,21 @@ class Tab2D(QWidget):
         finally:
             if manage_loading:
                 self._loading = False
+        pending_undefined = tuple(values.get("undefined_keys") or ())
         if clear_imported:
             self._active_case_dir = None
             self._actual_cell_count = None
             self.clear_imported_case()
             self.set_simulation_state(SimulationState2D.DRAFT)
             self._apply_enablement()
+        if pending_undefined:
+            was_loading = self._loading
+            self._loading = True
+            try:
+                for key in pending_undefined:
+                    self._mark_control_undefined(str(key))
+            finally:
+                self._loading = was_loading
 
     def _request_initialize(self) -> None:
         if self.is_imported_mode:

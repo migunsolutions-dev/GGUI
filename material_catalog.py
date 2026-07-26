@@ -4,6 +4,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Dict
 
+from domain_errors import IncompleteMaterialError, UnknownMaterialError
 
 MATERIALS: Dict[str, Dict[str, Any]] = {
     "TNT": {"rho": 1630, "energy": 4.29e6},
@@ -41,22 +42,72 @@ JWL_PARAMETERS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# Shared thermodynamic template coefficients (not a material identity fallback).
+DEFAULT_CV_COEFFS = (413.15, 2.1538)
+
+REQUIRED_CUSTOM_JWL_KEYS = ("A", "B", "R1", "R2", "omega")
+
 
 def materials_copy() -> Dict[str, Dict[str, Any]]:
     return deepcopy(MATERIALS)
 
 
 def jwl_parameters(material_name: str, custom: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    if material_name == "Custom" and isinstance(custom, dict):
-        required = ("A", "B", "R1", "R2", "omega")
-        if all(key in custom for key in required):
-            return {
+    """Return JWL parameters for a known catalog material or a complete Custom dict.
+
+    Never substitutes another catalog material (including C4/TNT) when the name is
+    unknown or Custom parameters are incomplete.
+    """
+    name = str(material_name or "").strip()
+    if name == "Custom":
+        if not isinstance(custom, dict):
+            raise IncompleteMaterialError(
+                "Custom material requires a complete parameter dictionary."
+            )
+        missing = [key for key in REQUIRED_CUSTOM_JWL_KEYS if key not in custom]
+        has_energy = "E0" in custom or "energy" in custom
+        if not has_energy:
+            missing.append("E0 (or energy)")
+        if "rho" not in custom:
+            # rho is required for case generation completeness checks; phase
+            # properties also consume inputs.rho_charge separately.
+            pass
+        if missing:
+            raise IncompleteMaterialError(
+                "Custom material is incomplete; missing required parameter(s): "
+                + ", ".join(missing)
+                + "."
+            )
+        try:
+            values = {
                 "A": float(custom["A"]),
                 "B": float(custom["B"]),
                 "R1": float(custom["R1"]),
                 "R2": float(custom["R2"]),
                 "omega": float(custom["omega"]),
-                "E0": float(custom.get("E0", custom.get("energy", 9.0e9))),
-                "CvCoeffs": tuple(custom.get("CvCoeffs", (413.15, 2.1538))),
+                "E0": float(custom["E0"] if "E0" in custom else custom["energy"]),
+                "CvCoeffs": tuple(custom.get("CvCoeffs", DEFAULT_CV_COEFFS)),
             }
-    return deepcopy(JWL_PARAMETERS.get(material_name, JWL_PARAMETERS["C4"]))
+        except (TypeError, ValueError) as exc:
+            raise IncompleteMaterialError(
+                f"Custom material parameters are malformed: {exc}"
+            ) from exc
+        for key, number in values.items():
+            if key == "CvCoeffs":
+                continue
+            if not isinstance(number, float) or number != number or number in (float("inf"), float("-inf")):
+                raise IncompleteMaterialError(
+                    f"Custom material parameter {key!r} is non-finite."
+                )
+            if number <= 0:
+                raise IncompleteMaterialError(
+                    f"Custom material parameter {key!r} must be > 0."
+                )
+        return values
+
+    if name not in JWL_PARAMETERS:
+        raise UnknownMaterialError(
+            f"Unknown material {name!r}. Refusing to substitute catalog parameters "
+            "from another material."
+        )
+    return deepcopy(JWL_PARAMETERS[name])
