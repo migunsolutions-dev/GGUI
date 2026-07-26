@@ -5,11 +5,19 @@ from PyQt5.QtWidgets import (
     QRadioButton, QSplitter, QScrollArea, QSizePolicy, QTabWidget
 )
 from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QFont
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-# --- תיקון: ייבוא CaseInputs1D ---
 from models import CaseInputs1D
+from ui_metrics import (
+    COMPUTATIONAL_LEFT_PANEL_WIDTH,
+    COMPUTATIONAL_LEFT_PANEL_MIN,
+    EXECUTION_AREA_MIN_HEIGHT,
+    EXECUTION_AREA_PREFERRED_HEIGHT,
+    ACTION_BUTTON_FONT_PT,
+    GROUP_TITLE_FONT_PT,
+)
 
 class MplCanvas(FigureCanvas):
     def __init__(self, parent=None, width=5, height=4, dpi=100):
@@ -199,7 +207,7 @@ class Tab1D(QWidget):
         self.scroll_area.setWidget(self.left_container)
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.NoFrame)
-        self.scroll_area.setMinimumWidth(260)
+        self.scroll_area.setMinimumWidth(COMPUTATIONAL_LEFT_PANEL_MIN)
         left_layout.addWidget(self.scroll_area, stretch=1)
 
         # Info Panel (bottom of left column)
@@ -225,44 +233,104 @@ class Tab1D(QWidget):
         self.right_layout = QVBoxLayout(self.right_container)
         self.right_layout.setContentsMargins(0, 0, 0, 0)
         self.right_layout.setSpacing(0)
+
+        self._right_v_splitter = QSplitter(Qt.Vertical)
+        self._right_v_splitter.setChildrenCollapsible(False)
+        self._right_v_splitter.setObjectName("tab1dRightVerticalSplitter")
+
         self.canvas = MplCanvas(self)
         self.canvas.axes.set_title("Overpressure vs Distance")
         self.canvas.axes.set_xlabel("Distance (m)")
         self.canvas.axes.set_ylabel("Overpressure (Pa)")
         self.canvas.axes.grid(True)
-        self.right_layout.addWidget(self.canvas, stretch=1)
+        self.canvas.setMinimumHeight(120)
+
         self.ctrl_tabs = QTabWidget()
-        self.ctrl_tabs.setMinimumHeight(140)
-        self.ctrl_tabs.setMaximumHeight(160)
+        self.ctrl_tabs.setMinimumHeight(EXECUTION_AREA_MIN_HEIGHT)
+        self.ctrl_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.tab_exec = QWidget()
         self._build_exec_tab(self.tab_exec)
-        self.ctrl_tabs.addTab(self.tab_exec, "Execution Controls")
-        self.right_layout.addWidget(self.ctrl_tabs)
+        # Wrap execution content so very short windows can scroll locally.
+        exec_scroll = QScrollArea()
+        exec_scroll.setWidgetResizable(True)
+        exec_scroll.setFrameShape(QFrame.NoFrame)
+        exec_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        exec_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        exec_scroll.setWidget(self.tab_exec)
+        self._exec_scroll = exec_scroll
+        self.ctrl_tabs.addTab(exec_scroll, "Execution Controls")
+
+        self._right_v_splitter.addWidget(self.canvas)
+        self._right_v_splitter.addWidget(self.ctrl_tabs)
+        self._right_v_splitter.setStretchFactor(0, 1)
+        self._right_v_splitter.setStretchFactor(1, 0)
+        # Graph gets remainder; execution gets content-preferred height (~220–240).
+        self._right_v_splitter.setSizes([800, EXECUTION_AREA_PREFERRED_HEIGHT])
+        self._1d_exec_splitter_sizes = list(self._right_v_splitter.sizes())
+        self._right_v_splitter.splitterMoved.connect(self._on_1d_exec_splitter_moved)
+
+        self.right_layout.addWidget(self._right_v_splitter)
         self.splitter.addWidget(self.right_container)
 
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
-        self.splitter.setSizes([400, 800])
+        left_w = COMPUTATIONAL_LEFT_PANEL_WIDTH
+        self.splitter.setSizes([left_w, max(400, 1200 - left_w)])
+        self._main_splitter = self.splitter
         root_layout.addWidget(self.splitter)
+
+    def _on_1d_exec_splitter_moved(self, _pos: int = 0, _index: int = 0) -> None:
+        """Remember the user's graph/execution split for this session."""
+        self._1d_exec_splitter_sizes = list(self._right_v_splitter.sizes())
+
+    def restore_1d_exec_splitter_sizes(self) -> None:
+        """Re-apply session splitter sizes without resetting on tab return."""
+        sizes = getattr(self, "_1d_exec_splitter_sizes", None)
+        if sizes and hasattr(self, "_right_v_splitter"):
+            self._right_v_splitter.setSizes(sizes)
+
+    def get_computational_left_width(self) -> int:
+        return int(self.splitter.sizes()[0]) if self.splitter.sizes() else COMPUTATIONAL_LEFT_PANEL_WIDTH
+
+    def set_computational_left_width(self, width: int) -> None:
+        width = max(COMPUTATIONAL_LEFT_PANEL_MIN, int(width))
+        total = sum(self.splitter.sizes()) or (width + 800)
+        self.splitter.setSizes([width, max(50, total - width)])
 
     # --- פונקציית עזר לבניית הסרגל התחתון ---
     def _build_exec_tab(self, parent):
         layout = QHBoxLayout(parent)
+        layout.setContentsMargins(8, 8, 8, 8)
         
         # כפתורי פעולה בלבד
         g_actions = QGroupBox("Simulation Control")
+        title_font = QFont(g_actions.font())
+        title_font.setPointSize(GROUP_TITLE_FONT_PT)
+        title_font.setBold(True)
+        g_actions.setFont(title_font)
         v_actions = QHBoxLayout(g_actions)
         
+        action_font = QFont()
+        action_font.setPointSize(ACTION_BUTTON_FONT_PT)
+        action_font.setWeight(QFont.Bold)
+
         self.btn_run = QPushButton("▶ Run Simulation")
-        self.btn_run.setFixedWidth(200)
-        self.btn_run.setFixedHeight(50) 
-        self.btn_run.setStyleSheet("background-color: #2ecc71; color: white; font-weight: bold; font-size: 16px; border-radius: 6px;")
+        # Width sized for 10 pt bold label + padding (native Windows metrics).
+        self.btn_run.setFixedWidth(250)
+        self.btn_run.setFixedHeight(50)
+        self.btn_run.setFont(action_font)
+        self.btn_run.setStyleSheet(
+            "background-color: #2ecc71; color: white; font-weight: bold; border-radius: 6px;"
+        )
         self.btn_run.clicked.connect(self.sig_request_run.emit)
 
         self.btn_stop = QPushButton("⏸ Interrupt")
-        self.btn_stop.setFixedWidth(160)
+        self.btn_stop.setFixedWidth(190)
         self.btn_stop.setFixedHeight(50)
-        self.btn_stop.setStyleSheet("background-color: #e67e22; color: white; font-weight: bold; font-size: 16px; border-radius: 6px;")
+        self.btn_stop.setFont(action_font)
+        self.btn_stop.setStyleSheet(
+            "background-color: #e67e22; color: white; font-weight: bold; border-radius: 6px;"
+        )
         self.btn_stop.clicked.connect(self.sig_request_stop.emit)
 
         v_actions.addWidget(self.btn_run)

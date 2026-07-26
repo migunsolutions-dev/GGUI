@@ -1,13 +1,23 @@
 import os
+import logging
 import numpy as np
 import pyvista as pv
 from pyvistaqt import QtInteractor
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QFrame, QLabel
+    QWidget, QVBoxLayout, QFrame, QLabel, QSizePolicy
 )
 from PyQt5.QtCore import pyqtSignal
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
+
+from viewer_gl import (
+    close_plotter_safely,
+    create_embedded_interactor,
+    register_viewer,
+    scalar_bar_kwargs,
+    stop_plotter_render_timer,
+    unregister_viewer,
+)
 
 HAS_PV = True
 try:
@@ -15,6 +25,8 @@ try:
     from pyvistaqt import QtInteractor
 except ImportError:
     HAS_PV = False
+
+_LOG = logging.getLogger("ggui.viewer_widget")
 
 @dataclass
 class ObstacleItem:
@@ -43,6 +55,7 @@ class SectionItem:
 
 class BlastViewerWidget(QWidget):
     cell_count_updated = pyqtSignal(int)
+    log_scale_rejected = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -67,6 +80,7 @@ class BlastViewerWidget(QWidget):
         self._probe_actors: List = None
         self._show_probes = False
         self._probes_data: List[tuple] = []
+        self.axisymmetric_mirror = False
 
         # Patch names that form the outer domain box (wireframe); all others = obstacles (solid)
         self._domain_patch_names = frozenset({"minX", "maxX", "minY", "maxY", "minZ", "maxZ"})
@@ -82,6 +96,9 @@ class BlastViewerWidget(QWidget):
         self._last_cell_count: Optional[int] = None
         self._dynamic_actors: List = []
         self._obstacle_actors: List = []
+        self._shutdown = False
+        self._viewport_active = True
+        self._gl_info = None
         self._init_ui()
         # Headless Qt regression runs must not create an interactive OpenGL
         # context. The data/model paths remain fully testable offscreen.
@@ -91,18 +108,55 @@ class BlastViewerWidget(QWidget):
     def _init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0,0,0,0)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.plotter_frame = QFrame()
+        self.plotter_frame.setMinimumWidth(0)
+        self.plotter_frame.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.plotter_layout = QVBoxLayout(self.plotter_frame)
         self.plotter_layout.setContentsMargins(0,0,0,0)
         layout.addWidget(self.plotter_frame)
 
     def _init_vtk(self):
-        if not HAS_PV: return
-        self._plotter = QtInteractor(self.plotter_frame)
+        if not HAS_PV:
+            return
+        # auto_update=False: pyvistaqt's default 5 Hz timer causes wglMakeCurrent
+        # failures on hidden QTabWidget pages (invalid HWND).
+        self._plotter = create_embedded_interactor(self.plotter_frame, auto_update=False)
         self._plotter.set_background("#F0F2F5")  # Light bluish-grey (Engineering style)
         self._plotter.add_axes()
-        self._plotter.enable_trackball_style()
-        self.plotter_layout.addWidget(self._plotter.interactor)
+        try:
+            self._plotter.enable_trackball_style()
+        except RuntimeError:
+            pass
+        interactor = self._plotter.interactor
+        try:
+            interactor.setMinimumWidth(0)
+            interactor.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        except Exception:
+            pass
+        self.plotter_layout.addWidget(interactor)
+        self._gl_info = register_viewer("BlastViewerWidget/3D", self, self._plotter)
+
+    def set_viewport_active(self, active: bool) -> None:
+        """Pause/resume any plotter timers when the hosting tab is hidden."""
+        self._viewport_active = bool(active)
+        stop_plotter_render_timer(self._plotter)
+
+    def shutdown_viewer(self) -> None:
+        """Stop timers and close the VTK window while the Qt HWND is still valid."""
+        if self._shutdown:
+            return
+        self._shutdown = True
+        self._viewport_active = False
+        plotter = self._plotter
+        self._plotter = None
+        stop_plotter_render_timer(plotter)
+        close_plotter_safely(plotter, owner="BlastViewerWidget/3D")
+        unregister_viewer(self)
+        self._dynamic_actors.clear()
+        self._obstacle_actors.clear()
+        self._probe_actors = []
 
     def set_field(self, name):
         self.current_field = name
@@ -144,6 +198,11 @@ class BlastViewerWidget(QWidget):
     def set_log_scale(self, state: bool) -> None:
         for s in self.field_settings.values():
             s.log_scale = state
+
+    def set_axisymmetric_mirror(self, state: bool) -> None:
+        """Display-only reflection across global X=0 for r-z wedge slices."""
+        self.axisymmetric_mirror = bool(state)
+        self.force_refresh_view()
 
     def toggle_probes(self, state: bool, probes_data: Optional[List[tuple]] = None) -> None:
         self._show_probes = bool(state)
@@ -315,7 +374,7 @@ class BlastViewerWidget(QWidget):
         return [ox, oy, oz]
 
     def refresh_view(self):
-        if not self._plotter:
+        if self._shutdown or not self._plotter:
             return
         # In preview mode, redraw preview with current viewport options (no Initialize needed)
         if not self.is_simulating and self._last_preview_data:
@@ -386,6 +445,12 @@ class BlastViewerWidget(QWidget):
                     except Exception:
                         pass
                 self._obstacle_actors.clear()
+            for a in list(self._probe_actors):
+                try:
+                    self._plotter.remove_actor(a)
+                except Exception:
+                    pass
+            self._probe_actors = []
 
             field = self.current_field
             s = self.field_settings.get(field, FieldViewSettings())
@@ -395,7 +460,10 @@ class BlastViewerWidget(QWidget):
                 arr = internal_mesh.get_array(field)
                 clim = [arr.min(), arr.max()] if s.auto_scale else [s.min_val, s.max_val]
                 if use_log_scale and clim[0] is not None and clim[1] is not None and clim[0] <= 0:
-                    clim = [max(1e-30, clim[0]), clim[1]]
+                    use_log_scale = False
+                    self.log_scale_rejected.emit(
+                        f"Log scale requires strictly positive {field} values."
+                    )
 
             if self._first_load:
                 # 1. Floor: white wireframe grid only (no solid color)
@@ -516,6 +584,10 @@ class BlastViewerWidget(QWidget):
                     slc = internal_mesh.slice(normal=sec.normal, origin=origin)
                     if slc.n_points == 0:
                         continue
+                    if self.axisymmetric_mirror:
+                        mirrored = slc.copy()
+                        mirrored.points[:, 0] *= -1.0
+                        slc = slc.merge(mirrored, merge_points=True, tolerance=1e-12)
                     opacity = float(np.clip(sec.opacity, 0.0, 1.0))
                     actor = self._plotter.add_mesh(
                         slc,
@@ -529,19 +601,22 @@ class BlastViewerWidget(QWidget):
                         log_scale=use_log_scale,
                     )
                     self._dynamic_actors.append(actor)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _LOG.warning("3D section render failed: %s", exc)
 
             if field in internal_mesh.array_names:
                 sb = self._plotter.add_scalar_bar(
-                    title=field,
-                    n_labels=6,
-                    fmt="%.2e",
-                    vertical=True,
-                    position_x=0.02,
-                    color="black",
-                    background_opacity=0.0,
-                    log_scale=use_log_scale,
+                    **scalar_bar_kwargs(
+                        title=field,
+                        n_labels=6,
+                        fmt="%.2e",
+                        vertical=True,
+                        position_x=0.02,
+                        color="black",
+                        fill=False,
+                        use_opacity=False,
+                        render=False,
+                    )
                 )
                 self._dynamic_actors.append(sb)
             tt = self._plotter.add_text(f"Time: {latest:.5f} s", position="upper_left", color="black", font_size=10)
@@ -561,5 +636,5 @@ class BlastViewerWidget(QWidget):
                     actor = self._plotter.add_mesh(sphere, color="yellow", opacity=0.9, reset_camera=False)
                     self._probe_actors.append(actor)
 
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOG.warning("3D view update failed: %s", exc)

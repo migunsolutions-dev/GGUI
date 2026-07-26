@@ -20,6 +20,7 @@ from initialization_plan import (
     outer_band_level_string,
 )
 from mesh_domain import align_domain_to_cell_size
+from material_catalog import jwl_parameters
 from models import CaseInputs3D
 from path_utils import get_latest_time_dir, win_to_wsl_path
 from startup_capture_guard import require_safe_capture
@@ -1990,26 +1991,8 @@ dumpLevel      true;
         init_pt = getattr(inputs, "initiation_point", None)
         if init_pt is None or (isinstance(init_pt, (list, tuple)) and len(init_pt) < 3):
             init_pt = inputs.charge_center
-        # JWL parameters from literature / tab_1d materials library; Custom from material_props
-        jwl_lib = {
-            "TNT":  {"A": 373.77e9, "B": 3.7471e9, "R1": 4.15, "R2": 0.90, "omega": 0.35, "E0": 4.29e9, "CvCoeffs": (413.15, 2.1538)},
-            "C4":   {"A": 609.77e9, "B": 12.95e9, "R1": 4.50, "R2": 1.40, "omega": 0.25, "E0": 9.0e9, "CvCoeffs": (413.15, 2.1538)},
-            "PETN": {"A": 617.0e9,  "B": 16.9e9,  "R1": 4.40, "R2": 1.20, "omega": 0.25, "E0": 6.11e9, "CvCoeffs": (413.15, 2.1538)},
-            "ANFO": {"A": 49.46e9,  "B": 1.89e9,  "R1": 3.90, "R2": 1.10, "omega": 0.33, "E0": 3.79e9, "CvCoeffs": (413.15, 2.1538)},
-        }
-        if inputs.material_name == "Custom" and getattr(inputs, "material_props", None):
-            mp = inputs.material_props
-            if isinstance(mp, dict) and all(k in mp for k in ("A", "B", "R1", "R2", "omega")):
-                j = {
-                    "A": float(mp["A"]), "B": float(mp["B"]),
-                    "R1": float(mp["R1"]), "R2": float(mp["R2"]), "omega": float(mp["omega"]),
-                    "E0": float(mp.get("E0", mp.get("energy", 9.0e9))),
-                    "CvCoeffs": mp.get("CvCoeffs", (413.15, 2.1538)),
-                }
-            else:
-                j = jwl_lib["C4"]
-        else:
-            j = jwl_lib.get(inputs.material_name, jwl_lib["C4"])
+        # Canonical material catalog shared with dimensional workflows.
+        j = jwl_parameters(inputs.material_name, getattr(inputs, "material_props", None))
         eos = f"equationOfState {{ rho0 {inputs.rho_charge}; A {j['A']:.4g}; B {j['B']:.4g}; R1 {j['R1']}; R2 {j['R2']}; omega {j['omega']}; }}"
         cv_coeffs = j.get("CvCoeffs", (413.15, 2.1538))
         thermo = f"thermodynamics {{ CvCoeffs<8> ({cv_coeffs[0]} {cv_coeffs[1]} 0 0 0 0 0 0); Sf 0.0; Hf 0.0; }}"
