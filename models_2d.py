@@ -52,7 +52,7 @@ class CaseInputs2D:
     # Domain. Radius and height are requested values; generation records effective values.
     radius: float = 1.5
     height: float = 1.5
-    cell_size: float = 0.05
+    cell_size: Optional[float] = 0.05
 
     # Initialization.
     initialization_source: str = "Direct Charge"  # Direct Charge | From 1D
@@ -62,10 +62,10 @@ class CaseInputs2D:
     detonation_radius: float = 0.0  # locked; validated to exactly zero
     detonation_height: float = 0.5
     charge_aspect: float = 2.5  # cylinder L/D
-    mass_kg: float = 1.0
+    mass_kg: Optional[float] = 1.0
     material_name: str = "TNT"
-    rho_charge: float = 1630.0
-    energy_j_per_kg: float = 4.29e6
+    rho_charge: Optional[float] = 1630.0
+    energy_j_per_kg: Optional[float] = 4.29e6
     material_props: Dict[str, Any] = field(default_factory=dict)
 
     # Atmosphere.
@@ -130,3 +130,6 @@ class CaseInputs2D:
     show_mesh: bool = False
     show_probes: bool = True
     log_scale: bool = False
+
+    # Explicit undefined imported required keys (never treated as widget defaults).
+    undefined_keys: Tuple[str, ...] = ()

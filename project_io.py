@@ -321,6 +321,13 @@ def _case_inputs_2d_from_dict(data: Dict[str, Any]) -> CaseInputs2D:
     )
     if "output_fields" in values:
         values["output_fields"] = tuple(values["output_fields"])
+    if "undefined_keys" in values:
+        keys = values.get("undefined_keys") or ()
+        if not isinstance(keys, (list, tuple)):
+            raise ProjectFormatError(
+                "dimensions.2D.case_inputs.undefined_keys must be a list"
+            )
+        values["undefined_keys"] = tuple(str(item) for item in keys)
     try:
         return CaseInputs2D(**values)
     except (TypeError, ValueError) as exc:

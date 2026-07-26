@@ -149,16 +149,19 @@ def validate_case_inputs_2d(inputs: CaseInputs2D) -> ValidationResult2D:
     charge = None
     seed_plan = None
 
-    try:
-        domain = align_axisymmetric_domain(inputs.radius, inputs.height, inputs.cell_size)
-        if domain.adjusted:
-            warnings.append(
-                "Effective domain was aligned to the requested Base Cell Size: "
-                f"R={domain.effective_radius:.6g} m, H={domain.effective_height:.6g} m "
-                f"({domain.radial_cells}×{domain.vertical_cells} cells)."
-            )
-    except (TypeError, ValueError) as exc:
-        errors.append(str(exc))
+    if inputs.cell_size is None:
+        errors.append("Base Cell Size is undefined.")
+    else:
+        try:
+            domain = align_axisymmetric_domain(inputs.radius, inputs.height, inputs.cell_size)
+            if domain.adjusted:
+                warnings.append(
+                    "Effective domain was aligned to the requested Base Cell Size: "
+                    f"R={domain.effective_radius:.6g} m, H={domain.effective_height:.6g} m "
+                    f"({domain.radial_cells}×{domain.vertical_cells} cells)."
+                )
+        except (TypeError, ValueError) as exc:
+            errors.append(str(exc))
 
     if inputs.initialization_source not in (DIRECT_SOURCE, REMAP_SOURCE):
         errors.append("Initialization Source must be Direct Charge or From 1D.")

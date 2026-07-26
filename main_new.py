@@ -1013,6 +1013,25 @@ class BlastFoamApp(QMainWindow):
         inputs = self.tab_2d.get_case_inputs()
         if not isinstance(inputs, CaseInputs2D):
             return
+        from material_validation import validate_required_values
+
+        required = validate_required_values(
+            inputs,
+            undefined_keys=getattr(self.tab_2d, "undefined_gui_keys", lambda: ())(),
+            imported_field_meta=getattr(self.tab_2d, "_imported_field_meta", {}),
+            unsupported_features=getattr(
+                self.tab_2d, "unsupported_import_features", lambda: ()
+            )(),
+            require_imported_physics=True,
+        )
+        if not required.ok:
+            QMessageBox.critical(
+                self,
+                "Imported 2D Required Values",
+                "\n".join(required.errors),
+            )
+            self.status_bar.set_status("2D required values missing", "#e74c3c")
+            return
         checked = validate_case_inputs_2d(inputs)
         if not checked.valid:
             QMessageBox.critical(

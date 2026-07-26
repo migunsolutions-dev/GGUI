@@ -18,6 +18,7 @@ from axisymmetric_2d import (
 from base_generator import ALPHA_C4_CHECK_SCRIPT, BaseGenerator
 from charge_capture import CAPTURE_CELL_SAFETY, auto_charge_capture_radius_m
 from material_catalog import jwl_parameters
+from material_validation import validate_required_values
 from models_2d import CaseInputs2D
 from path_utils import win_to_wsl_path
 
@@ -33,6 +34,11 @@ class Generator2D(BaseGenerator):
         self.openfoam_bashrc = openfoam_bashrc
 
     def generate(self, case_name: str, inputs: CaseInputs2D) -> str:
+        validate_required_values(
+            inputs,
+            undefined_keys=getattr(inputs, "undefined_keys", ()) or (),
+            require_imported_physics=bool(getattr(inputs, "undefined_keys", ())),
+        ).raise_if_invalid()
         checked = validate_case_inputs_2d(inputs).require_valid()
         assert checked.domain is not None
         case_dir = self.create_case_dirs(case_name)
@@ -223,6 +229,10 @@ mergePatchPairs ();
         self._write_text(os.path.join(zero, "U"), u)
 
     def _write_phase_properties(self, case_dir: str, inputs: CaseInputs2D) -> None:
+        validate_required_values(
+            inputs,
+            undefined_keys=getattr(inputs, "undefined_keys", ()) or (),
+        ).raise_if_invalid()
         j = jwl_parameters(inputs.material_name, inputs.material_props)
         cv = j["CvCoeffs"]
         remap = inputs.initialization_source != DIRECT_SOURCE

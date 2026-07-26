@@ -1,8 +1,9 @@
 """Map an imported axisymmetric blastFoam case onto Cylindrical–2D GUI fields.
 
 Provenance is explicit per field. Recovered values populate the editable GGUI model.
-Unknown values are not invented from native defaults; permanent GUI controls retain
-their widget defaults so the case remains fully editable and generatable.
+Unknown or unsupported values are not invented from native widget defaults; they
+remain unrecovered / case-defined so Initialise Model can require an explicit
+user value or block on unsupported source representations.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from case_topology import ClassificationResult, classify_case_topology
 from material_catalog import materials_copy
+from material_validation import REQUIRED_IMPORTED_PHYSICS_KEYS, UNSUPPORTED_IMPORT_KEYS
 
 
 class FieldProvenance(str, Enum):
@@ -58,6 +60,7 @@ class ImportMappingResult:
     read_only_keys: Tuple[str, ...] = ()
     probes: Tuple[Dict[str, Any], ...] = ()
     notes: Tuple[str, ...] = ()
+    unsupported_features: Tuple[Dict[str, str], ...] = ()
 
     def get(self, key: str) -> Optional[MappedField]:
         return self.fields.get(key)
@@ -1567,6 +1570,33 @@ def map_imported_case_to_gui(
     result.not_recovered_keys = tuple(sorted(not_recovered))
     result.editable_keys = tuple(sorted(editable))
     result.read_only_keys = tuple(sorted(read_only))
+
+    unsupported: List[Dict[str, str]] = []
+    for key, mf in result.fields.items():
+        gui_key = mf.gui_key or key
+        if mf.provenance != FieldProvenance.CASE_DEFINED:
+            continue
+        if gui_key not in UNSUPPORTED_IMPORT_KEYS and key not in UNSUPPORTED_IMPORT_KEYS:
+            continue
+        affected = (
+            "Direct Charge physics used by Initialise Model"
+            if gui_key in REQUIRED_IMPORTED_PHYSICS_KEYS or key in REQUIRED_IMPORTED_PHYSICS_KEYS
+            else "the regenerated mesh / boundary model"
+        )
+        unsupported.append(
+            {
+                "field": gui_key,
+                "source_feature": (
+                    f"{gui_key} in the imported blastFoam case"
+                    + (f" ({mf.source_file})" if mf.source_file else "")
+                ),
+                "reason": mf.reason
+                or "the source value cannot be represented identically in GGUI",
+                "affected": affected,
+            }
+        )
+    result.unsupported_features = tuple(unsupported)
+
     notes.append(
         "Converted editable GGUI model: Initialise Model regenerates a fresh case "
         "via generator_2d (source remains read-only)."
