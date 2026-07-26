@@ -1,164 +1,22 @@
 import os
 import re
-import glob
 import time
-import shlex
 import subprocess
-from dataclasses import dataclass
-from enum import Enum
 from typing import Optional, Tuple, List
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
+from execution_plan import (  # noqa: F401 — re-export for existing imports
+    FINAL_RECONSTRUCT_CMD,
+    ExecutionIntent,
+    ExecutionPlan,
+    ExecutionPreparationError,
+    build_execution_plan,
+)
+from wsl_runtime import build_case_command_argv, to_wsl_path_and_distro
+
 # Number of tail lines to capture from each log file for debug_summary.txt
 DEBUG_TAIL_LINES = 50
-
-
-class ExecutionIntent(str, Enum):
-    FRESH_FULL_PIPELINE = "fresh_full_pipeline"
-    INITIALIZED_SOLVER_RUN = "initialized_solver_run"
-    RESUME = "resume"
-    ONE_STEP_RESUME = "one_step_resume"
-
-
-class ExecutionPreparationError(RuntimeError):
-    pass
-
-
-@dataclass(frozen=True)
-class ExecutionPlan:
-    intent: ExecutionIntent
-    command: str
-    latest_time: Optional[float]
-    log_name: str = "log.blastFoam"
-
-
-def _numeric_time_dirs(path: str) -> List[float]:
-    values: List[float] = []
-    if not os.path.isdir(path):
-        return values
-    for name in os.listdir(path):
-        try:
-            value = float(name)
-        except ValueError:
-            continue
-        if value > 0 and os.path.isdir(os.path.join(path, name)):
-            values.append(value)
-    return values
-
-
-def build_execution_plan(
-    case_dir: str,
-    cores: int,
-    intent: ExecutionIntent,
-) -> ExecutionPlan:
-    """Build a non-destructive solver command for an already generated case."""
-    cores = max(1, int(cores))
-    if intent == ExecutionIntent.FRESH_FULL_PIPELINE:
-        return ExecutionPlan(intent, "bash ./Allrun", None, "log.Allrun")
-
-    serial_times = _numeric_time_dirs(case_dir)
-    serial_latest = max(serial_times) if serial_times else None
-    processor_dirs = sorted(
-        path
-        for path in glob.glob(os.path.join(case_dir, "processor[0-9]*"))
-        if os.path.isdir(path)
-    )
-    per_processor_times = [_numeric_time_dirs(path) for path in processor_dirs]
-    resume = intent in (ExecutionIntent.RESUME, ExecutionIntent.ONE_STEP_RESUME)
-
-    # Consistent processor latest only when every discovered rank reports the same max time.
-    # This rule applies for both serial and parallel resume — never silently take max().
-    processor_latest: Optional[float] = None
-    if processor_dirs:
-        latest_values = [max(times) if times else None for times in per_processor_times]
-        if cores > 1:
-            expected = {f"processor{i}" for i in range(cores)}
-            actual = {os.path.basename(path) for path in processor_dirs}
-            if actual != expected:
-                raise ExecutionPreparationError(
-                    f"Processor state has {len(processor_dirs)} directories but the GUI requests {cores} cores."
-                )
-        if resume:
-            if len(set(latest_values)) != 1:
-                raise ExecutionPreparationError(
-                    "Processor directories do not share one consistent latest saved time; "
-                    "reconstruct or repair the case before resuming."
-                )
-            if latest_values and latest_values[0] is not None:
-                processor_latest = latest_values[0]
-        elif latest_values and latest_values[0] is not None and len(set(latest_values)) == 1:
-            processor_latest = latest_values[0]
-
-    latest: Optional[float] = None
-    if resume:
-        # latest_time must match the state the solver will actually use.
-        if cores == 1:
-            if processor_latest is not None and (
-                serial_latest is None or processor_latest > serial_latest
-            ):
-                latest = processor_latest
-            else:
-                latest = serial_latest
-        else:
-            if serial_latest is not None and (
-                processor_latest is None or serial_latest > processor_latest
-            ):
-                latest = serial_latest
-            elif processor_latest is not None:
-                latest = processor_latest
-            else:
-                latest = serial_latest
-    else:
-        candidates = [t for t in (serial_latest, processor_latest) if t is not None]
-        latest = max(candidates) if candidates else None
-
-    if intent == ExecutionIntent.ONE_STEP_RESUME and latest is None:
-        zero_dir = os.path.join(processor_dirs[0] if processor_dirs else case_dir, "0")
-        if os.path.isdir(zero_dir) and os.path.isfile(os.path.join(zero_dir, "p")):
-            latest = 0.0
-    if resume and latest is None:
-        raise ExecutionPreparationError(
-            "No resumable saved time exists. Initialize and run the case before Resume/Exact 1."
-        )
-
-    if cores == 1:
-        start_mode = "latestTime" if resume else "startTime"
-        prep = ""
-        if resume and processor_dirs:
-            if processor_latest is not None and (
-                serial_latest is None or processor_latest > serial_latest
-            ):
-                prep = "reconstructPar -latestTime > log.reconstructResume 2>&1 && "
-        cmd = (
-            f"set -o pipefail; foamDictionary system/controlDict -entry startFrom -set {start_mode} "
-            f"> log.prepareSolver 2>&1 && {prep}blastFoam 2>&1 | tee log.blastFoam"
-        )
-        return ExecutionPlan(intent, cmd, latest)
-
-    prep = ""
-    if resume and processor_dirs:
-        if serial_latest is not None and (
-            processor_latest is None or serial_latest > processor_latest
-        ):
-            # Serial state is ahead: re-decompose latest serial time into processors.
-            prep = "decomposePar -force -latestTime > log.decomposeParSolver 2>&1 && "
-        # else: consistent processor state is newer or equal — reuse it.
-    elif not processor_dirs:
-        # Decompose the initialized time 0 for a new run, or only the latest
-        # reconstructed serial state for resume. Neither path cleans the case.
-        decompose_opt = "-force -latestTime" if resume else "-force"
-        prep = f"decomposePar {decompose_opt} > log.decomposeParSolver 2>&1 && "
-    start_mode = "latestTime" if resume else "startTime"
-    cmd = (
-        f"set -o pipefail; foamDictionary system/controlDict -entry startFrom -set {start_mode} "
-        f"> log.prepareSolver 2>&1 && {prep}"
-        f"mpirun -np {cores} blastFoam -parallel 2>&1 | tee log.blastFoam"
-    )
-    return ExecutionPlan(intent, cmd, latest)
-
-
-FINAL_RECONSTRUCT_CMD = "reconstructPar -latestTime > log.reconstructFinal 2>&1"
 
 
 class SolverRunner(QThread):
@@ -213,7 +71,8 @@ class SolverRunner(QThread):
         self._watchdog_stop_requested_time: Optional[float] = None  # time.time() when we created "stop"
         self._watchdog_grace_seconds: float = 3.0  # wait before forcing process stop if solver ignores "stop"
 
-        self._wsl_distro, self._linux_case_dir = self._win_unc_to_wsl_path_and_distro(win_case_dir)
+        path = to_wsl_path_and_distro(win_case_dir)
+        self._wsl_distro, self._linux_case_dir = path.distro, path.linux_path
 
     def stop(self) -> None:
         self.keep_running = False
@@ -232,40 +91,30 @@ class SolverRunner(QThread):
 
     @staticmethod
     def _win_unc_to_wsl_path_and_distro(win_path: str) -> Tuple[Optional[str], str]:
-        p = (win_path or "").strip()
-        if p.startswith("/"):
-            return None, p
-        if p.startswith("\\\\"):
-            parts = [x for x in p.split("\\") if x]
-            if len(parts) >= 3 and parts[0].lower() in ("wsl.localhost", "wsl$"):
-                distro = parts[1]
-                linux_parts = parts[2:]
-                return distro, "/" + "/".join(linux_parts)
-            return None, p.replace("\\", "/")
-        # Windows absolute path (e.g. C:\...): WSL needs /mnt/c/...
-        if len(p) >= 2 and p[1] == ":":
-            drive = p[0].lower()
-            rest = p[2:].replace("\\", "/").lstrip("/")
-            return None, f"/mnt/{drive}/{rest}" if rest else f"/mnt/{drive}/"
-        return None, p.replace("\\", "/")
+        """Compatibility wrapper around ``wsl_runtime.to_wsl_path_and_distro``."""
+        path = to_wsl_path_and_distro(win_path)
+        return path.distro, path.linux_path
 
     def _build_wsl_cmd(self, linux_dir: str, cmd: str) -> List[str]:
-        """Build WSL/bash command that sources OpenFOAM in the same shell then runs cmd.
-        Source must run in the current shell (not a subshell) so PATH and env persist for cmd.
-        Redirection (e.g. > log.reconstructPar) in cmd is interpreted by bash -lc."""
-        src = shlex.quote(self.openfoam_bashrc)
-        cdir = shlex.quote(linux_dir)
-        script = (
-            'set +u; '
-            'export ZSH_NAME="${ZSH_NAME:-}"; '
-            f'source {src} >/dev/null 2>&1 || true; '
-            f'cd {cdir} && {cmd}'
+        """Build WSL/bash argv via the central ``wsl_runtime`` module."""
+        # linux_dir is already converted; pass a synthetic case dir only for quoting
+        # of bashrc + command. Distro comes from the runner instance.
+        argv, _, _ = build_case_command_argv(
+            linux_dir if linux_dir.startswith("/") else self.win_case_dir,
+            cmd,
+            openfoam_bashrc=self.openfoam_bashrc,
+            quiet_source=True,
         )
-        if os.name == "nt":
-            if self._wsl_distro:
-                return ["wsl", "-d", self._wsl_distro, "--", "bash", "-lc", script]
-            return ["wsl", "bash", "-lc", script]
-        return ["bash", "-lc", script]
+        # Rebuild with the exact linux_dir + known distro to avoid re-detect drift.
+        from wsl_runtime import build_openfoam_script, build_wsl_argv
+
+        script = build_openfoam_script(
+            case_linux_path=linux_dir,
+            command=cmd,
+            openfoam_bashrc=self.openfoam_bashrc,
+            quiet_source=True,
+        )
+        return build_wsl_argv(script, distro=self._wsl_distro)
 
     def _run_simple(self, linux_dir: str, cmd: str) -> None:
         try:

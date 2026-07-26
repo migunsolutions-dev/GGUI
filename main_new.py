@@ -430,6 +430,8 @@ class BlastFoamApp(QMainWindow):
         
         # State
         self.runner = None
+        self._prep_worker = None
+        self._force_sync_prep = False  # tests may set True to avoid QThread races
         self.active_case_dir_3d = None
         self.active_case_initialized_3d = False
         self.active_case_dir_2d = None
@@ -1041,19 +1043,27 @@ class BlastFoamApp(QMainWindow):
             return
 
         self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_INITIALIZING)
+        self.active_case_initialized_2d = False
         self.status_bar.set_status("Generating GGUI case from imported model…", "#f39c12")
-        QApplication.processEvents()
+        self._set_preparation_controls_enabled(False)
 
-        try:
-            case_root = self._resolved_case_root()
+        from preparation_worker_qt import PreparationResult, PreparationStep, PreparationWorker
+
+        ctx = {
+            "source": source,
+            "inputs": inputs,
+            "case_root": self._resolved_case_root(),
+        }
+
+        def _generate_and_init(cancel_token):
+            if cancel_token.cancelled:
+                return PreparationResult(ok=False, cancelled=True, error="Cancelled")
+            case_root = ctx["case_root"]
             src_base = os.path.basename(source.rstrip("\\/")) or "imported"
-            # Prefer a fresh generated revision when a previous generated case exists.
             case_name = self.service.make_case_name(f"Case_2D_from_{src_base}")
             case_dir = self.service.generate_case(case_name, inputs)
             if os.path.normpath(case_dir) == source:
                 raise RuntimeError("Refusing to generate into the source directory.")
-            # Prefer the generator instance created by generate_case; fall back
-            # so initialization_command remains available if generate was wrapped.
             gen2d = self.service.generator_2d
             if gen2d is None:
                 from generator_2d import Generator2D
@@ -1061,20 +1071,19 @@ class BlastFoamApp(QMainWindow):
                 gen2d = Generator2D(case_root, self.openfoam_bashrc)
                 self.service.generator_2d = gen2d
             command = gen2d.initialization_command(inputs)
+            if cancel_token.cancelled:
+                return PreparationResult(ok=False, cancelled=True, error="Cancelled")
             success = self._run_wsl_commands(case_dir, command)
             if not success:
-                self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_FAILED)
-                self.active_case_initialized_2d = False
-                self.status_bar.set_status("2D Init Failed", "#e74c3c")
-                QMessageBox.critical(
-                    self,
-                    "Initialise Model Failed",
-                    "blockMesh / setRefinedFields / checkMesh failed in the "
-                    "generated GGUI case. See log.initialize. Source was not modified.",
+                return PreparationResult(
+                    ok=False,
+                    failed_step="initialize",
+                    error=(
+                        "blockMesh / setRefinedFields / checkMesh failed in the "
+                        "generated GGUI case. See log.initialize. Source was not modified."
+                    ),
+                    payload={"case_dir": case_dir, "command": command, "source": source},
                 )
-                return
-
-            # Require checkMesh "Mesh OK" before marking the case initialized.
             check_ok = False
             for log_name in ("log.checkMesh", "log.initialize"):
                 log_path = os.path.join(case_dir, log_name)
@@ -1085,27 +1094,90 @@ class BlastFoamApp(QMainWindow):
                         check_ok = True
                         break
             if not check_ok:
-                self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_FAILED)
-                self.active_case_initialized_2d = False
-                self.status_bar.set_status("2D Init Failed — Mesh not OK", "#e74c3c")
-                QMessageBox.critical(
-                    self,
-                    "Initialise Model Failed",
-                    "checkMesh did not report Mesh OK in the generated GGUI case.\n"
-                    "Source was not modified. See log.checkMesh / log.initialize.",
+                return PreparationResult(
+                    ok=False,
+                    failed_step="checkMesh",
+                    error=(
+                        "checkMesh did not report Mesh OK in the generated GGUI case.\n"
+                        "Source was not modified. See log.checkMesh / log.initialize."
+                    ),
+                    payload={"case_dir": case_dir, "command": command, "source": source},
                 )
-                return
+            return PreparationResult(
+                ok=True,
+                payload={
+                    "case_dir": case_dir,
+                    "command": command,
+                    "source": source,
+                    "inputs": inputs,
+                    "check_ok": check_ok,
+                },
+            )
+
+        worker = PreparationWorker(
+            [PreparationStep("generate_and_initialize", _generate_and_init)],
+            case_dir="",
+            openfoam_bashrc=self.openfoam_bashrc,
+            parent=self,
+        )
+        worker.progress.connect(
+            lambda name: self.status_bar.set_status(f"Preparing: {name}", "#f39c12")
+        )
+        worker.finished_ok.connect(self._on_imported_2d_prep_ok)
+        worker.finished_error.connect(self._on_imported_2d_prep_failed)
+        worker.finished_cancelled.connect(self._on_imported_2d_prep_cancelled)
+        self._prep_worker = worker
+        # Unit tests may force synchronous execution; production uses a QThread.
+        if getattr(self, "_force_sync_prep", False):
+            worker.run()
+        else:
+            worker.start()
+
+    def _set_preparation_controls_enabled(self, enabled: bool) -> None:
+        for attr in ("btn_initialize", "btn_exact_end", "btn_stop"):
+            widget = getattr(self.tab_2d, attr, None)
+            if widget is not None:
+                if enabled:
+                    # Restore from state helpers.
+                    self.tab_2d._apply_action_buttons(
+                        running=False,
+                        initialized=bool(getattr(self, "active_case_initialized_2d", False)),
+                    )
+                else:
+                    widget.setEnabled(False)
+
+    def _on_imported_2d_prep_failed(self, result) -> None:
+        self._set_preparation_controls_enabled(True)
+        self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_FAILED)
+        self.active_case_initialized_2d = False
+        self.status_bar.set_status("2D Init Failed", "#e74c3c")
+        QMessageBox.critical(
+            self,
+            "Initialise Model Failed",
+            result.error or "Preparation failed.",
+        )
+
+    def _on_imported_2d_prep_cancelled(self, result) -> None:
+        self._set_preparation_controls_enabled(True)
+        self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_FAILED)
+        self.active_case_initialized_2d = False
+        self.status_bar.set_status("2D Init cancelled", "#e74c3c")
+
+    def _on_imported_2d_prep_ok(self, result) -> None:
+        self._set_preparation_controls_enabled(True)
+        payload = result.payload or {}
+        case_dir = payload["case_dir"]
+        command = payload["command"]
+        source = payload["source"]
+        inputs = payload["inputs"]
+        check_ok = bool(payload.get("check_ok"))
+        try:
             actual_cells = self._count_poly_mesh_cells(case_dir)
             charge_cells = None
             alpha_path = os.path.join(case_dir, "0", "alpha.c4")
             if os.path.isfile(alpha_path):
                 try:
-                    from axisymmetric_viewer import AxisymmetricViewerWidget
-
-                    # Best-effort: count α>0.5 from ASCII field when available.
-                    with open(
-                        alpha_path, encoding="utf-8", errors="ignore"
-                    ) as alpha_file:
+                    with open(alpha_path, encoding="utf-8", errors="ignore") as alpha_file:
                         atxt = alpha_file.read()
                     import re as _re
 
@@ -1115,7 +1187,11 @@ class BlastFoamApp(QMainWindow):
                         _re.S,
                     )
                     if m:
-                        vals = [float(x) for x in m.group(2).split() if x[:1].isdigit() or x[:1] == "-"]
+                        vals = [
+                            float(x)
+                            for x in m.group(2).split()
+                            if x[:1].isdigit() or x[:1] == "-"
+                        ]
                         charge_cells = sum(1 for v in vals if v > 0.5)
                 except Exception:
                     charge_cells = None
@@ -1132,7 +1208,11 @@ class BlastFoamApp(QMainWindow):
             state.prepare_results = {
                 "blockMesh": 0,
                 "setRefinedFields": 0 if "setRefinedFields" in command else None,
-                "setFields": 0 if "setFields" in command and "setRefinedFields" not in command else None,
+                "setFields": (
+                    0
+                    if "setFields" in command and "setRefinedFields" not in command
+                    else None
+                ),
                 "checkMesh": 0 if check_ok else 1,
             }
             state.prepare_results = {
@@ -1148,8 +1228,6 @@ class BlastFoamApp(QMainWindow):
             state.runnable = True
             state.mode = ImportMode2D.IMPORTED_2D_READY
 
-            # The validated in-memory model remains authoritative in this
-            # session; inspection contributes runtime/mesh metadata only.
             self.tab_2d.load_imported_case(state, apply_mapping=False)
             self.active_case_dir_2d = case_dir
             self.active_case_initialized_2d = True
@@ -1332,26 +1410,24 @@ class BlastFoamApp(QMainWindow):
             if utility not in WHITELISTED_UTILITIES:
                 return 1, f"Refused non-whitelisted utility: {utility}"
 
-        distro, linux_path = SolverRunner._win_unc_to_wsl_path_and_distro(case_dir)
-        quoted = "'" + linux_path.replace("'", "'\"'\"'") + "'"
-        arg_str = " ".join(shlex.quote(tok) for tok in arg_tokens)
+        from wsl_runtime import quote_shell, run_wsl_command
+
+        arg_str = " ".join(quote_shell(tok) for tok in arg_tokens)
         rendered = f"{utility} {arg_str}".strip()
-        cmd = f"{rendered} > log.{utility} 2>&1"
-        full_cmd = f"source {self.openfoam_bashrc}; cd {quoted}; {cmd}; echo __GGUI_EC__:$?"
-        if distro:
-            wsl_args = ["wsl", "-d", distro, "bash", "-lc", full_cmd]
-        else:
-            wsl_args = ["wsl", "bash", "-lc", full_cmd]
+        cmd = f"{rendered} > log.{utility} 2>&1; echo __GGUI_EC__:$? "
         log_path = Path(case_dir) / f"log.{utility}"
         try:
-            completed = subprocess.run(
-                wsl_args, check=False, capture_output=True, text=True
+            result = run_wsl_command(
+                case_dir,
+                cmd,
+                openfoam_bashrc=self.openfoam_bashrc,
+                quiet_source=False,
             )
             text = ""
             if log_path.is_file():
                 text = log_path.read_text(encoding="utf-8", errors="ignore")
-            ec = completed.returncode
-            for line in (completed.stdout or "").splitlines()[::-1]:
+            ec = result.exit_code
+            for line in (result.stdout or "").splitlines()[::-1]:
                 if line.startswith("__GGUI_EC__:"):
                     try:
                         ec = int(line.split(":", 1)[1].strip())
@@ -1361,12 +1437,12 @@ class BlastFoamApp(QMainWindow):
             with open(log_path, "a", encoding="utf-8") as handle:
                 handle.write("\n# GGUI runner\n")
                 handle.write(f"utility={rendered}\nexit_code={ec}\n")
-                if completed.stdout:
+                if result.stdout:
                     handle.write("runner_stdout:\n")
-                    handle.write(completed.stdout)
-                if completed.stderr:
+                    handle.write(result.stdout)
+                if result.stderr:
                     handle.write("runner_stderr:\n")
-                    handle.write(completed.stderr)
+                    handle.write(result.stderr)
             if log_path.is_file():
                 text = log_path.read_text(encoding="utf-8", errors="ignore")
             print(f"[Prepare] {rendered} -> {ec} ({log_path})", file=sys.stderr)
@@ -1522,53 +1598,58 @@ class BlastFoamApp(QMainWindow):
     # ====== Simulation Control (Preserved from original) ======
     
     def _run_wsl_commands(self, case_dir, cmds):
-        """Execute WSL commands in case directory and log output to file.
-        Supports both UNC (\\\\wsl.localhost\\Distro\\...) and Windows paths (C:\\...)."""
+        """Execute WSL commands in case directory via central ``wsl_runtime``.
+
+        Supports UNC (\\\\wsl.localhost\\Distro\\...) and Windows paths (C:\\...).
+        All path/command quoting is performed by ``wsl_runtime``.
+        """
         import sys
         from pathlib import Path
-        
-        distro, linux_path = SolverRunner._win_unc_to_wsl_path_and_distro(case_dir)
-        full_cmd = f"source {self.openfoam_bashrc}; cd {linux_path}; {cmds}"
-        if distro:
-            wsl_args = ["wsl", "-d", distro, "bash", "-lc", full_cmd]
-        else:
-            wsl_args = ["wsl", "bash", "-lc", full_cmd]
-        
-        # Create log file for initialization output
+
+        from wsl_runtime import run_wsl_command, to_wsl_path_and_distro
+
+        path = to_wsl_path_and_distro(case_dir)
         log_file = Path(case_dir) / "log.initialize"
-        
         try:
-            with open(log_file, 'w', encoding='utf-8') as log:
-                log.write("="*60 + "\n")
+            result = run_wsl_command(
+                case_dir,
+                str(cmds),
+                openfoam_bashrc=self.openfoam_bashrc,
+                quiet_source=False,
+            )
+            with open(log_file, "w", encoding="utf-8") as log:
+                log.write("=" * 60 + "\n")
                 log.write("Initialize Command Log\n")
-                log.write("="*60 + "\n")
-                log.write(f"Directory: {linux_path}\n")
+                log.write("=" * 60 + "\n")
+                log.write(f"Directory: {path.linux_path}\n")
                 log.write(f"Command: {cmds}\n")
-                log.write("="*60 + "\n\n")
-                log.flush()
-                
-                result = subprocess.run(wsl_args, check=False, capture_output=True, text=True)
-                
+                log.write(f"Safe: {result.safe_command}\n")
+                log.write("=" * 60 + "\n\n")
                 if result.stdout:
                     log.write("STDOUT:\n")
                     log.write(result.stdout)
                     log.write("\n\n")
-                
                 if result.stderr:
                     log.write("STDERR:\n")
                     log.write(result.stderr)
                     log.write("\n\n")
-                
-                log.write("="*60 + "\n")
-                log.write(f"Result: {'SUCCESS' if result.returncode == 0 else 'FAILED with exit code ' + str(result.returncode)}\n")
-                log.write("="*60 + "\n")
-                
-            # Also try to print to console if available
-            print(f"\n[Initialize] Command {'succeeded' if result.returncode == 0 else 'FAILED with code ' + str(result.returncode)}")
+                log.write("=" * 60 + "\n")
+                log.write(
+                    "Result: "
+                    + (
+                        "SUCCESS"
+                        if result.ok
+                        else f"FAILED with exit code {result.exit_code}"
+                    )
+                    + "\n"
+                )
+                log.write("=" * 60 + "\n")
+            print(
+                f"\n[Initialize] Command "
+                f"{'succeeded' if result.ok else 'FAILED with code ' + str(result.exit_code)}"
+            )
             print(f"[Initialize] Log saved to: {log_file}")
-                
-            return result.returncode == 0
-            
+            return bool(result.ok)
         except Exception as e:
             print(f"ERROR running WSL commands: {e}", file=sys.stderr)
             return False

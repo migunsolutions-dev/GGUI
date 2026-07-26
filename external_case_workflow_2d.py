@@ -553,22 +553,24 @@ def validate_working_copy_destination(
 
 
 def _wsl_path_and_distro(win_path: str) -> Tuple[Optional[str], str]:
-    """Reuse General 3D / SolverRunner UNC→Linux conversion."""
-    from solver_runner import SolverRunner
+    """Canonical UNC/Windows→Linux conversion via ``wsl_runtime``."""
+    from wsl_runtime import to_wsl_path_and_distro
 
-    return SolverRunner._win_unc_to_wsl_path_and_distro(win_path)
+    path = to_wsl_path_and_distro(win_path)
+    return path.distro, path.linux_path
 
 
 def _run_wsl_argv(distro: Optional[str], script: str) -> subprocess.CompletedProcess:
-    """Invoke WSL with bash -lc (same pattern as General 3D)."""
-    if os.name == "nt":
-        if distro:
-            args = ["wsl", "-d", distro, "--", "bash", "-lc", script]
-        else:
-            args = ["wsl", "bash", "-lc", script]
-    else:
-        args = ["bash", "-lc", script]
-    return subprocess.run(args, check=False, capture_output=True, text=True)
+    """Invoke WSL with bash -lc via the central runtime module."""
+    from wsl_runtime import run_wsl_script
+
+    result = run_wsl_script(script, distro=distro)
+    return subprocess.CompletedProcess(
+        args=list(result.argv),
+        returncode=result.exit_code,
+        stdout=result.stdout,
+        stderr=result.stderr,
+    )
 
 
 def _copy_tree_via_wsl(

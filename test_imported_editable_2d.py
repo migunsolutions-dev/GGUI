@@ -414,6 +414,7 @@ class ImportInitUsesGeneratorTests(unittest.TestCase):
             ), mock.patch.object(
                 self.win.tab_2d.viewer, "set_field", autospec=True
             ):
+                self.win._force_sync_prep = True
                 self.win.on_initialize_imported_model_2d()
                 gen.assert_called_once()
                 run.assert_called_once()
