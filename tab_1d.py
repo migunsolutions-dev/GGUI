@@ -9,7 +9,11 @@ from PyQt5.QtGui import QFont
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-from models import CaseInputs1D
+from models import (
+    BOUNDARY_1D_RIGHT_OPTIONS,
+    BOUNDARY_1D_TRANSMIT,
+    CaseInputs1D,
+)
 from ui_metrics import (
     COMPUTATIONAL_LEFT_PANEL_WIDTH,
     COMPUTATIONAL_LEFT_PANEL_MIN,
@@ -25,6 +29,19 @@ def spherical_charge_radius_m(mass_kg: float, rho_kg_m3: float) -> float:
     rho = max(float(rho_kg_m3), 1e-12)
     mass = max(float(mass_kg), 0.0)
     return ((3.0 * mass) / (4.0 * math.pi * rho)) ** (1.0 / 3.0)
+
+
+# Ideal-gas sketch of the charge, same γ as the air phase. Peak tracks ρ and energy.
+INITIAL_CHARGE_GAMMA = 1.4
+
+
+def ideal_gas_charge_pressure_pa(
+    rho_kg_m3: float,
+    energy_j_per_kg: float,
+    gamma: float = INITIAL_CHARGE_GAMMA,
+) -> float:
+    """P = (γ-1) ρ e for the pre-run overpressure step."""
+    return max(float(gamma) - 1.0, 0.0) * max(float(rho_kg_m3), 0.0) * max(float(energy_j_per_kg), 0.0)
 
 
 def initial_overpressure_step(
@@ -98,7 +115,8 @@ class Tab1D(QWidget):
             probe_write_interval_steps=100,
             wedge_angle_deg=5.0,
             cone_half_angle_deg=12.0,
-            axis_epsilon=1e-3
+            axis_epsilon=1e-3,
+            right_boundary=self.cmb_right.currentText(),
         )
     # ----------------------------------------
 
@@ -189,6 +207,7 @@ class Tab1D(QWidget):
         self.edit_energy = QLineEdit("4.52e+06")
         self.edit_energy.setFixedWidth(100)
         self.edit_energy.editingFinished.connect(self.recalc_stats)
+        self.edit_energy.textChanged.connect(self.recalc_stats)
         energy_lay = QHBoxLayout()
         energy_lay.addWidget(self.edit_energy)
         energy_lay.addWidget(QLabel("(J/kg)"))
@@ -216,6 +235,22 @@ class Tab1D(QWidget):
         atmo_layout.addRow("Temp.", lay_temp)
         group_atmo.setLayout(atmo_layout)
         input_layout.addWidget(group_atmo)
+
+        group_bounds = QGroupBox("Boundaries")
+        bounds_layout = QFormLayout()
+        self.cmb_left = QComboBox()
+        self.cmb_left.addItem("Reflecting - spherical")
+        self.cmb_left.setEnabled(False)
+        self.cmb_right = QComboBox()
+        self.cmb_right.addItems(list(BOUNDARY_1D_RIGHT_OPTIONS))
+        self.cmb_right.setCurrentText(BOUNDARY_1D_TRANSMIT)
+        for combo in (self.cmb_left, self.cmb_right):
+            combo.setMinimumWidth(160)
+            combo.setMaximumWidth(220)
+        bounds_layout.addRow("Left", self.cmb_left)
+        bounds_layout.addRow("Right", self.cmb_right)
+        group_bounds.setLayout(bounds_layout)
+        input_layout.addWidget(group_bounds)
 
         group_solver = QGroupBox("Solver")
         solver_layout = QFormLayout()
@@ -356,16 +391,13 @@ class Tab1D(QWidget):
         axes.legend(loc="upper right")
 
     def charge_pressure_pa(self) -> float:
-        """Reference high-explosive pressure for the initial-condition sketch (JWL B)."""
-        props = self.get_selected_material_properties()
-        pressure = props.get("B")
-        if pressure is None:
-            try:
-                energy = float(self.edit_energy.text())
-            except (TypeError, ValueError):
-                energy = float(props.get("E0") or 0.0)
-            pressure = float(self.spin_density.value()) * energy
-        return float(pressure)
+        """Charge pressure for the pre-run sketch from the entered density and energy."""
+        rho = self.calculated_adj_rho if self.radio_yes.isChecked() else float(self.spin_density.value())
+        try:
+            energy = float(self.edit_energy.text())
+        except (TypeError, ValueError):
+            energy = float(self.get_selected_material_properties().get("E0") or 0.0)
+        return ideal_gas_charge_pressure_pa(rho, energy)
 
     def initial_overpressure_profile(self):
         rho = self.calculated_adj_rho if self.radio_yes.isChecked() else float(self.spin_density.value())
@@ -488,6 +520,7 @@ class Tab1D(QWidget):
             self.lbl_charge_radius.setText(f"{r_charge:.6f}")
             self.lbl_charge_cells.setText(f"{cells_charge}")
             self.lbl_adj_density.setText(f"{adj_rho:.1f}")
+            self._live_graph = False
             self.plot_initial_condition()
 
         except Exception:

@@ -3,7 +3,13 @@ import math
 from typing import Dict, Tuple
 
 from base_generator import BaseGenerator
-from models import CaseInputs1D, RecommendedParams1D
+from models import (
+    BOUNDARY_1D_REFLECT,
+    BOUNDARY_1D_RIGHT_OPTIONS,
+    BOUNDARY_1D_TRANSMIT,
+    CaseInputs1D,
+    RecommendedParams1D,
+)
 
 class Generator1D(BaseGenerator):
     """
@@ -43,36 +49,47 @@ class Generator1D(BaseGenerator):
         
         return case_dir
 
+    @staticmethod
+    def _right_boundary(inputs: CaseInputs1D) -> str:
+        kind = str(getattr(inputs, "right_boundary", BOUNDARY_1D_TRANSMIT) or BOUNDARY_1D_TRANSMIT)
+        return kind if kind in BOUNDARY_1D_RIGHT_OPTIONS else BOUNDARY_1D_TRANSMIT
+
     def write_initial_conditions(self, case_dir: str, inputs: CaseInputs1D) -> None:
         # Write to 0.orig so Allrun's "cp -r 0.orig 0" restores initial conditions (same as 3D flow).
         zero_dir = os.path.join(case_dir, "0.orig")
         rho_air = 1.225
         patches = ["origin", "outlet", "axis", "outerCone", "wedgeFront", "wedgeBack"]
+        right = self._right_boundary(inputs)
 
-        # Outlet: pressureWaveTransmissive for p (like mappedBuilding3D) minimizes reflections; zeroGradient for U.
-        # If blastFoam does not support pressureWaveTransmissive, fall back to advective for p.
         def scalar_bcs(name, val):
             lines = ["boundaryField", "{"]
             for pch in patches:
-                if pch.startswith("wedge"): lines.append(f"    {pch} {{ type wedge; }}")
+                if pch.startswith("wedge"):
+                    lines.append(f"    {pch} {{ type wedge; }}")
                 elif pch in ("axis", "outerCone", "origin"):
                     lines.append(f"    {pch} {{ type symmetry; }}")
-                else:
-                    if name == "p" and pch == "outlet":
-                        lines.append(f"    {pch} {{ type pressureWaveTransmissive; value uniform {inputs.p_atm}; }}")
+                elif pch == "outlet":
+                    if right == BOUNDARY_1D_TRANSMIT and name == "p":
+                        lines.append(
+                            f"    {pch} {{ type pressureWaveTransmissive; value uniform {inputs.p_atm}; }}"
+                        )
                     else:
                         lines.append(f"    {pch} {{ type zeroGradient; }}")
+                else:
+                    lines.append(f"    {pch} {{ type zeroGradient; }}")
             lines.append("}\n")
             return "\n".join(lines)
 
         def vector_bcs():
             lines = ["boundaryField", "{"]
             for pch in patches:
-                if pch.startswith("wedge"): lines.append(f"    {pch} {{ type wedge; }}")
+                if pch.startswith("wedge"):
+                    lines.append(f"    {pch} {{ type wedge; }}")
                 elif pch in ("axis", "outerCone", "origin"):
                     lines.append(f"    {pch} {{ type symmetry; }}")
+                elif pch == "outlet" and right == BOUNDARY_1D_REFLECT:
+                    lines.append(f"    {pch} {{ type slip; }}")
                 else:
-                    # Outlet: zeroGradient like mappedBuilding3D (allows outflow without reflection)
                     lines.append(f"    {pch} {{ type zeroGradient; }}")
             lines.append("}\n")
             return "\n".join(lines)
@@ -191,8 +208,9 @@ air
         mesh.append(");\nblocks\n(")
         mesh.append(f"    hex (0 3 2 1 4 7 6 5) (1 1 {n_r}) simpleGrading (1 1 1)")
         mesh.append(");\nedges\n(\n);\nboundary\n(")
+        outlet_type = "wall" if self._right_boundary(inputs) == BOUNDARY_1D_REFLECT else "patch"
         mesh.append("    origin     { type symmetry; faces ((4 7 6 5)); }")
-        mesh.append("    outlet     { type patch;    faces ((0 3 2 1)); }")
+        mesh.append(f"    outlet     {{ type {outlet_type};    faces ((0 3 2 1)); }}")
         mesh.append("    axis       { type symmetry; faces ((0 4 7 3)); }")
         mesh.append("    outerCone  { type symmetry; faces ((1 2 6 5)); }")
         mesh.append("    wedgeFront { type wedge;    faces ((0 1 5 4)); }")

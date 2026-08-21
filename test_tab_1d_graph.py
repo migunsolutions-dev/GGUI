@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import QApplication
 
 from tab_1d import (
     Tab1D,
+    ideal_gas_charge_pressure_pa,
     initial_overpressure_step,
     spherical_charge_radius_m,
 )
@@ -34,12 +35,15 @@ class DummyViewer(QObject):
 
 
 class InitialOverpressureProfileTests(unittest.TestCase):
-    def test_200kg_tnt_step_matches_charge_radius_and_jwl_b(self):
+    def test_200kg_tnt_step_uses_density_and_energy(self):
         mass = 200.0
         rho = 1630.0
+        energy = 4.29e6
         domain = 20.0
         p_atm = 101325.0
-        p_he = 3.23e9
+        p_he = ideal_gas_charge_pressure_pa(rho, energy)
+        self.assertAlmostEqual(p_he, 0.4 * rho * energy, delta=1.0)
+        self.assertLess(p_he, 3.0e9)
         charge_r = spherical_charge_radius_m(mass, rho)
         self.assertAlmostEqual(charge_r, 0.308, places=2)
         radii, over = initial_overpressure_step(domain, charge_r, p_he, p_atm)
@@ -71,12 +75,35 @@ class Tab1DInitialGraphTests(unittest.TestCase):
         self.assertEqual(line.get_label(), "Pressure")
         xs, ys = line.get_xdata(), line.get_ydata()
         charge_r = spherical_charge_radius_m(200.0, 1630.0)
+        peak = ideal_gas_charge_pressure_pa(1630.0, 4.29e6) - 101325.0
         self.assertAlmostEqual(float(xs[0]), 0.0)
         self.assertAlmostEqual(float(xs[-1]), 20.0)
         self.assertAlmostEqual(float(xs[1]), charge_r, places=5)
-        self.assertAlmostEqual(float(ys[0]), 3.23e9 - 101325.0, delta=1.0)
+        self.assertAlmostEqual(float(ys[0]), peak, delta=1.0)
+        self.assertLess(float(ys[0]), 3.0e9)
         self.assertAlmostEqual(float(ys[-1]), 0.0)
         self.assertFalse(tab._live_graph)
+
+    def test_graph_peak_tracks_density_and_energy(self):
+        tab = Tab1D()
+        tab.combo_comp.setCurrentText("TNT")
+        tab.spin_density.setValue(1600.0)
+        tab.edit_energy.setText("4.52e6")
+        self.app.processEvents()
+        first = float(tab.canvas.axes.lines[0].get_ydata()[0])
+        self.assertAlmostEqual(
+            first,
+            ideal_gas_charge_pressure_pa(1600.0, 4.52e6) - 101325.0,
+            delta=1.0,
+        )
+        tab.spin_density.setValue(1800.0)
+        self.app.processEvents()
+        denser = float(tab.canvas.axes.lines[0].get_ydata()[0])
+        self.assertGreater(denser, first)
+        tab.edit_energy.setText("5.0e6")
+        self.app.processEvents()
+        hotter = float(tab.canvas.axes.lines[0].get_ydata()[0])
+        self.assertGreater(hotter, denser)
 
     def test_live_update_does_not_call_synchronous_draw(self):
         tab = Tab1D()
@@ -90,6 +117,26 @@ class Tab1DInitialGraphTests(unittest.TestCase):
         self.assertTrue(tab._live_graph)
         tab.end_live_graph()
         self.assertFalse(tab._live_graph)
+
+
+class Tab1DBoundariesTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _app()
+
+    def test_right_boundary_has_three_options_default_transmit(self):
+        from models import BOUNDARY_1D_RIGHT_OPTIONS, BOUNDARY_1D_TRANSMIT
+
+        tab = Tab1D()
+        self.assertFalse(tab.cmb_left.isEnabled())
+        self.assertEqual(tab.cmb_left.currentText(), "Reflecting - spherical")
+        self.assertTrue(tab.cmb_right.isEnabled())
+        labels = [tab.cmb_right.itemText(i) for i in range(tab.cmb_right.count())]
+        self.assertEqual(labels, list(BOUNDARY_1D_RIGHT_OPTIONS))
+        self.assertEqual(tab.cmb_right.currentText(), BOUNDARY_1D_TRANSMIT)
+        self.assertEqual(tab.get_case_inputs().right_boundary, BOUNDARY_1D_TRANSMIT)
+        tab.cmb_right.setCurrentText("Reflect")
+        self.assertEqual(tab.get_case_inputs().right_boundary, "Reflect")
 
 
 class HiddenVtkPaintGuardTests(unittest.TestCase):

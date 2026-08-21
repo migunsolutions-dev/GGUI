@@ -23,6 +23,17 @@ class GenerationResult1D:
     charge_radius: float
     rec: RecommendedParams1D
 
+# 1D outer (right) radius: Autodyn-style labels mapped to blastFoam outlet BCs.
+BOUNDARY_1D_TERMINATE = "Terminate"
+BOUNDARY_1D_TRANSMIT = "Transmit"
+BOUNDARY_1D_REFLECT = "Reflect"
+BOUNDARY_1D_RIGHT_OPTIONS = (
+    BOUNDARY_1D_TERMINATE,
+    BOUNDARY_1D_TRANSMIT,
+    BOUNDARY_1D_REFLECT,
+)
+
+
 @dataclass(frozen=True)
 class CaseInputs1D:
     radius: float
@@ -41,6 +52,7 @@ class CaseInputs1D:
     wedge_angle_deg: float = 5.0
     cone_half_angle_deg: float = 12.0
     axis_epsilon: float = 1e-3
+    right_boundary: str = BOUNDARY_1D_TRANSMIT
 
 @dataclass(frozen=True)
 class ObstacleData:

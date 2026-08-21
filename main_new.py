@@ -1762,7 +1762,12 @@ class BlastFoamApp(QMainWindow):
             inputs = self.tab_1d.get_case_inputs()
             if not isinstance(inputs, CaseInputs1D):
                 raise ValueError("Invalid 1D Inputs")
-            
+
+            for tab in (self.tab_2d, self.tab_3d):
+                setter = getattr(getattr(tab, "viewer", None), "set_viewport_active", None)
+                if callable(setter):
+                    setter(False)
+
             self.status_bar.set_status("Generating 1D Case...", "#f39c12")
             
             prefix = "Case_1D"

@@ -57,6 +57,7 @@ class GuiThreadAndLifecycleTests(unittest.TestCase):
             # Do not invoke full VTK path in offscreen unit test.
 
         viewer.refresh_view = tracked  # type: ignore[method-assign]
+        viewer.set_viewport_active(True)
         for _ in range(25):
             viewer.request_refresh()
         # Allow the single-shot coalesce timer to fire.

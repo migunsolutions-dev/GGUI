@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 
 from PyQt5.QtCore import QEvent, QObject, QSize
 from PyQt5.QtGui import QResizeEvent
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QWidget
 
 LOG = logging.getLogger("ggui.viewer_gl")
 
@@ -23,7 +23,13 @@ class VtkResizeGuard(QObject):
 
     def eventFilter(self, obj, event):  # noqa: N802
         etype = event.type()
-        if etype not in (QEvent.Resize, QEvent.Paint, QEvent.UpdateRequest, QEvent.Show):
+        if etype not in (
+            QEvent.Resize,
+            QEvent.Paint,
+            QEvent.UpdateRequest,
+            QEvent.Show,
+            QEvent.Expose,
+        ):
             return False
         viewer = self._viewer()
         if viewer is None or getattr(viewer, "_shutdown", False):
@@ -42,11 +48,18 @@ class VtkResizeGuard(QObject):
 
 
 def guard_embedded_interactor(interactor: Any, viewer: Any) -> None:
-    """Keep the resize filter alive on the viewer so VTK does not see invalid HWNDs."""
+    """Keep the resize/paint filter alive on the viewer and its GL children."""
     if interactor is None or viewer is None:
         return
     guard = VtkResizeGuard(viewer)
-    interactor.installEventFilter(guard)
+    widgets = [interactor]
+    try:
+        widgets.extend(interactor.findChildren(QWidget))
+    except Exception:
+        pass
+    for widget in widgets:
+        if widget is not None:
+            widget.installEventFilter(guard)
     viewer._vtk_resize_guard = guard
 
 

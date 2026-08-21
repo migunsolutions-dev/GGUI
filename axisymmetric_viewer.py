@@ -250,8 +250,7 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
 
     def set_viewport_active(self, active: bool) -> None:
         was_active = bool(self._viewport_active)
-        self._viewport_active = bool(active)
-        set_plotter_visible(self._plotter, bool(active))
+        super().set_viewport_active(active)
         if not active and self._coalesce_timer is not None:
             self._coalesce_timer.stop()
             self._refresh_pending = False

@@ -100,13 +100,20 @@ class BlastViewerWidget(QWidget):
         self._dynamic_actors: List = []
         self._obstacle_actors: List = []
         self._shutdown = False
-        self._viewport_active = True
+        self._viewport_active = False
         self._gl_info = None
         self._init_ui()
-        # Headless Qt regression runs must not create an interactive OpenGL
-        # context. The data/model paths remain fully testable offscreen.
-        if HAS_PV and os.environ.get("QT_QPA_PLATFORM", "").lower() != "offscreen":
-            self._init_vtk()
+        # Do not create an OpenGL interactor until this tab is actually shown.
+        # Hidden VTK widgets on Windows abort the process during 1D graph updates.
+
+    def _vtk_allowed(self) -> bool:
+        return HAS_PV and os.environ.get("QT_QPA_PLATFORM", "").lower() != "offscreen"
+
+    def ensure_vtk(self) -> None:
+        """Create the embedded plotter the first time this viewport becomes active."""
+        if self._shutdown or self._plotter is not None or not self._vtk_allowed():
+            return
+        self._init_vtk()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -143,12 +150,21 @@ class BlastViewerWidget(QWidget):
         self._gl_info = register_viewer("BlastViewerWidget/3D", self, self._plotter)
 
     def set_viewport_active(self, active: bool) -> None:
-        """Pause/resume any plotter timers when the hosting tab is hidden."""
+        """Create VTK only when shown; freeze hidden OpenGL widgets otherwise."""
         was_active = bool(self._viewport_active)
         self._viewport_active = bool(active)
+        if active:
+            self.ensure_vtk()
         set_plotter_visible(self._plotter, bool(active))
+        try:
+            self.setUpdatesEnabled(bool(active))
+            self.plotter_frame.setUpdatesEnabled(bool(active))
+        except Exception:
+            pass
         if active and not was_active:
-            sync_interactor_size(getattr(self._plotter, "interactor", None) if self._plotter else None)
+            sync_interactor_size(
+                getattr(self._plotter, "interactor", None) if self._plotter else None
+            )
 
     def shutdown_viewer(self) -> None:
         """Stop timers and close the VTK window while the Qt HWND is still valid."""
