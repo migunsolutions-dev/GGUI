@@ -22,13 +22,16 @@ class VtkResizeGuard(QObject):
         self._viewer = weakref.ref(viewer)
 
     def eventFilter(self, obj, event):  # noqa: N802
-        if event.type() != QEvent.Resize:
+        etype = event.type()
+        if etype not in (QEvent.Resize, QEvent.Paint, QEvent.UpdateRequest, QEvent.Show):
             return False
         viewer = self._viewer()
         if viewer is None or getattr(viewer, "_shutdown", False):
             return True
         if not getattr(viewer, "_viewport_active", True):
             return True
+        if etype != QEvent.Resize:
+            return False
         try:
             size = event.size()
         except Exception:
@@ -115,6 +118,22 @@ def live_viewer_registry_snapshot() -> list:
     for key in dead:
         _VIEWER_REGISTRY.pop(key, None)
     return out
+
+
+def set_plotter_visible(plotter: Any, visible: bool) -> None:
+    """Hide a hidden-tab VTK interactor so it cannot steal the OpenGL context."""
+    if plotter is None:
+        return
+    stop_plotter_render_timer(plotter)
+    interactor = getattr(plotter, "interactor", None)
+    if interactor is None:
+        return
+    try:
+        interactor.setVisible(bool(visible))
+    except Exception:
+        pass
+    if visible:
+        sync_interactor_size(interactor)
 
 
 def stop_plotter_render_timer(plotter: Any) -> None:

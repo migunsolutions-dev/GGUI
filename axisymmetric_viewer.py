@@ -27,6 +27,7 @@ from viewer_gl import (
     live_viewer_registry_snapshot,
     register_viewer,
     scalar_bar_kwargs,
+    set_plotter_visible,
     stop_plotter_render_timer,
     sync_interactor_size,
     unregister_viewer,
@@ -250,14 +251,11 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
     def set_viewport_active(self, active: bool) -> None:
         was_active = bool(self._viewport_active)
         self._viewport_active = bool(active)
-        stop_plotter_render_timer(self._plotter)
+        set_plotter_visible(self._plotter, bool(active))
         if not active and self._coalesce_timer is not None:
             self._coalesce_timer.stop()
             self._refresh_pending = False
         elif active and not was_active:
-            plotter = self._plotter
-            interactor = getattr(plotter, "interactor", None) if plotter is not None else None
-            sync_interactor_size(interactor)
             QTimer.singleShot(0, self.request_refresh)
 
     def _assert_gui_thread(self) -> bool:
@@ -562,6 +560,8 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         self._last_preview_data = (float(radius), float(height), dict(charge), list(probes))
         self.set_axisymmetric_domain(radius, height)
         if not self._plotter or not HAS_PV or self.is_simulating or self._shutdown:
+            return
+        if not getattr(self, "_viewport_active", True):
             return
         if not self._assert_gui_thread():
             return

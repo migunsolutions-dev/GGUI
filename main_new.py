@@ -723,6 +723,8 @@ class BlastFoamApp(QMainWindow):
     def _sync_computational_left_width(self, widget, record_from_current: bool = False) -> None:
         if widget not in self._computational_tabs():
             return
+        if not hasattr(self, "_computational_left_width"):
+            return
         if record_from_current and hasattr(widget, "get_computational_left_width"):
             self._computational_left_width = widget.get_computational_left_width()
         if self._computational_left_width is None:
@@ -1762,7 +1764,6 @@ class BlastFoamApp(QMainWindow):
                 raise ValueError("Invalid 1D Inputs")
             
             self.status_bar.set_status("Generating 1D Case...", "#f39c12")
-            QApplication.processEvents()
             
             prefix = "Case_1D"
             case_name = self.service.make_case_name(prefix)
@@ -2598,6 +2599,8 @@ class BlastFoamApp(QMainWindow):
                 if getattr(self.tab_2d, "is_imported_mode", False):
                     self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_READY)
                 self.tab_2d.set_simulation_state(SimulationState2D.INTERRUPTED)
+            elif getattr(self, "_active_run_mode", None) == "1D":
+                self.tab_1d.end_live_graph()
         self.view_timer.stop()
     
     def on_new_data(self, pressures, sim_time_s, step_n, dt_val, mode="1D"):
@@ -2627,6 +2630,7 @@ class BlastFoamApp(QMainWindow):
             if callable(setter):
                 setter(active)
         self._sync_status_caption_host()
+        self._sync_computational_left_width(current, record_from_current=False)
 
     def _sync_status_caption_host(self) -> None:
         """On 1D/2D/3D, put Ready on the Fit row; keep metrics in the bottom bar."""
@@ -2661,6 +2665,8 @@ class BlastFoamApp(QMainWindow):
         self.runner = None
         self._active_run_mode = None
         self.status_bar.stop_et_timing()
+        if finished_mode == "1D":
+            self.tab_1d.end_live_graph()
 
         if success:
             self.status_bar.set_progress(100)

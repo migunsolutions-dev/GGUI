@@ -16,6 +16,7 @@ from viewer_gl import (
     guard_embedded_interactor,
     register_viewer,
     scalar_bar_kwargs,
+    set_plotter_visible,
     stop_plotter_render_timer,
     sync_interactor_size,
     unregister_viewer,
@@ -145,11 +146,9 @@ class BlastViewerWidget(QWidget):
         """Pause/resume any plotter timers when the hosting tab is hidden."""
         was_active = bool(self._viewport_active)
         self._viewport_active = bool(active)
-        stop_plotter_render_timer(self._plotter)
+        set_plotter_visible(self._plotter, bool(active))
         if active and not was_active:
-            plotter = self._plotter
-            interactor = getattr(plotter, "interactor", None) if plotter is not None else None
-            sync_interactor_size(interactor)
+            sync_interactor_size(getattr(self._plotter, "interactor", None) if self._plotter else None)
 
     def shutdown_viewer(self) -> None:
         """Stop timers and close the VTK window while the Qt HWND is still valid."""

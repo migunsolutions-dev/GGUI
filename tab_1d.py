@@ -4,7 +4,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QFormLayout, QComboBox, QDoubleSpinBox, QLineEdit,
     QRadioButton, QSplitter, QScrollArea, QSizePolicy, QTabWidget
 )
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -18,6 +18,27 @@ from ui_metrics import (
     ACTION_BUTTON_FONT_PT,
     GROUP_TITLE_FONT_PT,
 )
+
+
+def spherical_charge_radius_m(mass_kg: float, rho_kg_m3: float) -> float:
+    """Equivalent sphere radius for a given charge mass and density."""
+    rho = max(float(rho_kg_m3), 1e-12)
+    mass = max(float(mass_kg), 0.0)
+    return ((3.0 * mass) / (4.0 * math.pi * rho)) ** (1.0 / 3.0)
+
+
+def initial_overpressure_step(
+    domain_radius_m: float,
+    charge_radius_m: float,
+    charge_pressure_pa: float,
+    p_atm: float,
+):
+    """Step profile: charge pressure inside R_charge, ambient overpressure outside."""
+    r_max = max(float(domain_radius_m), 1e-9)
+    r_c = min(max(float(charge_radius_m), 0.0), r_max)
+    over = max(float(charge_pressure_pa) - float(p_atm), 0.0)
+    return [0.0, r_c, r_c, r_max], [over, over, 0.0, 0.0]
+
 
 class MplCanvas(FigureCanvas):
     def __init__(self, parent=None, width=5, height=4, dpi=100):
@@ -40,6 +61,11 @@ class Tab1D(QWidget):
         
         self.last_r_min = None
         self.last_r_max = None
+        self._live_graph = False
+        self._graph_timer = QTimer(self)
+        self._graph_timer.setSingleShot(True)
+        self._graph_timer.setInterval(50)
+        self._graph_timer.timeout.connect(self._redraw_canvas)
 
         self.setup_ui()
         self.recalc_stats()
@@ -162,6 +188,7 @@ class Tab1D(QWidget):
 
         self.edit_energy = QLineEdit("4.52e+06")
         self.edit_energy.setFixedWidth(100)
+        self.edit_energy.editingFinished.connect(self.recalc_stats)
         energy_lay = QHBoxLayout()
         energy_lay.addWidget(self.edit_energy)
         energy_lay.addWidget(QLabel("(J/kg)"))
@@ -294,10 +321,6 @@ class Tab1D(QWidget):
         controls.addWidget(self.btn_fit, 0)
         layout.addLayout(controls)
         self.canvas = MplCanvas(self)
-        self.canvas.axes.set_title("Overpressure vs Distance")
-        self.canvas.axes.set_xlabel("Distance (m)")
-        self.canvas.axes.set_ylabel("Overpressure (Pa)")
-        self.canvas.axes.grid(True)
         self.canvas.setMinimumHeight(120)
         layout.addWidget(self.canvas, 1)
         return frame
@@ -315,7 +338,58 @@ class Tab1D(QWidget):
     def _fit_graph(self) -> None:
         self.canvas.axes.relim()
         self.canvas.axes.autoscale_view()
-        self.canvas.draw_idle()
+        self._redraw_canvas()
+
+    def _redraw_canvas(self) -> None:
+        """Queue a matplotlib paint; never force a synchronous OpenGL swap."""
+        try:
+            self.canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _style_overpressure_axes(self) -> None:
+        axes = self.canvas.axes
+        axes.set_title("Overpressure vs Range")
+        axes.set_xlabel("Radius (m)")
+        axes.set_ylabel("Overpressure (Pa)")
+        axes.grid(True)
+        axes.legend(loc="upper right")
+
+    def charge_pressure_pa(self) -> float:
+        """Reference high-explosive pressure for the initial-condition sketch (JWL B)."""
+        props = self.get_selected_material_properties()
+        pressure = props.get("B")
+        if pressure is None:
+            try:
+                energy = float(self.edit_energy.text())
+            except (TypeError, ValueError):
+                energy = float(props.get("E0") or 0.0)
+            pressure = float(self.spin_density.value()) * energy
+        return float(pressure)
+
+    def initial_overpressure_profile(self):
+        rho = self.calculated_adj_rho if self.radio_yes.isChecked() else float(self.spin_density.value())
+        charge_r = spherical_charge_radius_m(self.spin_mass.value(), rho)
+        return initial_overpressure_step(
+            self.spin_radius.value(),
+            charge_r,
+            self.charge_pressure_pa(),
+            self.spin_press.value(),
+        )
+
+    def plot_initial_condition(self) -> None:
+        """Show the entered charge as a step in overpressure vs radius, before a run."""
+        if self._live_graph or not hasattr(self, "canvas"):
+            return
+        radii, overpressures = self.initial_overpressure_profile()
+        self.canvas.axes.clear()
+        self.canvas.axes.plot(radii, overpressures, color="#c0392b", linewidth=1.8, label="Pressure")
+        self._style_overpressure_axes()
+        self._redraw_canvas()
+
+    def end_live_graph(self) -> None:
+        """Allow input edits to refresh the initial-condition sketch after a run."""
+        self._live_graph = False
 
     def _on_1d_exec_splitter_moved(self, _pos: int = 0, _index: int = 0) -> None:
         """Remember the user's graph/execution split for this session."""
@@ -414,12 +488,14 @@ class Tab1D(QWidget):
             self.lbl_charge_radius.setText(f"{r_charge:.6f}")
             self.lbl_charge_cells.setText(f"{cells_charge}")
             self.lbl_adj_density.setText(f"{adj_rho:.1f}")
+            self.plot_initial_condition()
 
         except Exception:
             pass
 
     def update_graph(self, pressures, sim_time_s: float):
-        if not pressures: return
+        if not pressures:
+            return
         
         if self.last_r_min is None:
             try:
@@ -454,14 +530,12 @@ class Tab1D(QWidget):
         else:
             distances = [r_min]
 
+        self._live_graph = True
         self.canvas.axes.clear()
-        self.canvas.axes.plot(distances, overpressures, label=f"t = {sim_time_s*1000.0:.3f} ms")
-        self.canvas.axes.set_title("Overpressure vs Distance")
-        self.canvas.axes.set_xlabel("Distance (m)")
-        self.canvas.axes.set_ylabel("Overpressure (Pa)")
-        
-        self.canvas.axes.axhline(0, color='gray', linestyle='--', linewidth=0.8)
-        
-        self.canvas.axes.grid(True)
-        self.canvas.axes.legend(loc="upper right")
-        self.canvas.draw()
+        self.canvas.axes.plot(
+            distances, overpressures, color="#c0392b", linewidth=1.8,
+            label=f"t = {sim_time_s*1000.0:.3f} ms",
+        )
+        self._style_overpressure_axes()
+        if not self._graph_timer.isActive():
+            self._graph_timer.start()
