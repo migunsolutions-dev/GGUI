@@ -1,0 +1,42 @@
+---
+description: Apply a marked UI Review change (בצע את השינוי המסומן). Reads _ui_review/selection.json and current.png, then applies only the requested layout or text change.
+alwaysApply: false
+---
+
+# UI Review — בצע את השינוי המסומן
+
+When the user asks **בצע את השינוי המסומן** (or equivalent: apply the marked UI Review change, move S1/S2 relative to R/A labels), follow this workflow only. Do not treat this rule as permission to commit, push, merge, delete files, or perform a broad refactor.
+
+## 1. Read the review artifacts
+
+1. Read `_ui_review/selection.json`.
+2. Inspect `_ui_review/current.png`.
+3. Resolve `S1` / `S2` / …, `A1`, and `R1` / `R2` / `R2.1` references using the JSON locators (`objectName`, structural locator, hierarchy, tab text, layout index). Prefer those stable locators over pixel coordinates.
+
+## 2. Ambiguity
+
+If `ambiguities` is non-empty, a locator is missing, or the destination region/anchor cannot be identified uniquely, **ask before editing**. Do not guess.
+
+## 3. Make only the requested change
+
+- Prefer semantic placement: above, below, before, after, inside a region or tab — never absolute coordinates.
+- Preserve widget IDs / objectNames, values, signal connections, Save/Open behavior, and generator mappings.
+- Never hide, delete, rename, or relocate an **unselected** control.
+- Do not change physics, defaults, case values, loaders, generators, or OpenFOAM/blastFoam behavior.
+- Supported instruction shapes include:
+  - העבר את S1 ל-R2 מתחת ל-A1
+  - העבר את S1 ו-S2 ל-R3 ושמור על הסדר ביניהם
+  - מקם את S1 אחרי A1
+  - שנה רק את המלל של S1
+  - הגדל את גודל המלל של S1 ב-1 pt
+  - הסתר את S1 אך אל תמחק אותו
+  - העבר את תת-הלשונית S1 אחרי Mesh ולפני Execution
+
+## 4. Verify and relaunch
+
+1. Run focused UI tests relevant to the edit (at least `python -m unittest test_ui_review_mode -v` plus any layout test that covers the touched tab).
+2. Close the preview process recorded in `_ui_review/session.json` if it is still the one this session started.
+3. Relaunch the same preview: `python ui_preview.py --tab <tab> --state <state> --review` (use the tab/state/size from `session.json`).
+4. **Stop uncommitted and unpushed** for user approval.
+
+Do not commit, push, merge, or open a PR unless the user separately and explicitly asks.

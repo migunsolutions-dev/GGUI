@@ -7,6 +7,8 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
 
+from unittest import mock
+
 from PyQt5.QtWidgets import QApplication
 
 from axisymmetric_viewer import (
@@ -83,12 +85,18 @@ class AxisymmetricViewportTests(unittest.TestCase):
             viewer.meridional_display_bounds(1.5, 2.5, False),
             (0.0, 1.5, 0.0, 2.5),
         )
-        viewer.update_axisymmetric_preview(
+        preview_args = (
             1.5,
             2.5,
             {"shape": "Sphere", "height": 0.5, "radius": 0.05, "length": 0.0},
             [(0.2, 0.7)],
         )
+        if viewer._plotter is not None:
+            with mock.patch.object(viewer._plotter, "add_text") as add_text:
+                viewer.update_axisymmetric_preview(*preview_args)
+            add_text.assert_not_called()
+        else:
+            viewer.update_axisymmetric_preview(*preview_args)
         viewer.set_mirrored_view(True)
         self.assertEqual(viewer._axisymmetric_domain, (1.5, 2.5))
         viewer.set_mirrored_view(False)

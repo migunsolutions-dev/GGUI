@@ -438,10 +438,10 @@ class ImportedUiTests(unittest.TestCase):
                              isinstance(getattr(self.win.tab_2d, "_left_stack", None), QStackedWidget)
                              and self.win.tab_2d._left_stack.currentIndex() == 1)
             self.assertFalse(hasattr(self.win.tab_2d, "txt_external_summary"))
-            self.assertEqual(self.win.tab_2d.input_tabs.count(), 3)
+            self.assertEqual(self.win.tab_2d.input_tabs.count(), 2)
             self.assertEqual(self.win.tab_2d.input_tabs.tabText(0), "Setup")
-            self.assertEqual(self.win.tab_2d.input_tabs.tabText(1), "Mesh & AMR")
-            self.assertEqual(self.win.tab_2d.input_tabs.tabText(2), "Output & Probes")
+            self.assertEqual(self.win.tab_2d.input_tabs.tabText(1), "Output & Probes")
+            self.assertEqual(self.win.tab_2d.btn_mesh_amr.text(), "Mesh & AMR")
             self.assertTrue(self.win.tab_2d.lbl_import_banner.text())
             self.assertIn("Editable GGUI model", self.win.tab_2d.lbl_import_banner.text())
             # Banner is shown when a case is loaded (may not be visible offscreen).

@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
 
 from PyQt5.QtCore import QRect, Qt
-from PyQt5.QtWidgets import QApplication, QLabel, QScrollArea, QToolBar
+from PyQt5.QtWidgets import QApplication, QGroupBox, QLabel, QScrollArea, QToolBar
 
 from ui_metrics import (
     COMPUTATIONAL_LEFT_PANEL_WIDTH,
@@ -19,6 +19,7 @@ from ui_metrics import (
     DEFAULT_WINDOW_WIDTH_TOLERANCE,
     DEFAULT_WINDOW_HEIGHT_TOLERANCE,
     EXECUTION_AREA_MIN_HEIGHT,
+    EXECUTION_AREA_PREFERRED_HEIGHT_2D,
     INFO_PANEL_HEIGHT_MIN,
     INFO_PANEL_HEIGHT_MAX,
     STATUS_FONT_MIN_POINT_SIZE,
@@ -181,11 +182,52 @@ class TestUILayoutConsistency(unittest.TestCase):
             self.app.processEvents()
             tab = win.tab_2d
             self.assertGreaterEqual(tab.ctrl_tabs.height(), EXECUTION_AREA_MIN_HEIGHT)
+            self.assertGreaterEqual(
+                tab.ctrl_tabs.height(), EXECUTION_AREA_PREFERRED_HEIGHT_2D - 40
+            )
             vp = tab._exec_scroll.viewport()
-            for btn in (tab.btn_run, tab.btn_stop):
+            for btn in (tab.btn_initialize, tab.btn_exact_end, tab.btn_stop):
                 br = btn.rect()
                 mapped = QRect(btn.mapTo(vp, br.topLeft()), br.size())
                 self.assertTrue(_rect_contained(mapped, vp.rect()), msg=btn.text())
+            last_radio = tab._field_radios["cellLevel"]
+            mapped_radio = QRect(
+                last_radio.mapTo(vp, last_radio.rect().topLeft()),
+                last_radio.rect().size(),
+            )
+            self.assertTrue(_rect_contained(mapped_radio, vp.rect()), msg=last_radio.text())
+            self.assertEqual(tab._exec_scroll.verticalScrollBar().maximum(), 0)
+            tab._right_v_splitter.setSizes([800, EXECUTION_AREA_MIN_HEIGHT])
+            self.app.processEvents()
+            self.assertGreater(tab._exec_scroll.verticalScrollBar().maximum(), 0)
+        finally:
+            win.close()
+
+    def test_2d_cell_counts_live_in_info_panel(self):
+        win = self._make_main()
+        try:
+            win.tabs.setCurrentWidget(win.tab_2d)
+            self.app.processEvents()
+            tab = win.tab_2d
+            self.assertTrue(tab.info_frame.isAncestorOf(tab.lbl_radial_cells))
+            self.assertTrue(tab.info_frame.isAncestorOf(tab.lbl_vertical_cells))
+            self.assertTrue(tab.info_frame.isAncestorOf(tab.lbl_radial_cells_title))
+            self.assertTrue(tab.info_frame.isAncestorOf(tab.lbl_vertical_cells_title))
+            domain = next(
+                box
+                for box in tab.findChildren(QGroupBox)
+                if box.title() == "Domain Definition"
+            )
+            self.assertFalse(domain.isAncestorOf(tab.lbl_radial_cells))
+            self.assertFalse(domain.isAncestorOf(tab.lbl_vertical_cells))
+            self.assertTrue(tab.info_frame.isAncestorOf(tab.lbl_effective_domain))
+            self.assertFalse(domain.isAncestorOf(tab.lbl_effective_domain))
+            self.assertEqual(tab.lbl_radial_cells_title.text(), "Radial cells:")
+            self.assertEqual(tab.lbl_vertical_cells_title.text(), "Vertical cells:")
+            self.assertTrue(tab.lbl_radial_cells.isHidden())
+            self.assertTrue(tab.lbl_vertical_cells.isHidden())
+            self.assertFalse(tab.lbl_info_grid.isHidden())
+            self.assertFalse(tab.lbl_info_resolution.isHidden())
         finally:
             win.close()
 

@@ -10,15 +10,21 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
 
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QAbstractSpinBox, QGroupBox, QLabel, QVBoxLayout
 
+from axisymmetric_2d import DYNAMIC_MESH, FIXED_MESH
 from openfoam_times_2d import (
     LIVE_FOLLOW_LABEL,
+    TIME_ZERO_LABEL,
     list_numeric_time_entries,
     list_numeric_time_labels,
+    make_single_time_case_view,
     match_reader_time_value,
+    opening_time_entry,
     pick_opening_time,
     poly_mesh_dir_at_or_before,
+    poly_mesh_dir_for_time_zero,
+    remove_single_time_case_view,
 )
 from axisymmetric_viewer import AxisymmetricViewerWidget
 from tab_2d import Tab2D
@@ -98,6 +104,54 @@ class OpenFOAMTimeHelperTests(unittest.TestCase):
             at_late = poly_mesh_dir_at_or_before(str(root), 7.6e-4)
             self.assertTrue(at_late.replace("\\", "/").endswith("0.00076/polyMesh"))
 
+    def test_poly_mesh_time_zero_does_not_list_case_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _touch_case_tree(
+                root,
+                ["0", "1e-07", "2e-07", "0.00076"],
+                mesh_at=["0"],
+            )
+            real_listdir = os.listdir
+
+            def guarded(path):
+                if os.path.normpath(path) == os.path.normpath(str(root)):
+                    raise AssertionError("time-0 mesh lookup listed the case root")
+                return real_listdir(path)
+
+            with mock.patch("os.listdir", side_effect=guarded):
+                found = poly_mesh_dir_for_time_zero(str(root))
+            self.assertTrue(found.replace("\\", "/").endswith("0/polyMesh"))
+
+    def test_single_time_view_exposes_only_requested_time(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _touch_case_tree(root, ["0", "1e-07", "2e-07", "0.00076"])
+            before = {
+                rel.relative_to(root).as_posix(): rel.stat().st_mtime_ns
+                for rel in root.rglob("*")
+                if rel.is_file()
+            }
+            view = make_single_time_case_view(str(root), TIME_ZERO_LABEL)
+            try:
+                names = set(os.listdir(view))
+                self.assertIn("0", names)
+                self.assertIn("constant", names)
+                self.assertIn("system", names)
+                self.assertIn("case.foam", names)
+                self.assertNotIn("1e-07", names)
+                self.assertNotIn("0.00076", names)
+            finally:
+                remove_single_time_case_view(view)
+            after = {
+                rel.relative_to(root).as_posix(): rel.stat().st_mtime_ns
+                for rel in root.rglob("*")
+                if rel.is_file()
+            }
+            self.assertEqual(before, after)
+            self.assertTrue((root / "0" / "p").is_file())
+            self.assertTrue((root / "0.00076").is_dir())
+
 
 class ViewerTimeSelectionTests(unittest.TestCase):
     def setUp(self):
@@ -115,10 +169,65 @@ class ViewerTimeSelectionTests(unittest.TestCase):
             self.assertEqual(self.viewer.selected_time_label, "0")
             self.assertEqual(self.viewer.selected_time_value, 0.0)
             self.assertFalse(self.viewer.live_follow)
+            self.assertEqual(self.viewer.available_time_labels(), ["0"])
+            self.viewer.ensure_time_catalog()
             self.assertEqual(
                 self.viewer.available_time_labels(),
                 ["0", "1e-07", "2e-07", "0.00076"],
             )
+
+    def test_initial_load_does_not_scan_or_load_later_times(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            later = ["0"] + [f"{i}e-07" for i in range(1, 40)]
+            _touch_case_tree(root, later)
+            with mock.patch(
+                "axisymmetric_viewer.list_numeric_time_entries",
+                wraps=list_numeric_time_entries,
+            ) as listed:
+                with mock.patch.object(self.viewer, "request_refresh"):
+                    self.viewer.load_case(str(root))
+                listed.assert_not_called()
+            self.assertEqual(self.viewer.selected_time_label, TIME_ZERO_LABEL)
+            self.assertEqual(opening_time_entry(), (0.0, TIME_ZERO_LABEL))
+            self.assertEqual(self.viewer.available_time_labels(), ["0"])
+            self.assertNotIn("All", self.viewer.available_time_labels())
+            self.assertNotIn("All timesteps", self.viewer.available_time_labels())
+
+    def test_initial_load_does_not_modify_result_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _touch_case_tree(root, ["0", "1e-07", "0.00076"])
+            before = {
+                rel.relative_to(root).as_posix(): (rel.stat().st_mtime_ns, rel.stat().st_size)
+                for rel in root.rglob("*")
+                if rel.is_file()
+            }
+            with mock.patch.object(self.viewer, "request_refresh"):
+                self.viewer.load_case(str(root))
+            after = {
+                rel.relative_to(root).as_posix(): (rel.stat().st_mtime_ns, rel.stat().st_size)
+                for rel in root.rglob("*")
+                if rel.is_file()
+            }
+            self.assertEqual(before, after)
+            self.assertFalse((root / "case.foam").exists())
+
+    def test_refresh_at_time_zero_does_not_scan_all_times(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _touch_case_tree(root, ["0", "1e-07", "0.00076"])
+            with mock.patch.object(self.viewer, "request_refresh"):
+                self.viewer.load_case(str(root))
+            with mock.patch(
+                "axisymmetric_viewer.list_numeric_time_entries"
+            ) as listed:
+                with mock.patch(
+                    "axisymmetric_viewer.pv.POpenFOAMReader",
+                    side_effect=RuntimeError("skip vtk"),
+                ):
+                    self.viewer._refresh_axisymmetric_result()
+                listed.assert_not_called()
 
     def test_selecting_later_time_pins_selection(self):
         with tempfile.TemporaryDirectory() as td:
@@ -225,12 +334,51 @@ class Tab2DTimeSelectorTests(unittest.TestCase):
     def test_toolbar_has_time_selector_default_zero(self):
         tab = Tab2D()
         self.assertTrue(hasattr(tab, "cmb_time"))
+        self.assertFalse(tab.cmb_time.isVisibleTo(tab))
+        self.assertFalse(tab.lbl_time.isVisibleTo(tab))
+        viewport = tab.viewer.parentWidget()
+        shown = []
+        for i in range(viewport.layout().count()):
+            item = viewport.layout().itemAt(i)
+            if item.layout() is None:
+                continue
+            for j in range(item.layout().count()):
+                widget = item.layout().itemAt(j).widget()
+                if widget is not None:
+                    shown.append(widget)
+                    if isinstance(widget, type(tab.lbl_time)):
+                        self.assertNotEqual(widget.text(), "Time:")
+        self.assertNotIn(tab.cmb_time, shown)
+        self.assertNotIn(tab.lbl_time, shown)
         self.assertEqual(tab.cmb_time.currentText(), "0")
         # After sync with times:
         tab._on_viewer_times_changed(["0", "1e-07", "0.00076"], "0", False)
         self.assertEqual(tab.cmb_time.currentText(), "0")
         texts = [tab.cmb_time.itemText(i) for i in range(tab.cmb_time.count())]
         self.assertEqual(texts[:4], ["0", "1e-07", "0.00076", LIVE_FOLLOW_LABEL])
+        self.assertNotIn("All", texts)
+        self.assertNotIn("All timesteps", texts)
+
+    def test_load_keeps_time_combo_at_zero_until_popup(self):
+        tab = Tab2D()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _touch_case_tree(root, ["0", "1e-07", "0.00076"])
+            with mock.patch(
+                "axisymmetric_viewer.list_numeric_time_entries",
+                wraps=list_numeric_time_entries,
+            ) as listed:
+                with mock.patch.object(tab.viewer, "request_refresh"):
+                    tab.viewer.load_case(str(root))
+                listed.assert_not_called()
+            self.assertEqual(tab.cmb_time.currentText(), "0")
+            shown = [tab.cmb_time.itemText(i) for i in range(tab.cmb_time.count())]
+            self.assertEqual(shown[0], "0")
+            self.assertNotIn("0.00076", shown)
+            tab._ensure_time_catalog()
+            shown = [tab.cmb_time.itemText(i) for i in range(tab.cmb_time.count())]
+            self.assertIn("0.00076", shown)
+            self.assertEqual(tab.cmb_time.currentText(), "0")
 
     def test_imported_and_native_open_rule_shared(self):
         tab = Tab2D()
@@ -263,6 +411,175 @@ class Tab2DTimeSelectorTests(unittest.TestCase):
             self.assertEqual(tab.cmb_time.currentText(), "0.00076")
 
 
+class Tab2DFieldSelectorTests(unittest.TestCase):
+    def test_field_radios_are_in_simulation_control_not_viewport(self):
+        tab = Tab2D()
+        group = tab.btn_initialize.parentWidget()
+        while group is not None and not isinstance(group, QGroupBox):
+            group = group.parentWidget()
+        self.assertIsNotNone(group)
+        self.assertEqual(group.title(), "Simulation Control")
+        field_box = tab._field_radios["p"].parentWidget()
+        self.assertTrue(group.isAncestorOf(field_box))
+        items = [
+            group.layout().itemAt(i).widget()
+            for i in range(group.layout().count())
+        ]
+        self.assertIs(items[-1], field_box)
+        self.assertGreater(items.index(field_box), items.index(tab.lbl_state))
+        viewport = tab.viewer.parentWidget()
+        self.assertFalse(viewport.isAncestorOf(tab.cmb_field))
+        self.assertFalse(tab.cmb_field.isVisibleTo(tab))
+        self.assertEqual(
+            [radio.text() for radio in tab._field_radios.values()],
+            [
+                "Pressure",
+                "Density",
+                "Temperature",
+                "Velocity",
+                "Explosive fraction",
+                "Refinement level",
+            ],
+        )
+        self.assertTrue(tab._field_radios["p"].isChecked())
+        self.assertEqual(tab.cmb_field.currentText(), "p")
+        tab._field_radios["rho"].setChecked(True)
+        self.assertEqual(tab.cmb_field.currentText(), "rho")
+        tab.cmb_field.setCurrentText("T")
+        self.assertTrue(tab._field_radios["T"].isChecked())
+        self.assertEqual(tab.viewer.current_field, "T")
+        actions = tab.btn_initialize.parentWidget()
+        self.assertIsInstance(actions.layout(), QVBoxLayout)
+        self.assertIs(actions.layout().itemAt(0).widget(), tab.btn_initialize)
+        self.assertIs(actions.layout().itemAt(1).widget(), tab.btn_exact_end)
+        self.assertIs(actions.layout().itemAt(2).widget(), tab.btn_stop)
+        self.assertTrue(tab.btn_log.isHidden())
+        self.assertIn("#3498db", tab.btn_initialize.styleSheet())
+        self.assertIn("#1abc9c", tab.btn_exact_end.styleSheet())
+        self.assertIn("#e67e22", tab.btn_stop.styleSheet())
+        self.assertEqual(tab.btn_initialize.minimumWidth(), 198)
+        self.assertEqual(tab.btn_exact_end.minimumWidth(), 198)
+        self.assertEqual(tab.btn_stop.minimumWidth(), 198)
+        self.assertIsNotNone(actions.layout().itemAt(3).spacerItem())
+        exec_page = tab._exec_scroll.widget()
+        view_box = tab.cmb_view_mode.parentWidget()
+        self.assertIs(exec_page.layout().itemAt(0).widget(), group)
+        self.assertIs(exec_page.layout().itemAt(1).widget(), view_box)
+        stacked = [
+            view_box.layout().itemAt(i).widget()
+            for i in range(5)
+        ]
+        self.assertEqual(
+            stacked,
+            [
+                tab.cmb_view_mode,
+                tab.lbl_mirror_indicator,
+                tab.chk_view_mesh,
+                tab.chk_view_probes,
+                tab.chk_log_scale,
+            ],
+        )
+        self.assertFalse(viewport.isAncestorOf(tab.cmb_view_mode))
+        self.assertTrue(viewport.isAncestorOf(tab.btn_fit))
+        self.assertTrue(viewport.isAncestorOf(tab.cmb_time))
+
+
+class Tab2DMeshModeSelectorTests(unittest.TestCase):
+    def test_mesh_mode_radios_sit_below_base_cell_size(self):
+        tab = Tab2D()
+        group = tab.spin_cell.parentWidget()
+        while group is not None and not isinstance(group, QGroupBox):
+            group = group.parentWidget()
+        self.assertIsNotNone(group)
+        self.assertEqual(group.title(), "Domain Definition")
+        self.assertTrue(group.isAncestorOf(tab.rad_fixed_mesh))
+        self.assertTrue(group.isAncestorOf(tab.rad_dyn_mesh))
+        self.assertEqual(tab.rad_fixed_mesh.text(), "Fixed Mesh")
+        self.assertEqual(tab.rad_dyn_mesh.text(), "Dyn Mesh (AMR)")
+        self.assertTrue(tab.rad_dyn_mesh.isChecked())
+        self.assertEqual(tab.cmb_mesh_mode.currentText(), DYNAMIC_MESH)
+        self.assertTrue(group.isAncestorOf(tab.btn_mesh_amr))
+        self.assertEqual(tab.btn_mesh_amr.text(), "Mesh & AMR")
+        self.assertTrue(tab.btn_mesh_amr.isEnabled())
+        self.assertTrue(tab.lbl_radial_cells.isHidden())
+        self.assertTrue(tab.lbl_vertical_cells.isHidden())
+        self.assertFalse(tab.lbl_info_grid.isHidden())
+        self.assertFalse(tab.lbl_info_charge.isHidden())
+        self.assertFalse(tab.lbl_info_resolution.isHidden())
+        self.assertTrue(
+            tab.lbl_info_total.text().startswith("Estimated cells before initialization")
+        )
+        self.assertEqual(
+            tab.btn_mesh_amr.maximumWidth(),
+            max(438 // 2, tab.btn_mesh_amr.sizeHint().width()),
+        )
+        self.assertEqual(
+            tab.cmb_source.maximumWidth(),
+            max(355 // 2, tab.cmb_source.sizeHint().width()),
+        )
+        self.assertEqual(tab.input_tabs.count(), 2)
+        self.assertEqual(tab.input_tabs.tabText(0), "Setup")
+        self.assertEqual(tab.input_tabs.tabText(1), "Output & Probes")
+        self.assertEqual(tab._mesh_dialog.windowTitle(), "Mesh & AMR")
+        self.assertIsNotNone(tab.grp_seed)
+        self.assertIsNotNone(tab.grp_amr)
+        with mock.patch.object(tab, "_refresh_derived"):
+            tab.cmb_mesh_mode.blockSignals(True)
+            tab.cmb_mesh_mode.setCurrentText(FIXED_MESH)
+            tab.cmb_mesh_mode.blockSignals(False)
+            tab._apply_enablement()
+            self.assertFalse(tab.btn_mesh_amr.isEnabled())
+            self.assertFalse(tab.lbl_radial_cells.isHidden())
+            self.assertFalse(tab.lbl_vertical_cells.isHidden())
+            self.assertTrue(tab.lbl_info_grid.isHidden())
+            self.assertTrue(tab.lbl_info_charge.isHidden())
+            self.assertTrue(tab.lbl_info_resolution.isHidden())
+            tab.cmb_mesh_mode.blockSignals(True)
+            tab.cmb_mesh_mode.setCurrentText(DYNAMIC_MESH)
+            tab.cmb_mesh_mode.blockSignals(False)
+            tab._apply_enablement()
+            self.assertTrue(tab.btn_mesh_amr.isEnabled())
+            self.assertTrue(tab.lbl_radial_cells.isHidden())
+            self.assertFalse(tab.lbl_info_grid.isHidden())
+            tab._open_mesh_amr_dialog()
+            self.assertTrue(tab._mesh_dialog.isVisible())
+            tab._mesh_dialog.hide()
+
+
+class Tab2DSetupUnitLabelTests(unittest.TestCase):
+    def _unit_text(self, spin):
+        row = spin.parentWidget()
+        labels = [child.text() for child in row.findChildren(QLabel)]
+        self.assertEqual(len(labels), 1)
+        return labels[0]
+
+    def test_setup_units_sit_right_of_spinboxes(self):
+        tab = Tab2D()
+        marked = (
+            (tab.spin_radius, "m"),
+            (tab.spin_height, "m"),
+            (tab.spin_cell, "m"),
+            (tab.spin_mass, "kg"),
+            (tab.spin_density, "kg/m³"),
+        )
+        for spin, unit in marked:
+            self.assertEqual(spin.suffix(), "")
+            self.assertEqual(self._unit_text(spin), unit)
+            self.assertEqual(spin.buttonSymbols(), QAbstractSpinBox.NoButtons)
+            self.assertEqual(spin.maximumWidth(), 124)
+        self.assertEqual(tab.cmb_material.maximumWidth(), tab.spin_mass.maximumWidth())
+        self.assertEqual(tab.cmb_shape.maximumWidth(), tab.spin_mass.maximumWidth())
+        self.assertTrue(tab.lbl_axis_lock.isHidden())
+        setup_widgets = []
+        layout = tab.grp_mapping.parentWidget().layout()
+        for i in range(layout.count()):
+            widget = layout.itemAt(i).widget()
+            if widget is not None:
+                setup_widgets.append(widget)
+        self.assertIs(setup_widgets[-1], tab.grp_mapping)
+        self.assertEqual(tab.grp_mapping.title(), "1D → 2D rotateFields")
+
+
 class Regression3DLatestPolicyUnchanged(unittest.TestCase):
     def test_shared_3d_viewer_still_uses_latest_in_source(self):
         src = Path(__file__).resolve().parent / "viewer_widget.py"
@@ -271,8 +588,9 @@ class Regression3DLatestPolicyUnchanged(unittest.TestCase):
         ax = Path(__file__).resolve().parent / "axisymmetric_viewer.py"
         atext = ax.read_text(encoding="utf-8")
         self.assertNotIn("reader.time_values[-1]", atext)
-        self.assertIn("match_reader_time_value", atext)
-        self.assertIn("pick_opening_time", atext)
+        self.assertIn("opening_time_entry", atext)
+        self.assertIn("make_single_time_case_view", atext)
+        self.assertNotIn("set_active_time_value", atext)
 
 
 if __name__ == "__main__":

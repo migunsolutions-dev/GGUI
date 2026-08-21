@@ -65,3 +65,6 @@ _refactor_*.py
 # --- Local debug / agent dumps --------------------------------------------
 debug_summary.txt
 /debug_*.txt
+
+# UI Review overlay output (never commit)
+_ui_review/

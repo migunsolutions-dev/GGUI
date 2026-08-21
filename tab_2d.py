@@ -8,8 +8,10 @@ from typing import Dict, List
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
@@ -19,6 +21,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
@@ -56,14 +59,21 @@ from models_2d import (
 
 MATERIAL_UNDEFINED_PLACEHOLDER = "— select material —"
 UNDEFINED_CONTROL_STYLE = "background-color: #fff3cd;"
+VIEW_FIELD_OPTIONS = (
+    ("p", "Pressure"),
+    ("rho", "Density"),
+    ("T", "Temperature"),
+    ("U", "Velocity"),
+    ("alpha.c4", "Explosive fraction"),
+    ("cellLevel", "Refinement level"),
+)
 from physical_charge_geometry import physical_charge_geometry
 from ui_metrics import (
-    ACTION_BUTTON_FONT_PT,
     COMPUTATIONAL_LEFT_PANEL_MIN,
     COMPUTATIONAL_LEFT_PANEL_WIDTH,
     CONTROL_MAX_WIDTH_DEFAULT,
     EXECUTION_AREA_MIN_HEIGHT,
-    EXECUTION_AREA_PREFERRED_HEIGHT,
+    EXECUTION_AREA_PREFERRED_HEIGHT_2D,
     FORM_ROW_SPACING,
     GROUP_MARGINS,
     INFO_PANEL_HEIGHT,
@@ -72,6 +82,16 @@ from ui_metrics import (
     SECONDARY_INFO_STYLE,
     WARNING_STYLE,
 )
+
+
+class TimeComboBox(QComboBox):
+    """Time selector. The on-disk catalog is loaded only when the popup opens."""
+
+    popup_requested = pyqtSignal()
+
+    def showPopup(self):
+        self.popup_requested.emit()
+        super().showPopup()
 
 
 class Tab2D(QWidget):
@@ -150,7 +170,7 @@ class Tab2D(QWidget):
         self, *, running: bool = False, initialized: bool = False
     ) -> None:
         self.btn_initialize.setText("Initialise Model")
-        self.btn_initialize.setMinimumWidth(140)
+        self.btn_initialize.setMinimumWidth(198)
         if not self.is_imported_mode:
             preparing = self._state == SimulationState2D.INITIALIZING
             self.btn_initialize.setEnabled(not running and not preparing)
@@ -224,8 +244,7 @@ class Tab2D(QWidget):
             field = "alpha.c4" if "alpha.c4" in state.fields else (
                 "p" if "p" in state.fields else (state.fields[0] if state.fields else "p")
             )
-            if self.cmb_field.findText(field) < 0:
-                self.cmb_field.addItem(field)
+            self._ensure_view_field_option(field)
             self.cmb_field.setCurrentText(field)
             self.viewer.load_case(state.active_case_path)
             self.viewer.set_field(field)
@@ -278,7 +297,7 @@ class Tab2D(QWidget):
             if hasattr(self, "lbl_import_banner"):
                 self.lbl_import_banner.setVisible(False)
             self.btn_initialize.setText("Initialise Model")
-            self.btn_initialize.setMinimumWidth(140)
+            self.btn_initialize.setMinimumWidth(198)
             try:
                 clearer = getattr(self.viewer, "clear_simulation_view", None)
                 if callable(clearer):
@@ -538,7 +557,8 @@ class Tab2D(QWidget):
     def _set_result_controls_available(self, available: bool) -> None:
         """Disable result-only field/log controls before initialization."""
         tip = "" if available else "Unavailable until Initialise Model completes"
-        for widget in (self.cmb_field, self.chk_log_scale):
+        widgets = [self.cmb_field, self.chk_log_scale, *self._field_radios.values()]
+        for widget in widgets:
             widget.setEnabled(bool(available))
             widget.setToolTip(tip)
         # Mesh/probe overlays remain available for Setup Preview.
@@ -657,7 +677,7 @@ class Tab2D(QWidget):
         self.input_tabs.setMinimumWidth(0)
         self.input_tabs.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.input_tabs.addTab(self._scroll_tab(self._build_setup_tab()), "Setup")
-        self.input_tabs.addTab(self._scroll_tab(self._build_mesh_tab()), "Mesh & AMR")
+        self._build_mesh_amr_dialog()
         self.input_tabs.addTab(self._scroll_tab(self._build_output_tab()), "Output & Probes")
         ll.addWidget(self.input_tabs, 1)
         self._left_setup_scroll = self.input_tabs.widget(0)
@@ -681,7 +701,7 @@ class Tab2D(QWidget):
         self._right_v_splitter.addWidget(self.ctrl_tabs)
         self._right_v_splitter.setStretchFactor(0, 1)
         self._right_v_splitter.setStretchFactor(1, 0)
-        self._right_v_splitter.setSizes([800, EXECUTION_AREA_PREFERRED_HEIGHT])
+        self._right_v_splitter.setSizes([800, EXECUTION_AREA_PREFERRED_HEIGHT_2D])
         self._2d_exec_splitter_sizes = list(self._right_v_splitter.sizes())
         self._right_v_splitter.splitterMoved.connect(self._on_2d_exec_splitter_moved)
         rl.addWidget(self._right_v_splitter)
@@ -721,15 +741,36 @@ class Tab2D(QWidget):
         spin.setDecimals(decimals)
         spin.setValue(value)
         spin.setSuffix(suffix)
-        spin.setMaximumWidth(CONTROL_MAX_WIDTH_DEFAULT)
+        spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        spin.wheelEvent = lambda event: event.ignore()
+        spin.setMaximumWidth(max(72, CONTROL_MAX_WIDTH_DEFAULT - 20))
         return spin
+
+    @staticmethod
+    def _with_unit(spin: QDoubleSpinBox, unit: str) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        spin.setSuffix("")
+        layout.addWidget(spin, 0)
+        layout.addWidget(QLabel(unit), 0)
+        layout.addStretch(1)
+        return row
+
+    @staticmethod
+    def _limit_width_to_half_or_text(widget, current_width: int) -> None:
+        half = max(1, int(current_width) // 2)
+        widget.setMaximumWidth(max(half, widget.sizeHint().width()))
 
     @staticmethod
     def _int(value, minimum=0, maximum=1000000000) -> QSpinBox:
         spin = QSpinBox()
         spin.setRange(minimum, maximum)
         spin.setValue(value)
-        spin.setMaximumWidth(CONTROL_MAX_WIDTH_DEFAULT)
+        spin.setButtonSymbols(QSpinBox.NoButtons)
+        spin.wheelEvent = lambda event: event.ignore()
+        spin.setMaximumWidth(max(72, CONTROL_MAX_WIDTH_DEFAULT - 20))
         return spin
 
     def _build_setup_tab(self) -> QWidget:
@@ -737,26 +778,20 @@ class Tab2D(QWidget):
         layout = QVBoxLayout(page)
 
         group, form = self._group("Domain Definition")
-        self.spin_radius = self._double(1.5, 1e-6, suffix=" m")
-        self.spin_height = self._double(1.5, 1e-6, suffix=" m")
-        self.spin_cell = self._double(0.05, 1e-6, suffix=" m")
-        self.lbl_radial_cells = QLabel("—")
-        self.lbl_vertical_cells = QLabel("—")
-        self.lbl_effective_domain = QLabel("—")
-        self.lbl_effective_domain.setWordWrap(True)
-        self.lbl_effective_domain.setStyleSheet(SECONDARY_INFO_STYLE)
-        form.addRow("Radius:", self.spin_radius)
-        form.addRow("Height:", self.spin_height)
-        form.addRow("Base Cell Size:", self.spin_cell)
-        form.addRow("Radial cells:", self.lbl_radial_cells)
-        form.addRow("Vertical cells:", self.lbl_vertical_cells)
-        form.addRow(self.lbl_effective_domain)
+        self.spin_radius = self._double(1.5, 1e-6)
+        self.spin_height = self._double(1.5, 1e-6)
+        self.spin_cell = self._double(0.05, 1e-6)
+        form.addRow("Radius:", self._with_unit(self.spin_radius, "m"))
+        form.addRow("Height:", self._with_unit(self.spin_height, "m"))
+        form.addRow("Base Cell Size:", self._with_unit(self.spin_cell, "m"))
+        form.addRow(self._build_mesh_mode_selector())
         layout.addWidget(group)
 
         group, form = self._group("Initialization Source")
         self.cmb_source = QComboBox()
         self.cmb_source.addItems([DIRECT_SOURCE, REMAP_SOURCE])
         form.addRow("Source:", self.cmb_source)
+        self._limit_width_to_half_or_text(self.cmb_source, 355)
         layout.addWidget(group)
 
         self.grp_charge, form = self._group("Direct Charge")
@@ -764,27 +799,30 @@ class Tab2D(QWidget):
         self.cmb_material.addItems(self.materials_db.keys())
         self.cmb_shape = QComboBox()
         self.cmb_shape.addItems(["Sphere", "Cylinder"])
-        self.spin_mass = self._double(1.0, 1e-9, suffix=" kg")
-        self.spin_density = self._double(1630.0, 1e-9, suffix=" kg/m³")
-        self.spin_energy = self._double(4.29e6, 1e-9, 1e12, 2, " J/kg")
-        self.spin_hob = self._double(0.5, 0.0, suffix=" m")
+        self.spin_mass = self._double(1.0, 1e-9)
+        self.cmb_material.setMaximumWidth(self.spin_mass.maximumWidth())
+        self.cmb_shape.setMaximumWidth(self.spin_mass.maximumWidth())
+        self.spin_density = self._double(1630.0, 1e-9)
+        self.spin_energy = self._double(4.29e6, 1e-9, 1e12, 2)
+        self.spin_hob = self._double(0.5, 0.0)
         self.spin_ld = self._double(2.5, 1e-6, 100.0, 3)
-        self.spin_det_height = self._double(0.5, 0.0, suffix=" m")
+        self.spin_det_height = self._double(0.5, 0.0)
         self.lbl_charge_r = QLabel("—")
         self.lbl_charge_d = QLabel("—")
         self.lbl_charge_l = QLabel("—")
         self.lbl_axis_lock = QLabel("Charge centre r = 0; detonation r = 0 (axisymmetric, locked)")
         self.lbl_axis_lock.setWordWrap(True)
         self.lbl_axis_lock.setStyleSheet(SECONDARY_INFO_STYLE)
+        self.lbl_axis_lock.setVisible(False)
         form.addRow("Composition:", self.cmb_material)
         form.addRow("Shape:", self.cmb_shape)
-        form.addRow("Mass:", self.spin_mass)
-        form.addRow("Density:", self.spin_density)
-        form.addRow("Energy:", self.spin_energy)
-        form.addRow("Height of Burst:", self.spin_hob)
+        form.addRow("Mass:", self._with_unit(self.spin_mass, "kg"))
+        form.addRow("Density:", self._with_unit(self.spin_density, "kg/m³"))
+        form.addRow("Energy:", self._with_unit(self.spin_energy, "J/kg"))
+        form.addRow("Height of Burst:", self._with_unit(self.spin_hob, "m"))
         self.lbl_ld_title = QLabel("Cylinder L/D:")
         form.addRow(self.lbl_ld_title, self.spin_ld)
-        form.addRow("Detonation height:", self.spin_det_height)
+        form.addRow("Detonation height:", self._with_unit(self.spin_det_height, "m"))
         form.addRow("Computed radius:", self.lbl_charge_r)
         form.addRow("Computed diameter:", self.lbl_charge_d)
         self.lbl_length_title = QLabel("Computed length:")
@@ -799,8 +837,8 @@ class Tab2D(QWidget):
         self.cmb_source_time_mode.addItems(["latest", "specific"])
         self.txt_source_time = QComboBox()
         self.txt_source_time.setEditable(True)
-        self.spin_mapped_radius = self._double(0.5, 1e-9, suffix=" m")
-        self.spin_source_resolution = self._double(0.01, 1e-9, suffix=" m")
+        self.spin_mapped_radius = self._double(0.5, 1e-9)
+        self.spin_source_resolution = self._double(0.01, 1e-9)
         self.lbl_mapping_note = QLabel(
             "rotateFields mapping is not conservative; normal mapping uses source-volume "
             "weighting and fallback/extension uses nearest cells."
@@ -810,16 +848,15 @@ class Tab2D(QWidget):
         form.addRow("Source case:", self.txt_source_case)
         form.addRow("Source time:", self.cmb_source_time_mode)
         form.addRow("Specific time:", self.txt_source_time)
-        form.addRow("Mapped radius:", self.spin_mapped_radius)
-        form.addRow("Source resolution:", self.spin_source_resolution)
+        form.addRow("Mapped radius:", self._with_unit(self.spin_mapped_radius, "m"))
+        form.addRow("Source resolution:", self._with_unit(self.spin_source_resolution, "m"))
         form.addRow(self.lbl_mapping_note)
-        layout.addWidget(self.grp_mapping)
 
         group, form = self._group("Atmosphere")
-        self.spin_pressure = self._double(101325.0, 1.0, 1e10, 2, " Pa")
-        self.spin_temperature = self._double(288.15, 1.0, 1e5, 2, " K")
-        form.addRow("Pressure:", self.spin_pressure)
-        form.addRow("Temperature:", self.spin_temperature)
+        self.spin_pressure = self._double(101325.0, 1.0, 1e10, 2)
+        self.spin_temperature = self._double(288.15, 1.0, 1e5, 2)
+        form.addRow("Pressure:", self._with_unit(self.spin_pressure, "Pa"))
+        form.addRow("Temperature:", self._with_unit(self.spin_temperature, "K"))
         layout.addWidget(group)
 
         group, form = self._group("Boundaries")
@@ -838,42 +875,103 @@ class Tab2D(QWidget):
 
         group, form = self._group("Solver Controls")
         self.spin_max_co = self._double(0.5, 1e-6, 10.0, 3)
-        self.spin_end_time = self._double(1e-3, 1e-12, 1e6, 9, " s")
-        self.spin_delta_t = self._double(1e-8, 1e-15, 1.0, 12, " s")
+        self.spin_end_time = self._double(1e-3, 1e-12, 1e6, 9)
+        self.spin_delta_t = self._double(1e-8, 1e-15, 1.0, 12)
         self.chk_adjust = QCheckBox()
         self.chk_adjust.setChecked(True)
         self.cmb_write_control = QComboBox()
         self.cmb_write_control.addItems(["adjustableRunTime", "timeStep"])
-        self.spin_write_time = self._double(1e-5, 1e-12, 1e6, 9, " s")
+        self.spin_write_time = self._double(1e-5, 1e-12, 1e6, 9)
         self.spin_write_steps = self._int(100, 1)
         self.spin_cycle_write = self._int(0, 0)
         self.spin_cores = self._int(1, 1, 1024)
         form.addRow("CFL / maxCo:", self.spin_max_co)
-        form.addRow("End Time:", self.spin_end_time)
-        form.addRow("Initial time step:", self.spin_delta_t)
+        form.addRow("End Time:", self._with_unit(self.spin_end_time, "s"))
+        form.addRow("Initial time step:", self._with_unit(self.spin_delta_t, "s"))
         form.addRow("Adjust time step:", self.chk_adjust)
         form.addRow("Write control:", self.cmb_write_control)
-        form.addRow("Write interval (time):", self.spin_write_time)
+        form.addRow("Write interval (time):", self._with_unit(self.spin_write_time, "s"))
         form.addRow("Write interval (steps):", self.spin_write_steps)
         form.addRow("cycleWrite:", self.spin_cycle_write)
         form.addRow("Processor cores:", self.spin_cores)
         layout.addWidget(group)
+        layout.addWidget(self.grp_mapping)
         layout.addStretch()
         return page
+
+    def _build_mesh_mode_selector(self) -> QWidget:
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(2)
+        title = QLabel("Mesh mode")
+        self.cmb_mesh_mode = QComboBox(box)
+        self.cmb_mesh_mode.addItems([FIXED_MESH, DYNAMIC_MESH])
+        self.cmb_mesh_mode.setCurrentText(DYNAMIC_MESH)
+        self.cmb_mesh_mode.hide()
+        self.rad_fixed_mesh = QRadioButton("Fixed Mesh")
+        self.rad_dyn_mesh = QRadioButton("Dyn Mesh (AMR)")
+        self.rad_dyn_mesh.setChecked(True)
+        self._mesh_mode_group = QButtonGroup(box)
+        self._mesh_mode_group.setExclusive(True)
+        self._mesh_mode_group.addButton(self.rad_fixed_mesh)
+        self._mesh_mode_group.addButton(self.rad_dyn_mesh)
+        layout.addWidget(title)
+        layout.addWidget(self.rad_fixed_mesh)
+        layout.addWidget(self.rad_dyn_mesh)
+        self.btn_mesh_amr = QPushButton("Mesh & AMR")
+        self.btn_mesh_amr.setToolTip(
+            "Startup charge refinement and runtime wave AMR. "
+            "Available when Mesh mode is Dyn Mesh (AMR)."
+        )
+        layout.addWidget(self.btn_mesh_amr)
+        self._limit_width_to_half_or_text(self.btn_mesh_amr, 438)
+        return box
+
+    def _open_mesh_amr_dialog(self) -> None:
+        if self.cmb_mesh_mode.currentText() != DYNAMIC_MESH:
+            return
+        self._mesh_dialog.show()
+        self._mesh_dialog.raise_()
+        self._mesh_dialog.activateWindow()
+
+    def _build_mesh_amr_dialog(self) -> None:
+        self._mesh_dialog = QDialog(self)
+        self._mesh_dialog.setWindowTitle("Mesh & AMR")
+        self._mesh_dialog.setModal(False)
+        self._mesh_dialog.resize(480, 640)
+        layout = QVBoxLayout(self._mesh_dialog)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self._scroll_tab(self._build_mesh_tab()))
+
+    def _on_mesh_mode_radio_toggled(self, checked: bool) -> None:
+        if not checked:
+            return
+        if self.sender() is self.rad_fixed_mesh:
+            target = FIXED_MESH
+        elif self.sender() is self.rad_dyn_mesh:
+            target = DYNAMIC_MESH
+        else:
+            return
+        if self.cmb_mesh_mode.currentText() != target:
+            self.cmb_mesh_mode.setCurrentText(target)
+
+    def _sync_mesh_mode_radios(self, text: str) -> None:
+        dynamic = str(text) == DYNAMIC_MESH
+        radio = self.rad_dyn_mesh if dynamic else self.rad_fixed_mesh
+        if radio.isChecked():
+            return
+        radio.blockSignals(True)
+        radio.setChecked(True)
+        radio.blockSignals(False)
 
     def _build_mesh_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        group, form = self._group("Mesh Mode")
-        self.cmb_mesh_mode = QComboBox()
-        self.cmb_mesh_mode.addItems([FIXED_MESH, DYNAMIC_MESH])
-        self.cmb_mesh_mode.setCurrentText(DYNAMIC_MESH)
         self.lbl_mesh_definition = QLabel()
         self.lbl_mesh_definition.setWordWrap(True)
         self.lbl_mesh_definition.setStyleSheet(SECONDARY_INFO_STYLE)
-        form.addRow("Mode:", self.cmb_mesh_mode)
-        form.addRow(self.lbl_mesh_definition)
-        layout.addWidget(group)
+        layout.addWidget(self.lbl_mesh_definition)
 
         self.grp_seed, form = self._group("Startup Charge Refinement")
         self.cmb_seed_mode = QComboBox()
@@ -987,7 +1085,7 @@ class Tab2D(QWidget):
 
     def _build_info_panel(self) -> QFrame:
         frame = QFrame()
-        frame.setFixedHeight(INFO_PANEL_HEIGHT)
+        frame.setFixedHeight(INFO_PANEL_HEIGHT + 84)
         frame.setStyleSheet(
             "background:#eef2f6; border:1px solid #c7d0da; border-radius:4px;"
         )
@@ -998,6 +1096,28 @@ class Tab2D(QWidget):
         title.setStyleSheet(INFO_TITLE_STYLE)
         layout.addWidget(title)
         layout.addSpacing(3)
+        cells = QFormLayout()
+        cells.setContentsMargins(0, 0, 0, 0)
+        cells.setHorizontalSpacing(8)
+        cells.setVerticalSpacing(2)
+        self.lbl_radial_cells_title = QLabel("Radial cells:")
+        self.lbl_vertical_cells_title = QLabel("Vertical cells:")
+        self.lbl_radial_cells = QLabel("—")
+        self.lbl_vertical_cells = QLabel("—")
+        for label in (
+            self.lbl_radial_cells_title,
+            self.lbl_vertical_cells_title,
+            self.lbl_radial_cells,
+            self.lbl_vertical_cells,
+        ):
+            label.setStyleSheet(INFO_ROW_STYLE)
+        cells.addRow(self.lbl_radial_cells_title, self.lbl_radial_cells)
+        cells.addRow(self.lbl_vertical_cells_title, self.lbl_vertical_cells)
+        layout.addLayout(cells)
+        self.lbl_effective_domain = QLabel("—")
+        self.lbl_effective_domain.setWordWrap(True)
+        self.lbl_effective_domain.setStyleSheet(INFO_ROW_STYLE)
+        layout.addWidget(self.lbl_effective_domain)
         self.lbl_info_total = QLabel("Total computational cells: —")
         self.lbl_info_grid = QLabel("Base grid: —")
         self.lbl_info_charge = QLabel("Charge size/radius: —")
@@ -1024,34 +1144,17 @@ class Tab2D(QWidget):
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(4, 4, 4, 4)
         controls = QHBoxLayout()
-        self.cmb_view_mode = QComboBox()
-        self.cmb_view_mode.addItems(["Mirrored View", "Computational Domain View"])
-        self.lbl_mirror_indicator = QLabel(
-            "Mirrored display — computational domain is r ≥ 0"
-        )
-        self.lbl_mirror_indicator.setStyleSheet(SECONDARY_INFO_STYLE)
-        self.cmb_time = QComboBox()
+        self.lbl_time = QLabel("Time:", frame)
+        self.cmb_time = TimeComboBox(frame)
         self.cmb_time.setMinimumWidth(110)
         self.cmb_time.setToolTip(
-            "Simulation time. Cases open at 0. Live follows newest output during exact END."
+            "Simulation time. Cases open at 0. Open this list to pick a later saved time."
         )
         self.cmb_time.addItems(["0"])
-        self.cmb_field = QComboBox()
-        self.cmb_field.addItems(["p", "rho", "T", "U", "alpha.c4", "cellLevel"])
-        self.chk_view_mesh = QCheckBox("Mesh overlay")
-        self.chk_view_probes = QCheckBox("Probe markers")
-        self.chk_view_probes.setChecked(True)
-        self.chk_log_scale = QCheckBox("Log scale")
+        self.lbl_time.hide()
+        self.cmb_time.hide()
         self.btn_fit = QPushButton("Fit")
-        controls.addWidget(self.cmb_view_mode)
-        controls.addWidget(self.lbl_mirror_indicator, 1)
-        controls.addWidget(QLabel("Time:"))
-        controls.addWidget(self.cmb_time)
-        controls.addWidget(QLabel("Field:"))
-        controls.addWidget(self.cmb_field)
-        controls.addWidget(self.chk_view_mesh)
-        controls.addWidget(self.chk_view_probes)
-        controls.addWidget(self.chk_log_scale)
+        controls.addStretch(1)
         controls.addWidget(self.btn_fit)
         layout.addLayout(controls)
         self.viewer = AxisymmetricViewerWidget()
@@ -1068,32 +1171,112 @@ class Tab2D(QWidget):
         self.btn_initialize = QPushButton("Initialise Model")
         self.btn_exact_end = QPushButton("exact END")
         self.btn_stop = QPushButton("Interrupt")
-        self.btn_log = QPushButton("Open Log")
+        self.btn_log = QPushButton("Open Log", group)
+        self.btn_log.setVisible(False)
         self.btn_run = self.btn_exact_end  # compatibility alias; no separate Run/Resume action
+        self.btn_initialize.setStyleSheet("background-color: #3498db; color: white; padding: 5px;")
+        self.btn_exact_end.setStyleSheet("background-color: #1abc9c; color: white; padding: 4px;")
+        self.btn_stop.setStyleSheet("background-color: #e67e22; color: white; padding: 5px;")
         for button in (self.btn_initialize, self.btn_exact_end, self.btn_stop):
-            button.setFixedHeight(50)
-            button.setMinimumWidth(140)
-            font = button.font()
-            font.setPointSize(ACTION_BUTTON_FONT_PT)
-            font.setBold(True)
-            button.setFont(font)
-        self.btn_initialize.setStyleSheet("background:#3498db;color:white;border-radius:6px;")
-        self.btn_exact_end.setStyleSheet("background:#2ecc71;color:white;border-radius:6px;")
-        self.btn_stop.setStyleSheet("background:#e67e22;color:white;border-radius:6px;")
-        gl.addWidget(self.btn_initialize)
-        gl.addWidget(self.btn_exact_end)
-        gl.addWidget(self.btn_stop)
-        gl.addWidget(self.btn_log)
+            button.setMinimumWidth(198)
+        actions = QWidget()
+        actions.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        v = QVBoxLayout(actions)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(self.btn_initialize)
+        v.addWidget(self.btn_exact_end)
+        v.addWidget(self.btn_stop)
+        v.addStretch()
+        gl.addWidget(actions)
         self.lbl_state = QLabel("State: Draft")
         gl.addWidget(self.lbl_state)
+        gl.addWidget(self._build_field_selector())
         layout.addWidget(group)
+        layout.addWidget(self._build_view_display_controls())
         layout.addStretch()
         return page
+
+    def _build_view_display_controls(self) -> QWidget:
+        box = QWidget()
+        box.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(8, 0, 0, 0)
+        layout.setSpacing(4)
+        self.cmb_view_mode = QComboBox()
+        self.cmb_view_mode.addItems(["Mirrored View", "Computational Domain View"])
+        self.lbl_mirror_indicator = QLabel(
+            "Mirrored display — computational domain is r ≥ 0"
+        )
+        self.lbl_mirror_indicator.setStyleSheet(SECONDARY_INFO_STYLE)
+        self.lbl_mirror_indicator.setWordWrap(True)
+        self.chk_view_mesh = QCheckBox("Mesh overlay")
+        self.chk_view_probes = QCheckBox("Probe markers")
+        self.chk_view_probes.setChecked(True)
+        self.chk_log_scale = QCheckBox("Log scale")
+        layout.addWidget(self.cmb_view_mode)
+        layout.addWidget(self.lbl_mirror_indicator)
+        layout.addWidget(self.chk_view_mesh)
+        layout.addWidget(self.chk_view_probes)
+        layout.addWidget(self.chk_log_scale)
+        layout.addStretch()
+        return box
+
+    def _build_field_selector(self) -> QWidget:
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(12, 0, 0, 0)
+        layout.setSpacing(2)
+        self.cmb_field = QComboBox(box)
+        self.cmb_field.addItems([field for field, _label in VIEW_FIELD_OPTIONS])
+        self.cmb_field.hide()
+        self._field_group = QButtonGroup(box)
+        self._field_group.setExclusive(True)
+        self._field_radios: Dict[str, QRadioButton] = {}
+        for field, label in VIEW_FIELD_OPTIONS:
+            radio = QRadioButton(label)
+            self._field_group.addButton(radio)
+            self._field_radios[field] = radio
+            layout.addWidget(radio)
+        self._field_radios["p"].setChecked(True)
+        return box
+
+    def _ensure_view_field_option(self, field: str) -> None:
+        if self.cmb_field.findText(field) < 0:
+            self.cmb_field.addItem(field)
+        if field in self._field_radios:
+            return
+        radio = QRadioButton(field)
+        self._field_group.addButton(radio)
+        self._field_radios[field] = radio
+        self._field_radios[field].toggled.connect(self._on_field_radio_toggled)
+        self.cmb_field.parentWidget().layout().addWidget(radio)
+
+    def _on_field_radio_toggled(self, checked: bool) -> None:
+        if not checked:
+            return
+        radio = self.sender()
+        for field, widget in self._field_radios.items():
+            if widget is radio:
+                if self.cmb_field.currentText() != field:
+                    self.cmb_field.setCurrentText(field)
+                return
+
+    def _sync_field_radios_from_combo(self, field: str) -> None:
+        radio = self._field_radios.get(str(field or "").strip())
+        if radio is None or radio.isChecked():
+            return
+        radio.blockSignals(True)
+        radio.setChecked(True)
+        radio.blockSignals(False)
 
     def _connect_signals(self) -> None:
         self.cmb_source.currentTextChanged.connect(self._apply_enablement)
         self.cmb_shape.currentTextChanged.connect(self._apply_enablement)
         self.cmb_mesh_mode.currentTextChanged.connect(self._apply_enablement)
+        self.cmb_mesh_mode.currentTextChanged.connect(self._sync_mesh_mode_radios)
+        self.rad_fixed_mesh.toggled.connect(self._on_mesh_mode_radio_toggled)
+        self.rad_dyn_mesh.toggled.connect(self._on_mesh_mode_radio_toggled)
+        self.btn_mesh_amr.clicked.connect(self._open_mesh_amr_dialog)
         self.cmb_seed_mode.currentTextChanged.connect(self._apply_enablement)
         self.cmb_write_control.currentTextChanged.connect(self._apply_enablement)
         self.cmb_material.currentTextChanged.connect(self._on_material_changed)
@@ -1101,8 +1284,12 @@ class Tab2D(QWidget):
         self.chk_balancing.toggled.connect(self._apply_enablement)
         self.cmb_view_mode.currentTextChanged.connect(self._on_view_changed)
         self.cmb_time.currentTextChanged.connect(self._on_time_selector_changed)
+        self.cmb_time.popup_requested.connect(self._ensure_time_catalog)
         self.viewer.times_changed.connect(self._on_viewer_times_changed)
         self.cmb_field.currentTextChanged.connect(self.viewer.set_field)
+        self.cmb_field.currentTextChanged.connect(self._sync_field_radios_from_combo)
+        for radio in self._field_radios.values():
+            radio.toggled.connect(self._on_field_radio_toggled)
         self.chk_view_mesh.toggled.connect(self._on_mesh_overlay_toggled)
         self.chk_view_probes.toggled.connect(self._on_probe_view_toggled)
         self.chk_log_scale.toggled.connect(self._on_log_scale_toggled)
@@ -1167,6 +1354,10 @@ class Tab2D(QWidget):
         self.lbl_length_title.setVisible(cylinder)
         self.grp_seed.setEnabled(direct and dynamic)
         self.grp_amr.setEnabled(dynamic)
+        self.btn_mesh_amr.setEnabled(dynamic)
+        self._apply_info_mode_visibility()
+        if not dynamic:
+            self._mesh_dialog.hide()
         self.spin_seed_level.setEnabled(self.cmb_seed_mode.currentText() == SEED_MODE_MANUAL)
         self.spin_seed_target.setEnabled(self.cmb_seed_mode.currentText() == SEED_MODE_AUTO)
         self.spin_seed_min.setEnabled(self.cmb_seed_mode.currentText() == SEED_MODE_AUTO)
@@ -1211,6 +1402,9 @@ class Tab2D(QWidget):
         mirrored = text == "Mirrored View"
         self.lbl_mirror_indicator.setVisible(mirrored)
         self.viewer.set_mirrored_view(mirrored)
+
+    def _ensure_time_catalog(self) -> None:
+        self.viewer.ensure_time_catalog()
 
     def _on_viewer_times_changed(self, labels, selected: str, live_follow: bool) -> None:
         """Keep the Time combo synchronized without mutating the selection."""
@@ -1402,10 +1596,12 @@ class Tab2D(QWidget):
                     self.lbl_info_actual.setText(
                         "Actual current cells: (initialise to generate mesh)"
                     )
+                self._apply_info_mode_visibility()
                 return
             inputs = self.get_case_inputs()
             result = validate_case_inputs_2d(inputs)
             if not result.domain:
+                self._apply_info_mode_visibility()
                 return
             domain = result.domain
             self.lbl_info_total.setText(
@@ -1458,6 +1654,23 @@ class Tab2D(QWidget):
                 self.lbl_info_actual.setText("")
         except Exception:
             self.lbl_info_total.setText("Total computational cells: —")
+        self._apply_info_mode_visibility()
+
+    def _apply_info_mode_visibility(self) -> None:
+        if not hasattr(self, "info_frame"):
+            return
+        imported = bool(self.is_imported_mode and self._imported_case is not None)
+        dynamic = self.cmb_mesh_mode.currentText() == DYNAMIC_MESH
+        show_fixed_counts = imported or not dynamic
+        show_amr = imported or dynamic
+        self.lbl_radial_cells_title.setVisible(show_fixed_counts)
+        self.lbl_radial_cells.setVisible(show_fixed_counts)
+        self.lbl_vertical_cells_title.setVisible(show_fixed_counts)
+        self.lbl_vertical_cells.setVisible(show_fixed_counts)
+        self.lbl_info_grid.setVisible(show_amr)
+        self.lbl_info_charge.setVisible(show_amr)
+        self.lbl_info_resolution.setVisible(show_amr)
+        self.lbl_info_actual.setVisible(bool(self.lbl_info_actual.text().strip()))
 
     def _add_probe(self) -> None:
         row = self.tbl_probes.rowCount()

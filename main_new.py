@@ -433,6 +433,7 @@ class BlastFoamApp(QMainWindow):
         self._prep_result_handled = False
         self._force_sync_prep = False  # older tests may set True; prefer async tests
         self._pending_exact_end_after_prep = False
+        self._ui_review = None  # attached only by ui_preview / tests
         self.active_case_dir_3d = None
         self.active_case_initialized_3d = False
         self.active_case_dir_2d = None
@@ -2665,6 +2666,13 @@ class BlastFoamApp(QMainWindow):
                 self.tab_3d.lbl_initial_dt_display.setText("Initial Δt: — s")
             else:
                 self.tab_3d.lbl_initial_dt_display.setText(f"Initial Δt: {dt_val:g} s")
+
+
+    def attach_ui_review(self, enabled: bool = True, output_dir=None):
+        """Opt-in UI Review overlay. Production never calls this."""
+        from ui_review_mode import attach_ui_review as _attach
+
+        return _attach(self, enabled=enabled, output_dir=output_dir)
 
 
 def main():

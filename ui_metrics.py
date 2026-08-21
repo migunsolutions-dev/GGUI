@@ -23,6 +23,8 @@ INFO_PANEL_HEIGHT = 140
 # 1D / 2D lower execution region (vertical splitter allocation).
 EXECUTION_AREA_MIN_HEIGHT = 180
 EXECUTION_AREA_PREFERRED_HEIGHT = 230
+# 2D stacked action buttons need a taller opening allocation than 1D.
+EXECUTION_AREA_PREFERRED_HEIGHT_2D = 330
 
 # Readable status-bar fonts (fixed; never scaled down with window width).
 # Metrics: single non-wrapping row at 9 pt monospace. Ready/Running stays 11 pt.
