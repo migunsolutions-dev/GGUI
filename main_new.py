@@ -18,6 +18,7 @@ from PyQt5.QtGui import QIcon, QFont, QFontMetrics
 
 from tab_1d import Tab1D
 from tab_2d import Tab2D
+from dialogs import OutputFileOptionsDialog
 from tab_log import LogTab
 from tab_3d_general import TabGeneral3D
 from tab_probes import TabProbes
@@ -565,6 +566,7 @@ class BlastFoamApp(QMainWindow):
         
         # Output options
         act_output = QAction("⚙️ Output Options", self)
+        act_output.setObjectName("actOutputOptions")
         act_output.setToolTip("Configure output file options")
         act_output.triggered.connect(self._on_output_options)
         toolbar.addAction(act_output)
@@ -1674,9 +1676,104 @@ class BlastFoamApp(QMainWindow):
             QMessageBox.critical(self, "Save Project Error", f"Could not save project:\n{exc}")
             return False
     
+    def _collect_output_file_options(self):
+        from output_options import (
+            Dim1DOutput,
+            Dim2DOutput,
+            Dim3DOutput,
+            GaugeFlags,
+            OutputFileOptions,
+        )
+
+        t1 = self.tab_1d
+        g1 = GaugeFlags(
+            overpressure="p" in getattr(t1, "_probe_fields", ("p",)),
+            impulse=bool(getattr(t1, "_enable_impulse", True)),
+            density="rho" in getattr(t1, "_probe_fields", ()),
+            velocity="U" in getattr(t1, "_probe_fields", ()),
+            mass_fractions="alpha.c4" in getattr(t1, "_probe_fields", ()),
+            temperature="T" in getattr(t1, "_probe_fields", ()),
+            energy="rhoE" in getattr(t1, "_probe_fields", ()),
+            dynamic_pressure=bool(getattr(t1, "_enable_dynamic_pressure", False)),
+        )
+        t2 = self.tab_2d
+        checks = getattr(t2, "output_checks", {})
+        def _on(name: str) -> bool:
+            box = checks.get(name)
+            return bool(box.isChecked()) if box is not None else False
+
+        vtk_by_time = t2.cmb_write_control.currentData() == "adjustableRunTime"
+        g2 = GaugeFlags(
+            pressure=_on("p"),
+            impulse=bool(getattr(t2, "_enable_impulse", True)),
+            density=_on("rho"),
+            velocity=_on("U"),
+            mass_fractions=_on("alpha.c4"),
+            temperature=_on("T"),
+            energy=False,
+            dynamic_pressure=bool(getattr(t2, "_enable_dynamic_pressure", False)),
+        )
+        v2 = GaugeFlags(
+            pressure=_on("p"),
+            impulse=False,
+            density=_on("rho"),
+            velocity=_on("U"),
+            mass_fractions=_on("alpha.c4"),
+            temperature=_on("T"),
+            energy=False,
+        )
+        t3 = self.tab_3d
+        fields3 = set(getattr(t3, "_probe_fields", ("p", "impulse")))
+        g3 = GaugeFlags(
+            pressure="p" in fields3,
+            impulse="impulse" in fields3,
+            density="rho" in fields3,
+            velocity="U" in fields3,
+            mass_fractions="alpha.c4" in fields3,
+            temperature="T" in fields3,
+            energy="rhoE" in fields3,
+            dynamic_pressure="dynamicPressure" in fields3,
+        )
+        return OutputFileOptions(
+            dim1d=Dim1DOutput(gauges=g1),
+            dim2d=Dim2DOutput(
+                vtk_by_time=bool(vtk_by_time),
+                vtk_time_s=float(t2.spin_write_time.value()),
+                vtk_steps=int(t2.spin_write_steps.value()),
+                gauges=g2,
+                vtk=v2,
+            ),
+            dim3d=Dim3DOutput(
+                write_surfaces=bool(getattr(t3, "_write_surfaces", True)),
+                surface_by_time=bool(getattr(t3, "_surface_by_time", True)),
+                surface_time_s=float(getattr(t3, "_surface_time_s", 0.001)),
+                surface_steps=int(getattr(t3, "_surface_steps", 25)),
+                write_volumes=bool(getattr(t3, "_write_volumes", True)),
+                vtk_by_time=t3.combo_write_control.currentText() == "adjustableRunTime",
+                vtk_time_s=float(t3.spin_write_time.value()),
+                vtk_steps=int(t3.spin_write.value()),
+                gauges=g3,
+                peak_overpressure=bool(getattr(t3, "_enable_post_processing", False)),
+                peak_impulse=bool(getattr(t3, "_enable_post_processing", False)),
+            ),
+        )
+
+    def _apply_output_file_options(self, opts) -> None:
+        g1 = opts.dim1d.gauges
+        self.tab_1d.apply_output_gauges(
+            g1.foam_probe_fields(always_p=True),
+            impulse=g1.impulse,
+            dynamic_pressure=g1.dynamic_pressure,
+        )
+        self.tab_2d.apply_output_file_options(opts.dim2d)
+        self.tab_3d.apply_output_file_options(opts.dim3d)
+
     def _on_output_options(self):
         """Open Output File Options dialog"""
-        QMessageBox.information(self, "Output Options", "Output file options: Still in progress...")
+        dialog = OutputFileOptionsDialog(self, self._collect_output_file_options())
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        self._apply_output_file_options(dialog.get_options())
     
     def _on_time_history_locations(self):
         """Open Time History Locations dialog"""

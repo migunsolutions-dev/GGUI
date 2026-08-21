@@ -20,6 +20,7 @@ from charge_capture import CAPTURE_CELL_SAFETY, auto_charge_capture_radius_m
 from material_catalog import jwl_parameters
 from material_validation import validate_required_values
 from models_2d import CaseInputs2D
+from output_options import extra_function_objects
 from path_utils import win_to_wsl_path
 
 
@@ -452,6 +453,18 @@ snGradSchemes { default corrected; }
         # dynamicMeshDict Switch ``refineProbes`` (errorEstimator), which marks
         # cells at existing ``probes`` / ``blastProbes`` function-object locations.
         # There is no supported controlDict function type ``refineProbes``.
+        probe_fields = list(inputs.output_fields) if inputs.output_fields else ["p"]
+        if bool(getattr(inputs, "enable_impulse", False)) and "impulse" not in probe_fields:
+            probe_fields.append("impulse")
+        if bool(getattr(inputs, "enable_dynamic_pressure", False)) and "dynamicPressure" not in probe_fields:
+            probe_fields.append("dynamicPressure")
+        extras = extra_function_objects(
+            p_atm=float(inputs.p_atm),
+            impulse=bool(getattr(inputs, "enable_impulse", False)) or "impulse" in probe_fields,
+            overpressure=False,
+            dynamic_pressure=bool(getattr(inputs, "enable_dynamic_pressure", False)),
+            peaks=False,
+        )
         probes_block = ""
         if probes:
             probes_block = f"""
@@ -459,7 +472,7 @@ snGradSchemes { default corrected; }
     {{
         type probes;
         libs ("libfieldFunctionObjects.so");
-        fields ({' '.join(inputs.output_fields)});
+        fields ({' '.join(probe_fields)});
         writeControl timeStep;
         writeInterval 1;
         probeLocations
@@ -488,7 +501,7 @@ timePrecision 10;
 runTimeModifiable true;
 functions
 {{
-{probes_block}}}
+{extras}{probes_block}}}
 """
         self._write_text(os.path.join(system, "controlDict"), control)
         decompose = (

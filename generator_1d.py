@@ -10,6 +10,7 @@ from models import (
     CaseInputs1D,
     RecommendedParams1D,
 )
+from output_options import extra_function_objects
 
 class Generator1D(BaseGenerator):
     """
@@ -268,6 +269,17 @@ regions ( sphereToCell {{ centre (0 0 0); radius {float(charge_radius):.10g}; fi
         user_write = float(inputs.write_interval_s)
         field_write_interval = user_write if user_write > 0.0 else end_time
         probe_steps = max(1, int(inputs.probe_write_interval_steps))
+        foam_fields = tuple(getattr(inputs, "probe_fields", ("p",)) or ("p",))
+        if "p" not in foam_fields:
+            foam_fields = ("p",) + foam_fields
+        fields_txt = " ".join(foam_fields)
+        extras = extra_function_objects(
+            p_atm=float(inputs.p_atm),
+            impulse=bool(getattr(inputs, "enable_impulse", False)) or "impulse" in foam_fields,
+            overpressure=False,
+            dynamic_pressure=bool(getattr(inputs, "enable_dynamic_pressure", False)),
+            peaks=False,
+        )
 
         cd = self._foam_header("controlDict", "dictionary", "system") + f"""
 application     blastFoam;
@@ -288,11 +300,11 @@ writeCompression off;
 runTimeModifiable true;
 functions
 {{
-    probes1d
+{extras}    probes1d
     {{
         type            probes;
         libs            ("libfieldFunctionObjects.so");
-        fields          (p);
+        fields          ({fields_txt});
         writeControl    timeStep;
         writeInterval   {probe_steps};
         probeLocations  ( {os.linesep.join(probe_points)} );

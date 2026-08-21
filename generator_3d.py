@@ -22,6 +22,7 @@ from initialization_plan import (
 from mesh_domain import align_domain_to_cell_size
 from material_catalog import jwl_parameters
 from models import CaseInputs3D
+from output_options import extra_function_objects, section_plane_point, surfaces_vtk_block
 from path_utils import get_latest_time_dir, win_to_wsl_path
 from startup_capture_guard import require_safe_capture
 
@@ -3573,9 +3574,13 @@ if __name__ == "__main__":
             "",
         ]
         wc_type = getattr(inputs, "write_control_type", "timeStep")
-        if wc_type == "adjustableRunTime":
+        write_volumes = bool(getattr(inputs, "write_volumes", True))
+        if not write_volumes:
+            cd_lines.append("writeControl    adjustableRunTime;")
+            cd_lines.append(f"writeInterval   {float(inputs.end_time_s):.10g};")
+        elif wc_type == "adjustableRunTime":
             w_interval = getattr(inputs, "write_interval_time", 5e-5)
-            cd_lines.append(f"writeControl    adjustableRunTime;")
+            cd_lines.append("writeControl    adjustableRunTime;")
             cd_lines.append(f"writeInterval   {w_interval};")
         else:
             cd_lines.append("writeControl    timeStep;")
@@ -3595,33 +3600,66 @@ if __name__ == "__main__":
             "",
             "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //",
         ]
-        if getattr(inputs, "enable_post_processing", False):
+        probe_pts = tuple(getattr(inputs, "probe_points", ()) or ())
+        probe_fields = tuple(getattr(inputs, "probe_fields", ("p",)) or ("p",))
+        if "p" not in probe_fields:
+            probe_fields = ("p",) + probe_fields
+        want_impulse = "impulse" in probe_fields
+        want_dyn = "dynamicPressure" in probe_fields
+        peaks = bool(getattr(inputs, "enable_post_processing", False))
+        extras = extra_function_objects(
+            p_atm=float(inputs.p_atm),
+            impulse=want_impulse or peaks,
+            overpressure=peaks,
+            dynamic_pressure=want_dyn,
+            peaks=peaks,
+        )
+        probes_block = ""
+        if probe_pts:
+            loc_lines = "\n".join(
+                f"            ({float(pt[0]):.10g} {float(pt[1]):.10g} {float(pt[2]):.10g})"
+                for pt in probe_pts
+            )
+            probes_block = (
+                "    probes3d\n    {\n"
+                "        type            probes;\n"
+                '        libs            ("libfieldFunctionObjects.so");\n'
+                f"        fields          ({' '.join(probe_fields)});\n"
+                "        writeControl    timeStep;\n"
+                "        writeInterval   1;\n"
+                "        probeLocations\n        (\n"
+                f"{loc_lines}\n"
+                "        );\n    }\n"
+            )
+        surfaces_block = ""
+        if bool(getattr(inputs, "write_surfaces", True)):
+            planes = list(getattr(inputs, "surface_planes", ()) or ())
+            if not planes:
+                ox, oy, oz = section_plane_point(
+                    (0.0, 0.0, 1.0),
+                    0.5 * (float(inputs.min_point[2]) + float(inputs.max_point[2])),
+                    inputs.min_point,
+                    inputs.max_point,
+                )
+                planes = [("midXY", ox, oy, oz, 0.0, 0.0, 1.0)]
+            patches = []
+            if getattr(inputs, "obstacles", None):
+                patches = self._get_obstacle_patch_names(inputs)
+            surfaces_block = surfaces_vtk_block(
+                by_time=bool(getattr(inputs, "surface_write_by_time", True)),
+                interval_time=float(getattr(inputs, "surface_write_interval_time", 0.001)),
+                interval_steps=int(getattr(inputs, "surface_write_interval_steps", 25)),
+                fields=probe_fields,
+                planes=planes,
+                patches=patches,
+            )
+        if extras or probes_block or surfaces_block:
             cd_lines += [
                 "functions",
                 "{",
-                "    impulse",
-                "    {",
-                "        type            impulse;",
-                "        writeControl    writeTime;",
-                f"        pRef            {inputs.p_atm};",
-                "    }",
-                "    overpressure",
-                "    {",
-                "        type            overpressure;",
-                "        writeControl    writeTime;",
-                "        store           yes;",
-                f"        pRef            {inputs.p_atm};",
-                "    }",
-                "    maxPImpulse",
-                "    {",
-                "        type            fieldMinMax;",
-                "        writeControl    writeTime;",
-                "        fields",
-                "        (",
-                "            overpressure",
-                "            impulse",
-                "        );",
-                "    }",
+                extras.rstrip("\n") + ("\n" if extras else ""),
+                probes_block.rstrip("\n"),
+                surfaces_block.rstrip("\n"),
                 "};",
             ]
         cd_lines += [

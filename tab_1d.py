@@ -129,6 +129,9 @@ class Tab1D(QWidget):
         self._graph_timer.setSingleShot(True)
         self._graph_timer.setInterval(50)
         self._graph_timer.timeout.connect(self._redraw_canvas)
+        self._probe_fields = ("p", "impulse")
+        self._enable_impulse = True
+        self._enable_dynamic_pressure = False
 
         self.setup_ui()
         self.recalc_stats()
@@ -160,8 +163,19 @@ class Tab1D(QWidget):
             cone_half_angle_deg=12.0,
             axis_epsilon=0.10,
             right_boundary=self.cmb_right.currentText(),
+            probe_fields=tuple(getattr(self, "_probe_fields", ("p", "impulse"))),
+            enable_impulse=bool(getattr(self, "_enable_impulse", True)),
+            enable_dynamic_pressure=bool(getattr(self, "_enable_dynamic_pressure", False)),
         )
-    # ----------------------------------------
+
+    def apply_output_gauges(self, fields: tuple, *, impulse: bool, dynamic_pressure: bool) -> None:
+        """Store gauge field list from Output File Options (1D probes)."""
+        names = tuple(fields) if fields else ("p",)
+        if "p" not in names:
+            names = ("p",) + names
+        self._probe_fields = names
+        self._enable_impulse = bool(impulse)
+        self._enable_dynamic_pressure = bool(dynamic_pressure)
 
     def get_selected_material_properties(self):
         mat_name = self.combo_comp.currentText()

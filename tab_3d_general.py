@@ -839,6 +839,12 @@ class TabGeneral3D(QWidget):
         # opened case explicitly contains the corresponding constructs.
         self._enable_post_processing = False  # functions { impulse; overpressure; fieldMinMax; }
         self._fast_run_mode = True            # skip stage_check / log.stageVerification / checkMesh / check_internal_patch
+        self._probe_fields = ("p", "impulse")
+        self._write_volumes = True
+        self._write_surfaces = True
+        self._surface_by_time = True
+        self._surface_time_s = 0.001
+        self._surface_steps = 25
         self._obstacle_feature_angle = 120
         self._obstacle_cells_between_levels = 2
         self._obstacle_snap_iter = 100
@@ -1952,6 +1958,48 @@ class TabGeneral3D(QWidget):
         is_time_step = write_control == "timeStep"
         self.wrap_write_steps.setVisible(is_time_step)
         self.wrap_write_time.setVisible(not is_time_step)
+
+    def apply_output_file_options(self, dim3d) -> None:
+        """Apply Output File Options 3D tab: surface/volume VTK cadence, gauges, peaks."""
+        self._write_volumes = bool(dim3d.write_volumes)
+        self._write_surfaces = bool(dim3d.write_surfaces)
+        self._surface_by_time = bool(dim3d.surface_by_time)
+        self._surface_time_s = float(dim3d.surface_time_s)
+        self._surface_steps = int(dim3d.surface_steps)
+        self._enable_post_processing = bool(dim3d.peak_overpressure or dim3d.peak_impulse)
+        self._probe_fields = dim3d.gauges.foam_probe_fields(always_p=True)
+        if dim3d.write_volumes:
+            if dim3d.vtk_by_time:
+                idx = self.combo_write_control.findText("adjustableRunTime")
+                if idx >= 0:
+                    self.combo_write_control.setCurrentIndex(idx)
+                self.spin_write_time.setValue(float(dim3d.vtk_time_s))
+            else:
+                idx = self.combo_write_control.findText("timeStep")
+                if idx >= 0:
+                    self.combo_write_control.setCurrentIndex(idx)
+                self.spin_write.setValue(int(dim3d.vtk_steps))
+        self._on_write_control_changed(self.combo_write_control.currentText())
+
+    def _surface_planes_for_case(self):
+        """Enabled 3D sections as VTK cutting-plane tuples for controlDict."""
+        from output_options import section_plane_point
+
+        min_pt = (self.sx1.value(), self.sy1.value(), self.sz1.value())
+        max_pt = (self.sx2.value(), self.sy2.value(), self.sz2.value())
+        planes = []
+        for sec in self.sections:
+            if not getattr(sec, "enabled", True):
+                continue
+            origin = section_plane_point(
+                sec.normal,
+                getattr(sec, "position_m", 0.0),
+                min_pt,
+                max_pt,
+            )
+            nx, ny, nz = (float(sec.normal[0]), float(sec.normal[1]), float(sec.normal[2]))
+            planes.append((str(sec.name or "Section"), origin[0], origin[1], origin[2], nx, ny, nz))
+        return tuple(planes)
 
     def _on_mesh_mode_changed(self):
         """Dyn Mesh: enable Wave AMR level and charge-seed Advanced controls. Fixed Mesh: disable them."""
@@ -4122,6 +4170,14 @@ class TabGeneral3D(QWidget):
             bubble_radius_factor=getattr(self, "_bubble_radius_factor", 1.5),
             enable_post_processing=getattr(self, "_enable_post_processing", False),
             fast_run_mode=getattr(self, "_fast_run_mode", True),
+            probe_points=tuple((p.x, p.y, p.z) for p in self.probes_model.probes()),
+            probe_fields=tuple(getattr(self, "_probe_fields", ("p",))),
+            write_volumes=bool(getattr(self, "_write_volumes", True)),
+            write_surfaces=bool(getattr(self, "_write_surfaces", True)),
+            surface_write_by_time=bool(getattr(self, "_surface_by_time", True)),
+            surface_write_interval_time=float(getattr(self, "_surface_time_s", 0.001)),
+            surface_write_interval_steps=int(getattr(self, "_surface_steps", 25)),
+            surface_planes=self._surface_planes_for_case(),
             enable_balancing=bool(getattr(self, "_enable_balancing", False)),
             dynamic_max_cells=getattr(self, "_dynamic_max_cells", 200000000),
             outside_extent=getattr(self, "_outside_extent", None),

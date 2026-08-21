@@ -193,6 +193,8 @@ class Tab2D(QWidget):
         self._remap_from_last_1d = True
         self._remap_kind = RemapFromDialog.CURRENT_1D
         self._last_1d_case_dir = ""
+        self._enable_impulse = True
+        self._enable_dynamic_pressure = False
         self._preview_flush_timer = QTimer(self)
         self._preview_flush_timer.setSingleShot(True)
         self._preview_flush_timer.timeout.connect(self._flush_setup_preview)
@@ -2043,6 +2045,30 @@ class Tab2D(QWidget):
                 continue
         return tuple(probes)
 
+    def apply_output_file_options(self, dim2d) -> None:
+        """Apply Output File Options 2D tab: VTK cadence, gauges, VTK field checks."""
+        if dim2d.vtk_by_time:
+            idx = self.cmb_write_control.findData("adjustableRunTime")
+            self.cmb_write_control.setCurrentIndex(idx if idx >= 0 else 0)
+            self.spin_write_time.setValue(float(dim2d.vtk_time_s))
+        else:
+            idx = self.cmb_write_control.findData("timeStep")
+            self.cmb_write_control.setCurrentIndex(idx if idx >= 0 else 1)
+            self.spin_write_steps.setValue(int(dim2d.vtk_steps))
+        g, v = dim2d.gauges, dim2d.vtk
+        pairs = (
+            ("p", g.pressure or v.pressure),
+            ("rho", g.density or v.density),
+            ("T", g.temperature or v.temperature),
+            ("U", g.velocity or v.velocity),
+            ("alpha.c4", g.mass_fractions or v.mass_fractions),
+        )
+        for field, on in pairs:
+            if field in self.output_checks:
+                self.output_checks[field].setChecked(bool(on))
+        self._enable_impulse = bool(g.impulse)
+        self._enable_dynamic_pressure = bool(g.dynamic_pressure)
+
     def get_case_inputs(self) -> CaseInputs2D:
         name = self.cmb_material.currentText()
         material_undefined = (
@@ -2149,6 +2175,8 @@ class Tab2D(QWidget):
             output_fields=tuple(
                 field for field, check in self.output_checks.items() if check.isChecked()
             ),
+            enable_impulse=bool(getattr(self, "_enable_impulse", True)),
+            enable_dynamic_pressure=bool(getattr(self, "_enable_dynamic_pressure", False)),
             mirrored_view=self.cmb_view_mode.currentText() == "Mirrored View",
             show_mesh=self.chk_view_mesh.isChecked(),
             show_probes=self.chk_view_probes.isChecked(),
@@ -2282,6 +2310,10 @@ class Tab2D(QWidget):
                 selected = set(values.get("output_fields", ()))
                 for field, check in self.output_checks.items():
                     check.setChecked(field in selected)
+            if "enable_impulse" in values:
+                self._enable_impulse = bool(values["enable_impulse"])
+            if "enable_dynamic_pressure" in values:
+                self._enable_dynamic_pressure = bool(values["enable_dynamic_pressure"])
         finally:
             if manage_loading:
                 self._loading = False
