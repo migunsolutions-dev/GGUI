@@ -13,9 +13,11 @@ from typing import List, Dict, Optional
 from viewer_gl import (
     close_plotter_safely,
     create_embedded_interactor,
+    guard_embedded_interactor,
     register_viewer,
     scalar_bar_kwargs,
     stop_plotter_render_timer,
+    sync_interactor_size,
     unregister_viewer,
 )
 
@@ -136,12 +138,18 @@ class BlastViewerWidget(QWidget):
         except Exception:
             pass
         self.plotter_layout.addWidget(interactor)
+        guard_embedded_interactor(interactor, self)
         self._gl_info = register_viewer("BlastViewerWidget/3D", self, self._plotter)
 
     def set_viewport_active(self, active: bool) -> None:
         """Pause/resume any plotter timers when the hosting tab is hidden."""
+        was_active = bool(self._viewport_active)
         self._viewport_active = bool(active)
         stop_plotter_render_timer(self._plotter)
+        if active and not was_active:
+            plotter = self._plotter
+            interactor = getattr(plotter, "interactor", None) if plotter is not None else None
+            sync_interactor_size(interactor)
 
     def shutdown_viewer(self) -> None:
         """Stop timers and close the VTK window while the Qt HWND is still valid."""

@@ -23,10 +23,12 @@ from openfoam_times_2d import (
 from viewer_gl import (
     close_plotter_safely,
     create_embedded_interactor,
+    guard_embedded_interactor,
     live_viewer_registry_snapshot,
     register_viewer,
     scalar_bar_kwargs,
     stop_plotter_render_timer,
+    sync_interactor_size,
     unregister_viewer,
 )
 from viewer_widget import BlastViewerWidget, FieldViewSettings, HAS_PV, pv
@@ -196,6 +198,7 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         self._shutdown = False
         self._refresh_busy = False
         self._refresh_pending = False
+        self._preview_busy = False
         self._gui_thread_id: Optional[int] = None
         self._scalar_bar_actor = None
         self._cell_count_source = "none"
@@ -241,14 +244,21 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         except Exception:
             pass
         self.plotter_layout.addWidget(interactor)
+        guard_embedded_interactor(interactor, self)
         self._gl_info = register_viewer("AxisymmetricViewerWidget/2D", self, self._plotter)
 
     def set_viewport_active(self, active: bool) -> None:
+        was_active = bool(self._viewport_active)
         self._viewport_active = bool(active)
         stop_plotter_render_timer(self._plotter)
         if not active and self._coalesce_timer is not None:
             self._coalesce_timer.stop()
             self._refresh_pending = False
+        elif active and not was_active:
+            plotter = self._plotter
+            interactor = getattr(plotter, "interactor", None) if plotter is not None else None
+            sync_interactor_size(interactor)
+            QTimer.singleShot(0, self.request_refresh)
 
     def _assert_gui_thread(self) -> bool:
         if self._shutdown or self._plotter is None:
@@ -555,101 +565,107 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
             return
         if not self._assert_gui_thread():
             return
-        self._plotter.clear()
-        self._scalar_bar_actor = None
-        r0 = -radius if self.mirrored_view else 0.0
-        domain_points = np.array(
-            [
-                [r0, 0.0, 0.0],
-                [radius, 0.0, 0.0],
-                [radius, height, 0.0],
-                [r0, height, 0.0],
-                [r0, 0.0, 0.0],
-            ]
-        )
-        domain = pv.lines_from_points(domain_points)
-        self._plotter.add_mesh(domain, color="black", line_width=2)
-        self._plotter.add_mesh(
-            pv.Line((0.0, 0.0, 0.0), (0.0, height, 0.0)),
-            color="#2c3e50",
-            line_width=2,
-        )
+        if self._preview_busy:
+            return
+        self._preview_busy = True
+        try:
+            self._plotter.clear()
+            self._scalar_bar_actor = None
+            r0 = -radius if self.mirrored_view else 0.0
+            domain_points = np.array(
+                [
+                    [r0, 0.0, 0.0],
+                    [radius, 0.0, 0.0],
+                    [radius, height, 0.0],
+                    [r0, height, 0.0],
+                    [r0, 0.0, 0.0],
+                ]
+            )
+            domain = pv.lines_from_points(domain_points)
+            self._plotter.add_mesh(domain, color="black", line_width=2)
+            self._plotter.add_mesh(
+                pv.Line((0.0, 0.0, 0.0), (0.0, height, 0.0)),
+                color="#2c3e50",
+                line_width=2,
+            )
 
-        # Planned base grid (optional overlay — not a solver mesh).
-        if charge.get("show_grid"):
-            dx = float(charge.get("cell_size") or 0.0)
-            if dx > 0 and math.isfinite(dx):
-                nr = max(1, int(round(radius / dx)))
-                nz = max(1, int(round(height / dx)))
-                # Cap line count for interactive preview.
-                step_r = max(1, nr // 40)
-                step_z = max(1, nz // 40)
-                for i in range(0, nr + 1, step_r):
-                    x = min(radius, i * dx)
-                    self._plotter.add_mesh(
-                        pv.Line((x, 0.0, 0.0), (x, height, 0.0)),
-                        color="#bdc3c7",
-                        line_width=1,
-                        opacity=0.55,
-                    )
-                    if self.mirrored_view and x > 0:
+            # Planned base grid (optional overlay — not a solver mesh).
+            if charge.get("show_grid"):
+                dx = float(charge.get("cell_size") or 0.0)
+                if dx > 0 and math.isfinite(dx):
+                    nr = max(1, int(round(radius / dx)))
+                    nz = max(1, int(round(height / dx)))
+                    # Cap line count for interactive preview.
+                    step_r = max(1, nr // 40)
+                    step_z = max(1, nz // 40)
+                    for i in range(0, nr + 1, step_r):
+                        x = min(radius, i * dx)
                         self._plotter.add_mesh(
-                            pv.Line((-x, 0.0, 0.0), (-x, height, 0.0)),
+                            pv.Line((x, 0.0, 0.0), (x, height, 0.0)),
                             color="#bdc3c7",
                             line_width=1,
-                            opacity=0.35,
+                            opacity=0.55,
                         )
-                for j in range(0, nz + 1, step_z):
-                    y = min(height, j * dx)
-                    self._plotter.add_mesh(
-                        pv.Line((r0, y, 0.0), (radius, y, 0.0)),
-                        color="#bdc3c7",
-                        line_width=1,
-                        opacity=0.55,
-                    )
+                        if self.mirrored_view and x > 0:
+                            self._plotter.add_mesh(
+                                pv.Line((-x, 0.0, 0.0), (-x, height, 0.0)),
+                                color="#bdc3c7",
+                                line_width=1,
+                                opacity=0.35,
+                            )
+                    for j in range(0, nz + 1, step_z):
+                        y = min(height, j * dx)
+                        self._plotter.add_mesh(
+                            pv.Line((r0, y, 0.0), (radius, y, 0.0)),
+                            color="#bdc3c7",
+                            line_width=1,
+                            opacity=0.55,
+                        )
 
-        # Reflecting bottom / ground marker.
-        self._plotter.add_mesh(
-            pv.Line((r0, 0.0, 0.0), (radius, 0.0, 0.0)),
-            color="#8e44ad",
-            line_width=3,
-        )
-
-        zc = float(charge.get("height", 0.0))
-        cr = float(charge.get("radius", 0.0))
-        points = preview_charge_outline_points(
-            shape=str(charge.get("shape", "Sphere")),
-            height=zc,
-            radius=cr,
-            length=float(charge.get("length", 0.0)),
-            mirrored=self.mirrored_view,
-            reflecting_ground=bool(charge.get("reflecting_ground", False)),
-        )
-        outline = pv.lines_from_points(points, close=True)
-        self._plotter.add_mesh(outline, color="#e74c3c", line_width=3)
-
-        # Detonation point (on axis). Prefer explicit detonation height.
-        det_y = float(charge.get("detonation_height", zc))
-        det_r = max(0.004, min(radius, height) * 0.012)
-        self._plotter.add_mesh(
-            pv.Sphere(radius=det_r, center=(0.0, det_y, 0.0)),
-            color="#e67e22",
-        )
-
-        for r, z in probes:
-            marker = pv.Sphere(
-                radius=max(0.005, min(radius, height) * 0.01),
-                center=(r, z, 0.0),
+            # Reflecting bottom / ground marker.
+            self._plotter.add_mesh(
+                pv.Line((r0, 0.0, 0.0), (radius, 0.0, 0.0)),
+                color="#8e44ad",
+                line_width=3,
             )
-            self._plotter.add_mesh(marker, color="yellow")
-            if self.mirrored_view and r > 0:
-                mirror = pv.Sphere(
+
+            zc = float(charge.get("height", 0.0))
+            cr = float(charge.get("radius", 0.0))
+            points = preview_charge_outline_points(
+                shape=str(charge.get("shape", "Sphere")),
+                height=zc,
+                radius=cr,
+                length=float(charge.get("length", 0.0)),
+                mirrored=self.mirrored_view,
+                reflecting_ground=bool(charge.get("reflecting_ground", False)),
+            )
+            outline = pv.lines_from_points(points, close=True)
+            self._plotter.add_mesh(outline, color="#e74c3c", line_width=3)
+
+            # Detonation point (on axis). Prefer explicit detonation height.
+            det_y = float(charge.get("detonation_height", zc))
+            det_r = max(0.004, min(radius, height) * 0.012)
+            self._plotter.add_mesh(
+                pv.Sphere(radius=det_r, center=(0.0, det_y, 0.0)),
+                color="#e67e22",
+            )
+
+            for r, z in probes:
+                marker = pv.Sphere(
                     radius=max(0.005, min(radius, height) * 0.01),
-                    center=(-r, z, 0.0),
+                    center=(r, z, 0.0),
                 )
-                self._plotter.add_mesh(mirror, color="yellow", opacity=0.45)
-        self._add_meridional_bounds(r0, radius, 0.0, height)
-        self._apply_meridional_camera()
+                self._plotter.add_mesh(marker, color="yellow")
+                if self.mirrored_view and r > 0:
+                    mirror = pv.Sphere(
+                        radius=max(0.005, min(radius, height) * 0.01),
+                        center=(-r, z, 0.0),
+                    )
+                    self._plotter.add_mesh(mirror, color="yellow", opacity=0.45)
+            self._add_meridional_bounds(r0, radius, 0.0, height)
+            self._apply_meridional_camera()
+        finally:
+            self._preview_busy = False
 
     def _latest_written_poly_mesh_dir(self, case_dir: str) -> Optional[str]:
         best_time = None

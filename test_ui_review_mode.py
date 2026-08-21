@@ -304,6 +304,8 @@ class UIReviewProductionHookTests(unittest.TestCase):
             record = controller.select_widget(bar, Qt.ControlModifier, pos)
             self.assertEqual(record["kind"], "tab")
             self.assertIn("Output", record["tab_text"])
+            status_record = controller.select_widget(win.status_bar, Qt.ControlModifier)
+            self.assertEqual(status_record["class"], "SegmentedStatusBar")
             win.service.generate_case.assert_not_called()
             self.assertTrue(os.path.isfile(os.path.join(tmp.name, "current.png")))
             controller.disable()
@@ -316,6 +318,49 @@ class UIReviewProductionHookTests(unittest.TestCase):
         finally:
             win.close()
             tmp.cleanup()
+
+
+class VtkResizeGuardTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _app()
+
+    def test_inactive_and_tiny_resizes_are_swallowed(self):
+        from PyQt5.QtCore import QSize
+        from PyQt5.QtGui import QResizeEvent
+
+        from viewer_gl import guard_embedded_interactor
+
+        class Probe(QWidget):
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                self.resize_events = 0
+
+            def resizeEvent(self, event):
+                self.resize_events += 1
+                super().resizeEvent(event)
+
+        class DummyViewer(QWidget):
+            def __init__(self):
+                super().__init__()
+                self._shutdown = False
+                self._viewport_active = False
+                self.child = Probe(self)
+                guard_embedded_interactor(self.child, self)
+
+        viewer = DummyViewer()
+        before = viewer.child.resize_events
+        self.app.sendEvent(viewer.child, QResizeEvent(QSize(120, 70), QSize(80, 60)))
+        self.assertEqual(viewer.child.resize_events, before)
+
+        viewer._viewport_active = True
+        self.app.sendEvent(viewer.child, QResizeEvent(QSize(140, 80), QSize(120, 70)))
+        self.assertGreater(viewer.child.resize_events, before)
+
+        active_count = viewer.child.resize_events
+        self.app.sendEvent(viewer.child, QResizeEvent(QSize(1, 1), QSize(140, 80)))
+        self.assertEqual(viewer.child.resize_events, active_count)
+        viewer.close()
 
 
 if __name__ == "__main__":

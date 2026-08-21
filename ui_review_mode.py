@@ -13,7 +13,7 @@ import subprocess
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from PyQt5.QtCore import QEvent, QObject, QPoint, QRect, Qt
+from PyQt5.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt
 from PyQt5.QtGui import QColor, QKeySequence, QMouseEvent
 from PyQt5.QtWidgets import (
     QApplication,
@@ -21,6 +21,7 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QLabel,
+    QLayout,
     QMainWindow,
     QBoxLayout,
     QScrollArea,
@@ -31,6 +32,7 @@ from PyQt5.QtWidgets import (
     QTabWidget,
     QToolBar,
     QWidget,
+    QWIDGETSIZE_MAX,
 )
 
 SCHEMA_VERSION = 1
@@ -105,6 +107,57 @@ def _walk_parents(widget: Optional[QWidget]):
 
 def _is_under(window: QWidget, widget: Optional[QWidget]) -> bool:
     return widget is not None and any(w is window for w in _walk_parents(widget))
+
+
+def iter_vtk_interactors(window: QWidget):
+    """Yield (viewer, interactor) pairs for embedded 2D/3D VTK plotters."""
+    for attr in ("tab_2d", "tab_3d"):
+        tab = getattr(window, attr, None)
+        viewer = getattr(tab, "viewer", None) if tab is not None else None
+        plotter = getattr(viewer, "_plotter", None) if viewer is not None else None
+        interactor = getattr(plotter, "interactor", None) if plotter is not None else None
+        if interactor is not None:
+            yield viewer, interactor
+
+
+def grab_window_safely(window: QWidget):
+    """Grab the window without reading a live VTK HWND (Windows abort)."""
+    hidden = []
+    paused = []
+    frozen = []
+    try:
+        for viewer, interactor in iter_vtk_interactors(window):
+            setter = getattr(viewer, "set_viewport_active", None)
+            if callable(setter) and getattr(viewer, "_viewport_active", False):
+                setter(False)
+                paused.append(setter)
+            if interactor.isVisible():
+                parent = interactor.parentWidget()
+                if parent is not None:
+                    parent.setFixedSize(parent.size())
+                    frozen.append(parent)
+                interactor.hide()
+                hidden.append(interactor)
+        QApplication.processEvents()
+        return window.grab()
+    finally:
+        for interactor in hidden:
+            try:
+                interactor.show()
+            except Exception:
+                pass
+        for parent in frozen:
+            try:
+                parent.setMinimumSize(0, 0)
+                parent.setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX)
+            except Exception:
+                pass
+        for setter in paused:
+            try:
+                setter(True)
+            except Exception:
+                pass
+        QApplication.processEvents()
 
 
 def _class_name(widget: QWidget) -> str:
@@ -186,6 +239,19 @@ def structural_locator(widget: QWidget, main_tab: str) -> str:
     return f"{main_tab}::{'/'.join(parts)}"
 
 
+def _qt_layout(widget: QWidget):
+    """Return a QLayout even if a subclass shadowed QWidget.layout()."""
+    layout = getattr(widget, "layout", None)
+    if callable(layout):
+        try:
+            return layout()
+        except TypeError:
+            return None
+    if isinstance(layout, QLayout):
+        return layout
+    return None
+
+
 def layout_info(widget: QWidget) -> Optional[Dict[str, Any]]:
     parent = widget.parentWidget()
     if parent is None:
@@ -194,7 +260,7 @@ def layout_info(widget: QWidget) -> Optional[Dict[str, Any]]:
         for index in range(parent.count()):
             if parent.widget(index) is widget:
                 return {"class": "QSplitter", "index": index}
-    layout = parent.layout()
+    layout = _qt_layout(parent)
     if layout is None:
         return None
     info: Dict[str, Any] = {"class": layout.__class__.__name__}
@@ -569,6 +635,7 @@ class UIReviewController(QObject):
         self._toggle.setContext(Qt.ApplicationShortcut)
         self._toggle.activated.connect(self.toggle)
         self._tab_hooks: List[QTabWidget] = []
+        self._saved_min_size: Optional[QSize] = None
 
     def toggle(self) -> None:
         if self.enabled:
@@ -585,6 +652,9 @@ class UIReviewController(QObject):
                 self.window.installEventFilter(self)
                 self._filter_installed = True
             self._hook_tab_changes()
+        if self._saved_min_size is None:
+            self._saved_min_size = QSize(self.window.minimumSize())
+            self.window.setMinimumSize(self.window.size())
         self.refresh_regions()
         self._rebuild_overlays()
         self.write_outputs()
@@ -599,6 +669,9 @@ class UIReviewController(QObject):
             self.window.removeEventFilter(self)
             self._filter_installed = False
         self._clear_overlays()
+        if self._saved_min_size is not None:
+            self.window.setMinimumSize(self._saved_min_size)
+            self._saved_min_size = None
 
     def clear_selections(self) -> None:
         self.sources = []
@@ -679,6 +752,14 @@ class UIReviewController(QObject):
 
     def select_at(self, global_pos: QPoint, modifiers: Qt.KeyboardModifiers) -> Optional[Dict[str, Any]]:
         widget = QApplication.widgetAt(global_pos)
+        status = getattr(self.window, "status_bar", None)
+        if isinstance(status, QWidget):
+            if widget is not None and _is_under(status, widget):
+                widget = status
+            elif widget is None:
+                local = status.mapFromGlobal(global_pos)
+                if status.rect().adjusted(0, -6, 0, 12).contains(local):
+                    widget = status
         if widget is None or _is_overlay(widget) or not _is_under(self.window, widget):
             return None
         return self.select_widget(widget, modifiers, global_pos)
@@ -828,8 +909,11 @@ class UIReviewController(QObject):
         for widget in widgets:
             if _is_overlay(widget):
                 continue
-            if structural_locator(widget, tab_key) == locator:
-                return widget
+            try:
+                if structural_locator(widget, tab_key) == locator:
+                    return widget
+            except Exception:
+                continue
         return None
 
     def _tab_header_rect(self, record: Dict[str, Any]) -> Optional[QRect]:
@@ -933,8 +1017,12 @@ class UIReviewController(QObject):
             json.dump(payload, handle, indent=2, sort_keys=True)
             handle.write("\n")
         QApplication.processEvents()
-        pixmap = self.window.grab()
-        pixmap.save(screenshot_path, "PNG")
+        try:
+            pixmap = grab_window_safely(self.window)
+            if pixmap is not None and not pixmap.isNull():
+                pixmap.save(screenshot_path, "PNG")
+        except Exception:
+            pass
         return {"selection": selection_path, "screenshot": screenshot_path}
 
     def overlay_widgets(self) -> List[QWidget]:

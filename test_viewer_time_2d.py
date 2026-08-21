@@ -10,9 +10,18 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
 
-from PyQt5.QtWidgets import QApplication, QAbstractSpinBox, QGroupBox, QLabel, QVBoxLayout
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import (
+    QApplication,
+    QAbstractSpinBox,
+    QGridLayout,
+    QGroupBox,
+    QLabel,
+    QSizePolicy,
+    QVBoxLayout,
+)
 
-from axisymmetric_2d import DYNAMIC_MESH, FIXED_MESH
+from axisymmetric_2d import BOUNDARY_SLIP, DYNAMIC_MESH, FIXED_MESH
 from openfoam_times_2d import (
     LIVE_FOLLOW_LABEL,
     TIME_ZERO_LABEL,
@@ -27,7 +36,7 @@ from openfoam_times_2d import (
     remove_single_time_case_view,
 )
 from axisymmetric_viewer import AxisymmetricViewerWidget
-from tab_2d import Tab2D
+from tab_2d import Tab2D, compact_spin_text
 from viewer_widget import BlastViewerWidget
 
 app = QApplication.instance() or QApplication([])
@@ -426,7 +435,7 @@ class Tab2DFieldSelectorTests(unittest.TestCase):
             for i in range(group.layout().count())
         ]
         self.assertIs(items[-1], field_box)
-        self.assertGreater(items.index(field_box), items.index(tab.lbl_state))
+        self.assertNotIn(tab.lbl_state, items)
         viewport = tab.viewer.parentWidget()
         self.assertFalse(viewport.isAncestorOf(tab.cmb_field))
         self.assertFalse(tab.cmb_field.isVisibleTo(tab))
@@ -453,6 +462,8 @@ class Tab2DFieldSelectorTests(unittest.TestCase):
         self.assertIs(actions.layout().itemAt(0).widget(), tab.btn_initialize)
         self.assertIs(actions.layout().itemAt(1).widget(), tab.btn_exact_end)
         self.assertIs(actions.layout().itemAt(2).widget(), tab.btn_stop)
+        self.assertIs(actions.layout().itemAt(3).widget(), tab.lbl_state)
+        self.assertEqual(tab.lbl_state.maximumWidth(), 198)
         self.assertTrue(tab.btn_log.isHidden())
         self.assertIn("#3498db", tab.btn_initialize.styleSheet())
         self.assertIn("#1abc9c", tab.btn_exact_end.styleSheet())
@@ -460,28 +471,89 @@ class Tab2DFieldSelectorTests(unittest.TestCase):
         self.assertEqual(tab.btn_initialize.minimumWidth(), 198)
         self.assertEqual(tab.btn_exact_end.minimumWidth(), 198)
         self.assertEqual(tab.btn_stop.minimumWidth(), 198)
-        self.assertIsNotNone(actions.layout().itemAt(3).spacerItem())
+        self.assertIsNotNone(actions.layout().itemAt(4).spacerItem())
         exec_page = tab._exec_scroll.widget()
         view_box = tab.cmb_view_mode.parentWidget()
+        solver = tab.spin_max_co.parentWidget()
+        while solver is not None and not isinstance(solver, QGroupBox):
+            solver = solver.parentWidget()
+        self.assertIsNotNone(solver)
+        self.assertEqual(solver.title(), "Solver Controls")
+        self.assertIsInstance(solver.layout(), QGridLayout)
+        grid = solver.layout()
+        self.assertTrue(grid.itemAtPosition(0, 0).widget().isAncestorOf(tab.spin_end_time))
+        time_row = grid.itemAtPosition(0, 0).widget()
+        self.assertTrue(time_row.isAncestorOf(tab.spin_delta_t))
+        self.assertIs(time_row, grid.itemAtPosition(0, 1).widget())
+        initial_label = next(
+            label
+            for label in time_row.findChildren(QLabel)
+            if label.text() == "Initial time step:"
+        )
+        self.assertGreaterEqual(initial_label.minimumSizeHint().width(), 1)
+        self.assertEqual(initial_label.sizePolicy().horizontalPolicy(), QSizePolicy.Minimum)
+        self.assertTrue(grid.itemAtPosition(1, 0).widget().isAncestorOf(tab.spin_max_co))
+        self.assertTrue(grid.itemAtPosition(1, 0).widget().isAncestorOf(tab.chk_adjust))
+        self.assertIs(grid.itemAtPosition(1, 0).widget(), grid.itemAtPosition(1, 1).widget())
+        self.assertEqual(tab.spin_max_co.minimumWidth(), tab.spin_max_co.maximumWidth())
+        self.assertGreater(tab.spin_max_co.minimumWidth(), 72)
+        write_row = grid.itemAtPosition(2, 0).widget()
+        write_layout = write_row.layout()
+        self.assertTrue(write_row.isAncestorOf(tab.cmb_write_control))
+        self.assertEqual(write_layout.stretch(0), 0)
+        self.assertEqual(write_layout.stretch(1), 0)
+        self.assertIsNotNone(write_layout.itemAt(write_layout.count() - 1).spacerItem())
+        self.assertIsInstance(view_box, QGroupBox)
+        self.assertEqual(view_box.title(), "View")
         self.assertIs(exec_page.layout().itemAt(0).widget(), group)
-        self.assertIs(exec_page.layout().itemAt(1).widget(), view_box)
+        self.assertIs(exec_page.layout().itemAt(1).widget(), solver)
+        self.assertIs(exec_page.layout().itemAt(2).widget(), view_box)
+        self.assertEqual(tab.cmb_write_control.currentText(), "RunTime")
+        self.assertEqual(tab.cmb_write_control.currentData(), "adjustableRunTime")
+        self.assertLess(tab.cmb_write_control.maximumWidth(), 222)
+        self.assertTrue(grid.itemAtPosition(3, 0).widget().isAncestorOf(tab.spin_write_time))
+        self.assertTrue(grid.itemAtPosition(3, 0).widget().isAncestorOf(tab.spin_write_steps))
+        self.assertEqual(tab.lbl_write_interval.text(), "Write interval (time):")
+        self.assertFalse(tab.spin_write_time.isHidden())
+        self.assertTrue(tab.spin_write_steps.isHidden())
+        self.assertEqual(tab.lbl_write_interval_unit.text(), "s")
+        self.assertFalse(tab.lbl_write_interval_unit.isHidden())
+        tab._set_combo_stored_value(tab.cmb_write_control, "timeStep")
+        tab._sync_write_interval_display()
+        self.assertEqual(tab.lbl_write_interval.text(), "Write interval (steps):")
+        self.assertTrue(tab.spin_write_time.isHidden())
+        self.assertFalse(tab.spin_write_steps.isHidden())
+        self.assertTrue(tab.lbl_write_interval_unit.isHidden())
+        tab._set_combo_stored_value(tab.cmb_write_control, "adjustableRunTime")
+        tab._sync_write_interval_display()
         stacked = [
             view_box.layout().itemAt(i).widget()
-            for i in range(5)
+            for i in range(4)
         ]
         self.assertEqual(
             stacked,
             [
-                tab.cmb_view_mode,
-                tab.lbl_mirror_indicator,
+                tab.chk_view_mirror,
                 tab.chk_view_mesh,
                 tab.chk_view_probes,
                 tab.chk_log_scale,
             ],
         )
+        self.assertTrue(tab.cmb_view_mode.isHidden())
+        self.assertTrue(tab.lbl_mirror_indicator.isHidden())
+        self.assertEqual(tab.chk_view_mirror.text(), "Mirrored View")
+        self.assertTrue(tab.chk_view_mirror.isChecked())
+        self.assertEqual(tab.cmb_view_mode.currentText(), "Mirrored View")
+        tab.chk_view_mirror.setChecked(False)
+        self.assertEqual(tab.cmb_view_mode.currentText(), "Computational Domain View")
+        tab.chk_view_mirror.setChecked(True)
+        self.assertEqual(tab.cmb_view_mode.currentText(), "Mirrored View")
         self.assertFalse(viewport.isAncestorOf(tab.cmb_view_mode))
         self.assertTrue(viewport.isAncestorOf(tab.btn_fit))
         self.assertTrue(viewport.isAncestorOf(tab.cmb_time))
+        controls = viewport.layout().itemAt(0).layout()
+        self.assertIs(controls.itemAt(0).widget(), tab._status_caption_host)
+        self.assertIs(controls.itemAt(1).widget(), tab.btn_fit)
 
 
 class Tab2DMeshModeSelectorTests(unittest.TestCase):
@@ -544,6 +616,15 @@ class Tab2DMeshModeSelectorTests(unittest.TestCase):
             tab._open_mesh_amr_dialog()
             self.assertTrue(tab._mesh_dialog.isVisible())
             tab._mesh_dialog.hide()
+        tab.rad_fixed_mesh.setChecked(True)
+        QApplication.processEvents()
+        self.assertEqual(tab.cmb_mesh_mode.currentText(), FIXED_MESH)
+        self.assertFalse(tab.lbl_radial_cells.isHidden())
+        self.assertTrue(tab.lbl_info_grid.isHidden())
+        tab.rad_dyn_mesh.setChecked(True)
+        QApplication.processEvents()
+        self.assertEqual(tab.cmb_mesh_mode.currentText(), DYNAMIC_MESH)
+        self.assertTrue(tab.lbl_radial_cells.isHidden())
 
 
 class Tab2DSetupUnitLabelTests(unittest.TestCase):
@@ -567,8 +648,19 @@ class Tab2DSetupUnitLabelTests(unittest.TestCase):
             self.assertEqual(self._unit_text(spin), unit)
             self.assertEqual(spin.buttonSymbols(), QAbstractSpinBox.NoButtons)
             self.assertEqual(spin.maximumWidth(), 124)
+            self.assertEqual(spin.alignment() & Qt.AlignRight, Qt.AlignRight)
+        self.assertEqual(tab.spin_radius.textFromValue(1.5), "1.50")
+        self.assertEqual(tab.spin_cell.textFromValue(0.05), "0.050")
+        self.assertEqual(tab.spin_mass.textFromValue(1.0), "1")
+        self.assertEqual(tab.spin_density.textFromValue(1630.0), "1630")
         self.assertEqual(tab.cmb_material.maximumWidth(), tab.spin_mass.maximumWidth())
         self.assertEqual(tab.cmb_shape.maximumWidth(), tab.spin_mass.maximumWidth())
+        self.assertEqual(tab.cmb_bottom.currentText(), "Reflection")
+        self.assertEqual(tab.cmb_bottom.currentData(), BOUNDARY_SLIP)
+        self.assertEqual(tab.cmb_outer.currentText(), "Open")
+        self.assertEqual(tab.cmb_outer.maximumWidth(), 174)
+        self.assertEqual(tab.cmb_top.maximumWidth(), 174)
+        self.assertEqual(tab.cmb_bottom.maximumWidth(), 174)
         self.assertTrue(tab.lbl_axis_lock.isHidden())
         setup_widgets = []
         layout = tab.grp_mapping.parentWidget().layout()
@@ -578,6 +670,16 @@ class Tab2DSetupUnitLabelTests(unittest.TestCase):
                 setup_widgets.append(widget)
         self.assertIs(setup_widgets[-1], tab.grp_mapping)
         self.assertEqual(tab.grp_mapping.title(), "1D → 2D rotateFields")
+        self.assertNotIn(tab.grp_solver, setup_widgets)
+
+
+    def test_compact_spin_text_rules(self):
+        self.assertEqual(compact_spin_text(1.0, 6), "1")
+        self.assertEqual(compact_spin_text(1630.0, 6), "1630")
+        self.assertEqual(compact_spin_text(1.5, 6), "1.50")
+        self.assertEqual(compact_spin_text(0.5, 6), "0.50")
+        self.assertEqual(compact_spin_text(0.05, 6), "0.050")
+        self.assertEqual(compact_spin_text(288.15, 2), "288.150")
 
 
 class Regression3DLatestPolicyUnchanged(unittest.TestCase):

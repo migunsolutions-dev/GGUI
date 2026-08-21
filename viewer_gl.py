@@ -7,7 +7,60 @@ import time
 import weakref
 from typing import Any, Dict, Optional
 
+from PyQt5.QtCore import QEvent, QObject, QSize
+from PyQt5.QtGui import QResizeEvent
+from PyQt5.QtWidgets import QApplication
+
 LOG = logging.getLogger("ggui.viewer_gl")
+
+
+class VtkResizeGuard(QObject):
+    """Block VTK resize handling on hidden or tiny OpenGL widgets (Windows abort)."""
+
+    def __init__(self, viewer: Any):
+        super().__init__(viewer)
+        self._viewer = weakref.ref(viewer)
+
+    def eventFilter(self, obj, event):  # noqa: N802
+        if event.type() != QEvent.Resize:
+            return False
+        viewer = self._viewer()
+        if viewer is None or getattr(viewer, "_shutdown", False):
+            return True
+        if not getattr(viewer, "_viewport_active", True):
+            return True
+        try:
+            size = event.size()
+        except Exception:
+            return True
+        if size.width() < 2 or size.height() < 2:
+            return True
+        return False
+
+
+def guard_embedded_interactor(interactor: Any, viewer: Any) -> None:
+    """Keep the resize filter alive on the viewer so VTK does not see invalid HWNDs."""
+    if interactor is None or viewer is None:
+        return
+    guard = VtkResizeGuard(viewer)
+    interactor.installEventFilter(guard)
+    viewer._vtk_resize_guard = guard
+
+
+def sync_interactor_size(interactor: Any) -> None:
+    """Deliver one resize to VTK after a hidden viewer becomes visible again."""
+    if interactor is None:
+        return
+    try:
+        size = interactor.size()
+        if size.width() < 2 or size.height() < 2:
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        app.sendEvent(interactor, QResizeEvent(size, QSize(0, 0)))
+    except Exception:
+        pass
 
 # Live embedded viewers keyed by Python id. Values are weak refs so GC still works.
 _VIEWER_REGISTRY: Dict[int, Any] = {}

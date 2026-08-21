@@ -314,11 +314,31 @@ class TabGeneral3D(QWidget):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
         
-        # Viewport (top)
+        # Viewport (top): Ready on the Fit row, same as 1D/2D.
+        viewport = QWidget()
+        viewport.setObjectName("general3dViewport")
+        viewport.setMinimumWidth(0)
+        viewport.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        vp_layout = QVBoxLayout(viewport)
+        vp_layout.setContentsMargins(4, 4, 4, 4)
+        controls = QHBoxLayout()
+        self._status_caption_host = QWidget(viewport)
+        self._status_caption_host.setObjectName("viewportStatusHost")
+        host_layout = QHBoxLayout(self._status_caption_host)
+        host_layout.setContentsMargins(0, 0, 0, 0)
+        host_layout.setSpacing(8)
+        host_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._status_caption_host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.btn_fit = QPushButton("Fit")
+        controls.addWidget(self._status_caption_host, 1)
+        controls.addWidget(self.btn_fit, 0)
+        vp_layout.addLayout(controls)
         self.viewer = BlastViewerWidget()
         self.viewer.setMinimumWidth(0)
         self.viewer.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
-        right_layout.addWidget(self.viewer, stretch=1)
+        self.btn_fit.clicked.connect(self.viewer.reset_camera)
+        vp_layout.addWidget(self.viewer, 1)
+        right_layout.addWidget(viewport, stretch=1)
         
         # Execution Controls (bottom)
         self.ctrl_tabs = QTabWidget()
@@ -351,6 +371,16 @@ class TabGeneral3D(QWidget):
         self._main_splitter = splitter
         self._right_container = right_container
         self._left_column = left_column
+
+    def embed_status_caption(self, *widgets) -> None:
+        """Place the Ready/status caption on the Fit row, left-aligned."""
+        layout = self._status_caption_host.layout()
+        for widget in widgets:
+            if widget is None:
+                continue
+            layout.addWidget(widget, 0)
+            if isinstance(widget, QLabel):
+                widget.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
     def get_computational_left_width(self) -> int:
         sizes = self._main_splitter.sizes()

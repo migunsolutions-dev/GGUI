@@ -238,12 +238,7 @@ class Tab1D(QWidget):
         self._right_v_splitter.setChildrenCollapsible(False)
         self._right_v_splitter.setObjectName("tab1dRightVerticalSplitter")
 
-        self.canvas = MplCanvas(self)
-        self.canvas.axes.set_title("Overpressure vs Distance")
-        self.canvas.axes.set_xlabel("Distance (m)")
-        self.canvas.axes.set_ylabel("Overpressure (Pa)")
-        self.canvas.axes.grid(True)
-        self.canvas.setMinimumHeight(120)
+        viewport = self._build_viewport()
 
         self.ctrl_tabs = QTabWidget()
         self.ctrl_tabs.setMinimumHeight(EXECUTION_AREA_MIN_HEIGHT)
@@ -260,7 +255,7 @@ class Tab1D(QWidget):
         self._exec_scroll = exec_scroll
         self.ctrl_tabs.addTab(exec_scroll, "Execution Controls")
 
-        self._right_v_splitter.addWidget(self.canvas)
+        self._right_v_splitter.addWidget(viewport)
         self._right_v_splitter.addWidget(self.ctrl_tabs)
         self._right_v_splitter.setStretchFactor(0, 1)
         self._right_v_splitter.setStretchFactor(1, 0)
@@ -278,6 +273,49 @@ class Tab1D(QWidget):
         self.splitter.setSizes([left_w, max(400, 1200 - left_w)])
         self._main_splitter = self.splitter
         root_layout.addWidget(self.splitter)
+
+    def _build_viewport(self) -> QWidget:
+        frame = QWidget()
+        frame.setMinimumWidth(0)
+        frame.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(4, 4, 4, 4)
+        controls = QHBoxLayout()
+        self._status_caption_host = QWidget(frame)
+        self._status_caption_host.setObjectName("viewportStatusHost")
+        host_layout = QHBoxLayout(self._status_caption_host)
+        host_layout.setContentsMargins(0, 0, 0, 0)
+        host_layout.setSpacing(8)
+        host_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._status_caption_host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.btn_fit = QPushButton("Fit")
+        self.btn_fit.clicked.connect(self._fit_graph)
+        controls.addWidget(self._status_caption_host, 1)
+        controls.addWidget(self.btn_fit, 0)
+        layout.addLayout(controls)
+        self.canvas = MplCanvas(self)
+        self.canvas.axes.set_title("Overpressure vs Distance")
+        self.canvas.axes.set_xlabel("Distance (m)")
+        self.canvas.axes.set_ylabel("Overpressure (Pa)")
+        self.canvas.axes.grid(True)
+        self.canvas.setMinimumHeight(120)
+        layout.addWidget(self.canvas, 1)
+        return frame
+
+    def embed_status_caption(self, *widgets) -> None:
+        """Place the Ready/status caption on the Fit row, left-aligned."""
+        layout = self._status_caption_host.layout()
+        for widget in widgets:
+            if widget is None:
+                continue
+            layout.addWidget(widget, 0)
+            if isinstance(widget, QLabel):
+                widget.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+    def _fit_graph(self) -> None:
+        self.canvas.axes.relim()
+        self.canvas.axes.autoscale_view()
+        self.canvas.draw_idle()
 
     def _on_1d_exec_splitter_moved(self, _pos: int = 0, _index: int = 0) -> None:
         """Remember the user's graph/execution split for this session."""

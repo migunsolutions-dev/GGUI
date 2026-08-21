@@ -123,8 +123,8 @@ class SegmentedStatusBar(QFrame):
     _DASH = "—"
     _LABEL_STYLE = "color: white; background: transparent;"
     _STATUS_STYLE_TMPL = "color: {color}; font-weight: bold; background: transparent;"
-    _REP_MODE = "3D: Step=12345678  Tt=1.234567e-04  Δt=1.234e-07"
-    _REP_ET = "ET=12345.6 s"
+    _REP_MODE = "3D: Step=9999999 Tt=9.999e-99 Δt=9.999e-99"
+    _REP_ET = "ET=9.999e-99 s"
 
     def _metrics_font(self, point_size: int = None) -> QFont:
         from ui_metrics import STATUS_METRICS_POINT_SIZE, STATUS_FONT_MIN_POINT_SIZE
@@ -133,9 +133,8 @@ class SegmentedStatusBar(QFrame):
         font = QFont("Consolas")
         font.setStyleHint(QFont.TypeWriter)
         font.setPointSize(pt)
-        font.setWeight(QFont.Normal)
-        # Tightened tracking so three reserved mode groups + ET fit at ~1685.
-        font.setLetterSpacing(QFont.PercentageSpacing, 70.0)
+        font.setWeight(QFont.Bold)
+        font.setLetterSpacing(QFont.PercentageSpacing, 100.0)
         return font
 
     def _ready_font(self) -> QFont:
@@ -157,8 +156,7 @@ class SegmentedStatusBar(QFrame):
         lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
         lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         lbl.setMinimumWidth(width)
-        lbl.setFixedWidth(width)
-        lbl.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         return lbl
 
     def __init__(self, parent=None):
@@ -230,9 +228,9 @@ class SegmentedStatusBar(QFrame):
         self.lbl_metrics_meta = self.lbl_et
 
         sep_font = metrics_font
-        self._sep_1d_2d = QLabel(" | ")
-        self._sep_2d_3d = QLabel(" | ")
-        self._sep_3d_et = QLabel(" | ")
+        self._sep_1d_2d = QLabel("|")
+        self._sep_2d_3d = QLabel("|")
+        self._sep_3d_et = QLabel("|")
         for sep in (self._sep_1d_2d, self._sep_2d_3d, self._sep_3d_et):
             sep.setFont(sep_font)
             sep.setStyleSheet(self._LABEL_STYLE)
@@ -246,18 +244,18 @@ class SegmentedStatusBar(QFrame):
         metrics_layout = QHBoxLayout(self._metrics_widget)
         metrics_layout.setContentsMargins(0, 0, 0, 0)
         metrics_layout.setSpacing(0)
-        for w in (
-            self.lbl_1d_group, self._sep_1d_2d,
-            self.lbl_2d_group, self._sep_2d_3d,
-            self.lbl_3d_group, self._sep_3d_et,
-            self.lbl_et,
-        ):
-            metrics_layout.addWidget(w, stretch=0)
+        metrics_layout.addWidget(self.lbl_1d_group, 1)
+        metrics_layout.addWidget(self._sep_1d_2d, 0)
+        metrics_layout.addWidget(self.lbl_2d_group, 1)
+        metrics_layout.addWidget(self._sep_2d_3d, 0)
+        metrics_layout.addWidget(self.lbl_3d_group, 1)
+        metrics_layout.addWidget(self._sep_3d_et, 0)
+        metrics_layout.addWidget(self.lbl_et, 1)
 
         self._metrics_scroll = QScrollArea()
         self._metrics_scroll.setObjectName("statusMetricsScroll")
         self._metrics_scroll.setFrameShape(QFrame.NoFrame)
-        self._metrics_scroll.setWidgetResizable(False)
+        self._metrics_scroll.setWidgetResizable(True)
         self._metrics_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._metrics_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._metrics_scroll.setMinimumWidth(0)
@@ -281,6 +279,21 @@ class SegmentedStatusBar(QFrame):
         self._et_timer.setInterval(100)
         self._et_timer.timeout.connect(self._on_et_tick)
 
+    def restore_metrics_in_bar(self) -> None:
+        """Keep 1D/2D/3D/ET in the window-bottom bar (without Ready)."""
+        outer = self.layout()
+        outer.addWidget(self._metrics_scroll, stretch=1)
+        self._metrics_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.show()
+
+    def restore_status_contents(self) -> None:
+        """Return metrics + Ready to the window-bottom status bar."""
+        outer = self.layout()
+        outer.addWidget(self._metrics_scroll, stretch=1)
+        outer.addWidget(self.lbl_status, stretch=0)
+        self._metrics_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.show()
+
     def metrics_point_size(self) -> int:
         return int(self.lbl_1d_group.font().pointSize())
 
@@ -288,31 +301,44 @@ class SegmentedStatusBar(QFrame):
         return [self.lbl_1d_group, self.lbl_2d_group, self.lbl_3d_group, self.lbl_et]
 
     def _fmt_step(self, step):
-        return self._DASH if step is None else str(int(step))
+        from ui_metrics import STATUS_STEP_WIDTH
+        n = 0 if step is None else int(step)
+        return f"{n:{STATUS_STEP_WIDTH}d}"
+
+    def _fmt_sci(self, value):
+        from ui_metrics import STATUS_SCI_DIGITS
+        n = 0.0 if value is None else float(value)
+        return f"{n:.{STATUS_SCI_DIGITS}e}"
 
     def _fmt_tt(self, tt):
-        return self._DASH if tt is None else f"{tt:.6e}"
+        return self._fmt_sci(tt)
 
     def _fmt_dt(self, dt):
-        return self._DASH if dt is None else f"{dt:.3e}"
+        return self._fmt_sci(dt)
+
+    def _fmt_et_number(self, seconds):
+        from ui_metrics import STATUS_ET_SCI_THRESHOLD, STATUS_ET_WIDTH, STATUS_SCI_DIGITS
+        n = 0.0 if seconds is None else float(seconds)
+        if abs(n) >= STATUS_ET_SCI_THRESHOLD:
+            return f"{n:.{STATUS_SCI_DIGITS}e}"
+        return f"{int(round(n)):{STATUS_ET_WIDTH}d}"
 
     def _format_mode_group(self, mode: str, values: dict) -> str:
         return (
-            f"{mode}: Step={self._fmt_step(values.get('step'))}  "
-            f"Tt={self._fmt_tt(values.get('tt'))}  "
+            f"{mode}: Step={self._fmt_step(values.get('step'))} "
+            f"Tt={self._fmt_tt(values.get('tt'))} "
             f"Δt={self._fmt_dt(values.get('dt'))}"
         )
 
     def _format_et(self) -> str:
-        if self._et_seconds is None:
-            return f"ET={self._DASH}"
-        return f"ET={self._et_seconds:.1f} s"
+        seconds = 0.0 if self._et_seconds is None else self._et_seconds
+        return f"ET={self._fmt_et_number(seconds)} s"
 
     def _format_metrics_line(self) -> str:
         return (
-            f"{self._format_mode_group('1D', self._1d)} | "
-            f"{self._format_mode_group('2D', self._2d)} | "
-            f"{self._format_mode_group('3D', self._3d)} | "
+            f"{self._format_mode_group('1D', self._1d)}|"
+            f"{self._format_mode_group('2D', self._2d)}|"
+            f"{self._format_mode_group('3D', self._3d)}|"
             f"{self._format_et()}"
         )
 
@@ -329,11 +355,7 @@ class SegmentedStatusBar(QFrame):
         return QSize(0, sh.height())
 
     def _refresh_metrics_width(self):
-        self._metrics_widget.adjustSize()
-        hint = self._metrics_widget.sizeHint()
-        self._metrics_widget.resize(
-            hint.width(), max(hint.height(), self.lbl_1d_group.sizeHint().height())
-        )
+        self._metrics_widget.updateGeometry()
         self._metrics_scroll.updateGeometry()
 
     def update_1d(self, step=None, tt=None, dt=None):
@@ -678,11 +700,12 @@ class BlastFoamApp(QMainWindow):
         
         main_layout.addWidget(content_splitter, stretch=1)
         
-        # Bottom: Segmented Status Bar
+        # Bottom: Segmented Status Bar (Ready moves onto the 1D/2D/3D Fit row).
         self.status_bar = SegmentedStatusBar()
         main_layout.addWidget(self.status_bar)
         self.tab_3d.initial_dt_changed.connect(self._on_3d_initial_dt_changed)
         self.tab_3d._update_calculated_dt_label()
+        self._sync_status_caption_host()
 
     def _computational_tabs(self):
         return (self.tab_1d, self.tab_2d, self.tab_3d)
@@ -2607,6 +2630,21 @@ class BlastFoamApp(QMainWindow):
             setter = getattr(tab.viewer, "set_viewport_active", None)
             if callable(setter):
                 setter(active)
+        self._sync_status_caption_host()
+
+    def _sync_status_caption_host(self) -> None:
+        """On 1D/2D/3D, put Ready on the Fit row; keep metrics in the bottom bar."""
+        bar = getattr(self, "status_bar", None)
+        tabs = getattr(self, "tabs", None)
+        if bar is None:
+            return
+        current = tabs.currentWidget() if tabs is not None else None
+        if current is not None and hasattr(current, "embed_status_caption"):
+            bar.restore_metrics_in_bar()
+            bar.lbl_status.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            current.embed_status_caption(bar.lbl_status)
+            return
+        bar.restore_status_contents()
 
     def check_3d_updates(self):
         """Check for 3D/2D viewport updates on the GUI thread only."""
