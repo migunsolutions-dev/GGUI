@@ -21,16 +21,10 @@ from openfoam_times_2d import (
     remove_single_time_case_view,
 )
 from viewer_gl import (
-    close_plotter_safely,
     create_embedded_interactor,
     guard_embedded_interactor,
-    live_viewer_registry_snapshot,
     register_viewer,
     scalar_bar_kwargs,
-    set_plotter_visible,
-    stop_plotter_render_timer,
-    sync_interactor_size,
-    unregister_viewer,
 )
 from viewer_widget import BlastViewerWidget, FieldViewSettings, HAS_PV, pv
 
@@ -296,24 +290,19 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         self._refresh_pending = False
         self.refresh_view()
 
+    def release_vtk(self) -> None:
+        self._scalar_bar_actor = None
+        super().release_vtk()
+
     def shutdown_viewer(self) -> None:
         """Stop timers and close VTK while the Qt HWND is still valid."""
         if self._shutdown and self._plotter is None:
             return
-        self._shutdown = True
-        self._viewport_active = False
         self._refresh_pending = False
         self._discard_of_view_root()
         if self._coalesce_timer is not None:
             self._coalesce_timer.stop()
-        plotter = self._plotter
-        self._plotter = None
-        stop_plotter_render_timer(plotter)
-        close_plotter_safely(plotter, owner="AxisymmetricViewerWidget/2D")
-        unregister_viewer(self)
-        self._dynamic_actors.clear()
-        self._probe_actors = []
-        self._scalar_bar_actor = None
+        super().shutdown_viewer()
 
     def set_mirrored_view(self, mirrored: bool) -> None:
         self.mirrored_view = bool(mirrored)

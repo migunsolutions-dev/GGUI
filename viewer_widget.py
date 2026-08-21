@@ -149,19 +149,55 @@ class BlastViewerWidget(QWidget):
         guard_embedded_interactor(interactor, self)
         self._gl_info = register_viewer("BlastViewerWidget/3D", self, self._plotter)
 
-    def set_viewport_active(self, active: bool) -> None:
-        """Create VTK only when shown; freeze hidden OpenGL widgets otherwise."""
-        was_active = bool(self._viewport_active)
-        self._viewport_active = bool(active)
-        if active:
-            self.ensure_vtk()
-        set_plotter_visible(self._plotter, bool(active))
+    def release_vtk(self) -> None:
+        """Destroy the OpenGL interactor while this tab is hidden.
+
+        Hiding is not enough on Windows: a dormant vtkWin32OpenGLRenderWindow
+        still receives paint and aborts the process during 1D graph updates.
+        Recreate on the next set_viewport_active(True).
+        """
+        self._viewport_active = False
+        plotter = self._plotter
+        if plotter is None:
+            return
+        self._plotter = None
+        stop_plotter_render_timer(plotter)
+        interactor = getattr(plotter, "interactor", None)
         try:
-            self.setUpdatesEnabled(bool(active))
-            self.plotter_frame.setUpdatesEnabled(bool(active))
+            if interactor is not None:
+                interactor.hide()
+                interactor.setUpdatesEnabled(False)
+                self.plotter_layout.removeWidget(interactor)
+                interactor.setParent(None)
         except Exception:
             pass
-        if active and not was_active:
+        close_plotter_safely(plotter, owner=type(self).__name__)
+        unregister_viewer(self)
+        self._gl_info = None
+        self._dynamic_actors.clear()
+        self._obstacle_actors.clear()
+        self._probe_actors = []
+
+    def set_viewport_active(self, active: bool) -> None:
+        """Create VTK only while shown; destroy it when the tab is hidden."""
+        was_active = bool(self._viewport_active)
+        if not active:
+            self.release_vtk()
+            try:
+                self.setUpdatesEnabled(False)
+                self.plotter_frame.setUpdatesEnabled(False)
+            except Exception:
+                pass
+            return
+        self._viewport_active = True
+        try:
+            self.setUpdatesEnabled(True)
+            self.plotter_frame.setUpdatesEnabled(True)
+        except Exception:
+            pass
+        self.ensure_vtk()
+        set_plotter_visible(self._plotter, True)
+        if not was_active:
             sync_interactor_size(
                 getattr(self._plotter, "interactor", None) if self._plotter else None
             )
@@ -171,15 +207,7 @@ class BlastViewerWidget(QWidget):
         if self._shutdown:
             return
         self._shutdown = True
-        self._viewport_active = False
-        plotter = self._plotter
-        self._plotter = None
-        stop_plotter_render_timer(plotter)
-        close_plotter_safely(plotter, owner="BlastViewerWidget/3D")
-        unregister_viewer(self)
-        self._dynamic_actors.clear()
-        self._obstacle_actors.clear()
-        self._probe_actors = []
+        self.release_vtk()
 
     def set_field(self, name):
         self.current_field = name

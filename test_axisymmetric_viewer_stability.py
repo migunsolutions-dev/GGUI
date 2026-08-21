@@ -93,6 +93,22 @@ class GuiThreadAndLifecycleTests(unittest.TestCase):
         self.assertIs(seen["assert_ok"], False)
         viewer.shutdown_viewer()
 
+    def test_release_vtk_clears_plotter_without_permanent_shutdown(self):
+        viewer = AxisymmetricViewerWidget()
+        viewer.set_viewport_active(True)
+        viewer.release_vtk()
+        self.assertIsNone(viewer._plotter)
+        self.assertFalse(viewer._shutdown)
+        self.assertFalse(viewer._viewport_active)
+        viewer.set_viewport_active(True)
+        self.assertTrue(viewer._viewport_active)
+        self.assertFalse(viewer._shutdown)
+        viewer.set_viewport_active(False)
+        self.assertIsNone(viewer._plotter)
+        self.assertFalse(viewer._shutdown)
+        viewer.shutdown_viewer()
+        self.assertTrue(viewer._shutdown)
+
 
 class ChargeAndMirrorGeometryTests(unittest.TestCase):
     def test_sphere_and_cylinder_centres_locked_to_axis(self):
