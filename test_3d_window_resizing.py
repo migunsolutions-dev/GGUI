@@ -2,7 +2,7 @@
 Regression: top-level window horizontal resize for General 3D + status bar.
 
 Verifies OS-border shrink behavior, Execution Controls scroll isolation,
-compact scroll-isolated SegmentedStatusBar (all three stage histories,
+compact clipped SegmentedStatusBar (all three stage histories,
 Δt notation, fit at ~1685 px), and no window expansion on calculation state.
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
 
-from PyQt5.QtCore import QRect
+from PyQt5.QtCore import QRect, Qt
 from PyQt5.QtWidgets import QApplication, QLabel
 
 from ui_metrics import STATUS_METRICS_POINT_SIZE
@@ -270,10 +270,11 @@ class Test3DWindowResizing(unittest.TestCase):
                     self.assertGreaterEqual(lbl.width(), fm.horizontalAdvance(STATUS_REP_MODE_GROUP))
                 self.assertGreaterEqual(self.status.lbl_et.width(), fm.horizontalAdvance(STATUS_REP_ET))
                 hs = self.status._metrics_scroll.horizontalScrollBar()
-                content_w = self.status._metrics_widget.width()
-                viewport_w = self.status._metrics_scroll.viewport().width()
-                if content_w > viewport_w + 2:
-                    self.assertGreater(hs.maximum(), 0)
+                self.assertEqual(
+                    self.status._metrics_scroll.horizontalScrollBarPolicy(),
+                    Qt.ScrollBarAlwaysOff,
+                )
+                self.assertEqual(hs.maximum(), 0)
                 self.assertTrue(self.status.lbl_status.isVisible())
                 self.assertGreater(self.status.lbl_status.width(), 0)
                 self.assertIn("Running", self.status.lbl_status.text())
@@ -288,7 +289,7 @@ class Test3DWindowResizing(unittest.TestCase):
                     self.status.lbl_1d_group.rect().size(),
                 )
                 self.assertTrue(vp.rect().intersects(mapped_1d))
-    def test_status_bar_scrolls_when_narrow_without_clamping_window(self):
+    def test_status_bar_clips_when_narrow_without_clamping_window(self):
         self._fill_representative_values()
         for width in (1500, 1250, 1100):
             with self.subTest(width=width):
@@ -303,18 +304,16 @@ class Test3DWindowResizing(unittest.TestCase):
                 self.assertGreater(self.status.lbl_status.width(), 0)
 
                 scroll = self.status._metrics_scroll
-                metrics_need = self.status._metrics_widget.width()
-                viewport_w = scroll.viewport().width()
-                hs = scroll.horizontalScrollBar()
-                self.assertLess(self.app.minimumSizeHint().width(), metrics_need)
+                self.assertEqual(scroll.horizontalScrollBarPolicy(), Qt.ScrollBarAlwaysOff)
+                self.assertFalse(scroll.horizontalScrollBar().isVisible())
+                self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
                 self.assertEqual(self.status.minimumSizeHint().width(), 0)
-                if viewport_w < metrics_need - 2:
-                    self.assertGreater(hs.maximum(), 0)
-                    hs.setValue(hs.maximum())
-                    self.qapp.processEvents()
-                    self.assertGreater(self.status.lbl_et.width(), 0)
-                    hs.setValue(0)
-                    self.qapp.processEvents()
+                vp = scroll.viewport()
+                mapped_1d = QRect(
+                    self.status.lbl_1d_group.mapTo(vp, self.status.lbl_1d_group.rect().topLeft()),
+                    self.status.lbl_1d_group.rect().size(),
+                )
+                self.assertTrue(vp.rect().intersects(mapped_1d))
 
     def test_long_status_text_does_not_expand_window(self):
         self.app.resize(1250, 900)

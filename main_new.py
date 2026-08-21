@@ -256,18 +256,14 @@ class SegmentedStatusBar(QFrame):
         self._metrics_scroll.setObjectName("statusMetricsScroll")
         self._metrics_scroll.setFrameShape(QFrame.NoFrame)
         self._metrics_scroll.setWidgetResizable(True)
-        self._metrics_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._metrics_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._metrics_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._metrics_scroll.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._metrics_scroll.setMinimumWidth(0)
         self._metrics_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._metrics_scroll.setStyleSheet(
             "QScrollArea#statusMetricsScroll { background-color: #34495e; border: none; }"
             "QScrollArea#statusMetricsScroll > QWidget > QWidget { background-color: #34495e; }"
-            "QScrollBar:horizontal {"
-            "  height: 8px; background: #2c3e50; margin: 0;"
-            "}"
-            "QScrollBar::handle:horizontal { background: #7f8c8d; min-width: 24px; border-radius: 3px; }"
-            "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }"
         )
         self._metrics_scroll.setWidget(self._metrics_widget)
         self._refresh_metrics_width()

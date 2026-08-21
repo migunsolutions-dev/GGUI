@@ -182,8 +182,11 @@ class TestUILayoutConsistency(unittest.TestCase):
             self.app.processEvents()
             tab = win.tab_2d
             self.assertGreaterEqual(tab.ctrl_tabs.height(), EXECUTION_AREA_MIN_HEIGHT)
+            content_h = tab._exec_scroll.widget().minimumSizeHint().height()
+            tab_bar_h = tab.ctrl_tabs.tabBar().sizeHint().height()
             self.assertGreaterEqual(
-                tab.ctrl_tabs.height(), EXECUTION_AREA_PREFERRED_HEIGHT_2D - 40
+                tab.ctrl_tabs.height(),
+                min(content_h + tab_bar_h, EXECUTION_AREA_PREFERRED_HEIGHT_2D) - 8,
             )
             vp = tab._exec_scroll.viewport()
             for btn in (tab.btn_initialize, tab.btn_exact_end, tab.btn_stop):
@@ -323,6 +326,10 @@ class TestUILayoutConsistency(unittest.TestCase):
                 sb._metrics_scroll.verticalScrollBarPolicy(),
                 Qt.ScrollBarAlwaysOff,
             )
+            self.assertEqual(
+                sb._metrics_scroll.horizontalScrollBarPolicy(),
+                Qt.ScrollBarAlwaysOff,
+            )
             hs = sb._metrics_scroll.horizontalScrollBar()
             self.assertEqual(hs.maximum(), 0)
             self.assertNotIn("\n", sb.lbl_metrics_line.text())
@@ -358,7 +365,8 @@ class TestUILayoutConsistency(unittest.TestCase):
             self.app.processEvents()
             self.assertAlmostEqual(win.width(), 1250, delta=2)
             self.assertEqual(sb.metrics_point_size(), STATUS_METRICS_POINT_SIZE)
-            self.assertGreaterEqual(sb._metrics_scroll.horizontalScrollBar().maximum(), 0)
+            self.assertEqual(sb._metrics_scroll.horizontalScrollBarPolicy(), Qt.ScrollBarAlwaysOff)
+            self.assertFalse(sb._metrics_scroll.horizontalScrollBar().isVisible())
             self.assertEqual(sb._metrics_scroll.verticalScrollBar().maximum(), 0)
             for lbl in sb.metrics_value_labels():
                 self.assertFalse(lbl.wordWrap())

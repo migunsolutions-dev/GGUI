@@ -463,6 +463,7 @@ class Tab2DFieldSelectorTests(unittest.TestCase):
         self.assertIs(actions.layout().itemAt(1).widget(), tab.btn_exact_end)
         self.assertIs(actions.layout().itemAt(2).widget(), tab.btn_stop)
         self.assertIs(actions.layout().itemAt(3).widget(), tab.lbl_state)
+        self.assertIs(actions.layout().itemAt(4).widget(), tab.chk_log_scale)
         self.assertEqual(tab.lbl_state.maximumWidth(), 198)
         self.assertTrue(tab.btn_log.isHidden())
         self.assertIn("#3498db", tab.btn_initialize.styleSheet())
@@ -471,7 +472,7 @@ class Tab2DFieldSelectorTests(unittest.TestCase):
         self.assertEqual(tab.btn_initialize.minimumWidth(), 198)
         self.assertEqual(tab.btn_exact_end.minimumWidth(), 198)
         self.assertEqual(tab.btn_stop.minimumWidth(), 198)
-        self.assertIsNotNone(actions.layout().itemAt(4).spacerItem())
+        self.assertIsNotNone(actions.layout().itemAt(5).spacerItem())
         exec_page = tab._exec_scroll.widget()
         view_box = tab.cmb_view_mode.parentWidget()
         solver = tab.spin_max_co.parentWidget()
@@ -528,7 +529,7 @@ class Tab2DFieldSelectorTests(unittest.TestCase):
         tab._sync_write_interval_display()
         stacked = [
             view_box.layout().itemAt(i).widget()
-            for i in range(4)
+            for i in range(3)
         ]
         self.assertEqual(
             stacked,
@@ -536,9 +537,9 @@ class Tab2DFieldSelectorTests(unittest.TestCase):
                 tab.chk_view_mirror,
                 tab.chk_view_mesh,
                 tab.chk_view_probes,
-                tab.chk_log_scale,
             ],
         )
+        self.assertFalse(view_box.isAncestorOf(tab.chk_log_scale))
         self.assertTrue(tab.cmb_view_mode.isHidden())
         self.assertTrue(tab.lbl_mirror_indicator.isHidden())
         self.assertEqual(tab.chk_view_mirror.text(), "Mirrored View")
