@@ -5,8 +5,8 @@ from PyQt5.QtWidgets import (
     QRadioButton, QSplitter, QScrollArea, QSizePolicy, QTabWidget
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QFont
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from PyQt5.QtGui import QFont, QImage, QPixmap
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
 from models import (
@@ -57,13 +57,57 @@ def initial_overpressure_step(
     return [0.0, r_c, r_c, r_max], [over, over, 0.0, 0.0]
 
 
-class MplCanvas(FigureCanvas):
+class MplCanvas(QLabel):
+    """Raster matplotlib figure. Avoids Qt5Agg OpenGL swaps that abort on Windows."""
+
     def __init__(self, parent=None, width=5, height=4, dpi=100):
-        fig = Figure(figsize=(width, height), dpi=dpi)
-        self.axes = fig.add_subplot(111)
-        super().__init__(fig)
+        super().__init__(parent)
+        self._dpi = float(dpi)
+        self.figure = Figure(figsize=(width, height), dpi=dpi, facecolor="white")
+        self.axes = self.figure.add_subplot(111)
+        self._agg = FigureCanvasAgg(self.figure)
+        self._drawing = False
+        self.setMinimumHeight(120)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.updateGeometry()
+        self.setAlignment(Qt.AlignCenter)
+
+    def draw(self):
+        self._render_to_label()
+
+    def draw_idle(self):
+        self._render_to_label()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.axes.lines:
+            self.draw_idle()
+
+    def _render_to_label(self) -> None:
+        if self._drawing:
+            return
+        self._drawing = True
+        try:
+            w = max(int(self.width()), 1)
+            h = max(int(self.height()), 1)
+            if w < 40 or h < 40:
+                w, h = 640, 400
+            self.figure.set_size_inches(w / self._dpi, h / self._dpi, forward=False)
+            if w >= 200 and h >= 200:
+                try:
+                    self.figure.tight_layout()
+                except Exception:
+                    pass
+            self._agg.draw()
+            renderer = self._agg.get_renderer()
+            width = int(renderer.width)
+            height = int(renderer.height)
+            buf = renderer.buffer_rgba()
+            image = QImage(bytes(buf), width, height, QImage.Format_RGBA8888)
+            self.setPixmap(QPixmap.fromImage(image))
+        except Exception:
+            pass
+        finally:
+            self._drawing = False
 
 
 class Tab1D(QWidget):
@@ -79,6 +123,8 @@ class Tab1D(QWidget):
         self.last_r_min = None
         self.last_r_max = None
         self._live_graph = False
+        self._pending_pressures = None
+        self._pending_time_s = 0.0
         self._graph_timer = QTimer(self)
         self._graph_timer.setSingleShot(True)
         self._graph_timer.setInterval(50)
@@ -376,7 +422,9 @@ class Tab1D(QWidget):
         self._redraw_canvas()
 
     def _redraw_canvas(self) -> None:
-        """Queue a matplotlib paint; never force a synchronous OpenGL swap."""
+        """Apply pending live data, then paint a software bitmap (no Qt OpenGL)."""
+        if self._live_graph and self._pending_pressures:
+            self._apply_live_profile(self._pending_pressures, self._pending_time_s)
         try:
             self.canvas.draw_idle()
         except Exception:
@@ -529,7 +577,13 @@ class Tab1D(QWidget):
     def update_graph(self, pressures, sim_time_s: float):
         if not pressures:
             return
-        
+        self._pending_pressures = [float(p) for p in pressures]
+        self._pending_time_s = float(sim_time_s)
+        self._live_graph = True
+        if not self._graph_timer.isActive():
+            self._graph_timer.start()
+
+    def _apply_live_profile(self, pressures, sim_time_s: float) -> None:
         if self.last_r_min is None:
             try:
                 radius = float(self.spin_radius.value())
@@ -538,37 +592,31 @@ class Tab1D(QWidget):
                     rho = self.calculated_adj_rho
                 else:
                     rho = float(self.spin_density.value())
-                
+
                 vol = float(self.spin_mass.value()) / max(rho, 1.0)
-                r_ch = ((3.0 * vol) / (4.0 * math.pi))**(1/3.0)
-                
+                r_ch = ((3.0 * vol) / (4.0 * math.pi)) ** (1 / 3.0)
+
                 r_min_geom = max(1e-6, 0.05 * dx)
                 r_min = max(1e-6, min(r_min_geom, 0.2 * r_ch))
                 self.last_r_min = r_min
                 self.last_r_max = radius
             except (TypeError, ValueError, ZeroDivisionError, AttributeError):
-                # Probe radius bounds are display-only; keep last good range.
                 self.last_r_min = 0.0
                 self.last_r_max = 1.0
 
         r_min = self.last_r_min
         r_max = self.last_r_max
-        
         p_atm = self.spin_press.value()
         overpressures = [p - p_atm for p in pressures]
-        
         n = len(overpressures)
         if n > 1:
-            distances = [r_min + (i/(n-1))*(r_max - r_min) for i in range(n)]
+            distances = [r_min + (i / (n - 1)) * (r_max - r_min) for i in range(n)]
         else:
             distances = [r_min]
 
-        self._live_graph = True
         self.canvas.axes.clear()
         self.canvas.axes.plot(
             distances, overpressures, color="#c0392b", linewidth=1.8,
             label=f"t = {sim_time_s*1000.0:.3f} ms",
         )
         self._style_overpressure_axes()
-        if not self._graph_timer.isActive():
-            self._graph_timer.start()

@@ -118,6 +118,31 @@ class Tab1DInitialGraphTests(unittest.TestCase):
         tab.end_live_graph()
         self.assertFalse(tab._live_graph)
 
+    def test_live_update_does_not_mutate_axes_until_redraw(self):
+        tab = Tab1D()
+        initial = float(tab.canvas.axes.lines[0].get_ydata()[0])
+        tab.update_graph([101325.0, 2.0e8, 101325.0], 1.0e-4)
+        self.assertAlmostEqual(float(tab.canvas.axes.lines[0].get_ydata()[0]), initial)
+        tab._redraw_canvas()
+        ys = [float(v) for v in tab.canvas.axes.lines[0].get_ydata()]
+        self.assertIn(2.0e8 - 101325.0, ys)
+
+
+class ProbeStreamParseTests(unittest.TestCase):
+    def test_incomplete_trailing_line_is_left_unread(self):
+        from solver_runner import complete_probe_chunk, parse_last_probe_pressures
+
+        raw = b"# Probe 0 (0 0 0)\n0.1 101325 200000\n0.2 101325 2"
+        complete, leftover = complete_probe_chunk(raw)
+        self.assertTrue(complete.endswith(b"\n"))
+        self.assertEqual(leftover, len(b"0.2 101325 2"))
+        parsed = parse_last_probe_pressures(complete.decode("utf-8"))
+        self.assertIsNotNone(parsed)
+        t, pressures, count = parsed
+        self.assertAlmostEqual(t, 0.1)
+        self.assertEqual(pressures, [101325.0, 200000.0])
+        self.assertEqual(count, 1)
+
 
 class Tab1DBoundariesTests(unittest.TestCase):
     @classmethod

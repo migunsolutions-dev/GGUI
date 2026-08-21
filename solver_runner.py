@@ -1,3 +1,4 @@
+import glob
 import os
 import re
 import time
@@ -17,6 +18,39 @@ from wsl_runtime import build_case_command_argv, to_wsl_path_and_distro
 
 # Number of tail lines to capture from each log file for debug_summary.txt
 DEBUG_TAIL_LINES = 50
+
+
+def complete_probe_chunk(raw: bytes) -> Tuple[bytes, int]:
+    """Keep only newline-terminated probe text; leftover bytes stay unread."""
+    if not raw:
+        return b"", 0
+    last_nl = raw.rfind(b"\n")
+    if last_nl < 0:
+        return b"", len(raw)
+    complete = raw[: last_nl + 1]
+    return complete, len(raw) - len(complete)
+
+
+def parse_last_probe_pressures(text: str) -> Optional[Tuple[float, List[float], int]]:
+    """Return (time, pressures, data_line_count) from complete probe text."""
+    lines = [
+        ln.strip()
+        for ln in text.splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+    if not lines:
+        return None
+    parts = lines[-1].split()
+    if len(parts) < 2:
+        return None
+    try:
+        t = float(parts[0])
+        pressures = [float(x) for x in parts[1:]]
+    except ValueError:
+        return None
+    if not pressures:
+        return None
+    return t, pressures, len(lines)
 
 
 class SolverRunner(QThread):
@@ -138,22 +172,27 @@ class SolverRunner(QThread):
             self._end_time_s = None
 
     def _discover_probe_file(self) -> Optional[str]:
-        base = os.path.join(self.win_case_dir, "postProcessing", "probes1d")
-        if not os.path.isdir(base):
+        try:
+            base = os.path.join(self.win_case_dir, "postProcessing", "probes1d")
+            if not os.path.isdir(base):
+                return None
+            candidate = os.path.join(base, "0", "p")
+            if os.path.isfile(candidate):
+                return candidate
+            paths = glob.glob(os.path.join(base, "*", "p"))
+            if not paths:
+                return None
+
+            def time_key(path: str) -> float:
+                try:
+                    tdir = os.path.basename(os.path.dirname(path))
+                    return float(tdir)
+                except Exception:
+                    return -1.0
+
+            return sorted(paths, key=time_key)[-1]
+        except Exception:
             return None
-        candidate = os.path.join(base, "0", "p")
-        if os.path.isfile(candidate):
-            return candidate
-        paths = glob.glob(os.path.join(base, "*", "p"))
-        if not paths:
-            return None
-        def time_key(path: str) -> float:
-            try:
-                tdir = os.path.basename(os.path.dirname(path))
-                return float(tdir)
-            except Exception:
-                return -1.0
-        return sorted(paths, key=time_key)[-1]
 
     def _aggregate_log_errors(self, exit_code: int) -> str:
         """Collect last DEBUG_TAIL_LINES from each log.* in case dir. Return full summary text."""
@@ -416,52 +455,33 @@ class SolverRunner(QThread):
             return None
 
         try:
-            with open(self._probe_file, "r", encoding="utf-8", errors="ignore") as f:
+            with open(self._probe_file, "rb") as f:
                 f.seek(self._probe_pos)
-                new = f.read()
-                self._probe_pos = f.tell()
+                raw = f.read()
+                complete, leftover = complete_probe_chunk(raw)
+                self._probe_pos = f.tell() - leftover
         except Exception:
             return None
 
-        if not new:
+        if not complete:
             return None
 
-        lines = [ln.strip() for ln in new.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-        if not lines:
-            return None
-
-        # Parse the last line
-        last = lines[-1]
-        parts = last.split()
-        if len(parts) < 2:
+        parsed = parse_last_probe_pressures(complete.decode("utf-8", "ignore"))
+        if parsed is None:
             return None
 
         try:
-            t = float(parts[0])
-            ps = [float(x) for x in parts[1:]]
-            
-            # --- CALCULATE STATS ---
-            # 1. Update total lines read
-            count_new = len(lines)
+            t, ps, count_new = parsed
             self._total_lines_read += count_new
-            
-            # 2. Estimated Step (We know writeInterval is 100 from Generator)
             current_step = self._total_lines_read * 100
-            
-            # 3. Estimated dt (Time difference / steps elapsed)
-            # Avoid division by zero
             dt_est = 0.0
             if count_new > 0 and self._total_lines_read > 1:
                 time_diff = t - self._last_time_val
-                # Each line represents 100 steps
-                steps_diff = count_new * 100 
+                steps_diff = count_new * 100
                 if steps_diff > 0:
                     dt_est = time_diff / steps_diff
-            
             self._last_time_val = t
-            
             return t, ps, current_step, dt_est
-            
         except Exception:
             return None
 

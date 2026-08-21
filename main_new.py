@@ -2618,7 +2618,10 @@ class BlastFoamApp(QMainWindow):
         if mode == "1D":
             self.status_bar.update_1d(step=step_n, tt=sim_time_s, dt=dt_val)
             if self.tabs.currentWidget() == self.tab_1d:
-                self.tab_1d.update_graph(pressures, sim_time_s)
+                try:
+                    self.tab_1d.update_graph(pressures, sim_time_s)
+                except Exception:
+                    pass
         elif mode == "2D":
             self.status_bar.update_2d(step=step_n, tt=sim_time_s, dt=dt_val)
             # Coalesce viewport redraws; never render directly from the runner thread.
@@ -2728,9 +2731,10 @@ class BlastFoamApp(QMainWindow):
 def main():
     """Application entry point"""
     from ggui_logging import configure_logging
+    from qt_bootstrap import prepare_qt_application
 
     configure_logging()
-    app = QApplication(sys.argv)
+    app = prepare_qt_application()
     
     # Set application style
     app.setStyle("Fusion")

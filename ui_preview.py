@@ -149,14 +149,13 @@ def launch_preview(
     show: bool = True,
     exec_loop: bool = True,
 ):
-    from PyQt5.QtWidgets import QApplication
-
     from ggui_logging import configure_logging
-    from main_new import BlastFoamApp
+    from qt_bootstrap import prepare_qt_application
     from ui_review_mode import attach_ui_review, repo_root
 
     configure_logging()
-    app = QApplication.instance() or QApplication(sys.argv)
+    app = prepare_qt_application()
+    from main_new import BlastFoamApp
     app.setStyle("Fusion")
 
     window = BlastFoamApp()

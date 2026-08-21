@@ -1,14 +1,15 @@
+from __future__ import annotations
+
+import importlib.util
 import os
 import logging
 import numpy as np
-import pyvista as pv
-from pyvistaqt import QtInteractor
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QFrame, QLabel, QSizePolicy
 )
 from PyQt5.QtCore import pyqtSignal
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 
 from viewer_gl import (
     close_plotter_safely,
@@ -22,12 +23,25 @@ from viewer_gl import (
     unregister_viewer,
 )
 
-HAS_PV = True
-try:
-    import pyvista as pv
-    from pyvistaqt import QtInteractor
-except ImportError:
-    HAS_PV = False
+HAS_PV = importlib.util.find_spec("pyvista") is not None
+
+
+class _PyVistaProxy:
+    """Load pyvista on first attribute access so 1D never initializes VTK."""
+
+    _mod = None
+
+    def _load(self):
+        if self._mod is None:
+            import pyvista as _pv
+            self._mod = _pv
+        return self._mod
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+
+pv = _PyVistaProxy()
 
 _LOG = logging.getLogger("ggui.viewer_widget")
 
@@ -64,7 +78,7 @@ class BlastViewerWidget(QWidget):
         super().__init__(parent)
         self.current_case_dir = None
         self.is_simulating = False
-        self._stl_cache: Dict[str, pv.PolyData] = {}
+        self._stl_cache: Dict[str, Any] = {}
         self.field_settings: Dict[str, FieldViewSettings] = {}
         self.current_field = "p"
         self._first_load = True
