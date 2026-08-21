@@ -46,12 +46,13 @@ class CaseInputs1D:
     material_props: Dict[str, Any]
     max_cfl: float
     end_time_s: float
-    write_interval_s: float = 1e-5
-    n_probes: int = 1000
-    probe_write_interval_steps: int = 100
-    wedge_angle_deg: float = 5.0
+    # 0 = Viper-like: stream probes, dump mesh fields only at endTime (remap needs that last dir).
+    write_interval_s: float = 0.0
+    n_probes: int = 200
+    probe_write_interval_steps: int = 25
+    wedge_angle_deg: float = 15.0
     cone_half_angle_deg: float = 12.0
-    axis_epsilon: float = 1e-3
+    axis_epsilon: float = 0.10
     right_boundary: str = BOUNDARY_1D_TRANSMIT
 
 @dataclass(frozen=True)

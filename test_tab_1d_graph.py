@@ -127,6 +127,29 @@ class Tab1DInitialGraphTests(unittest.TestCase):
         ys = [float(v) for v in tab.canvas.axes.lines[0].get_ydata()]
         self.assertIn(2.0e8 - 101325.0, ys)
 
+    def test_remap_toggle_does_not_change_initial_graph(self):
+        tab = Tab1D()
+        tab.combo_comp.setCurrentText("TNT")
+        tab.spin_mass.setValue(200.0)
+        tab.spin_radius.setValue(20.0)
+        tab.radio_no.setChecked(True)
+        self.app.processEvents()
+        xs_no = [float(v) for v in tab.canvas.axes.lines[0].get_xdata()]
+        ys_no = [float(v) for v in tab.canvas.axes.lines[0].get_ydata()]
+        tab.radio_yes.setChecked(True)
+        self.app.processEvents()
+        xs_yes = [float(v) for v in tab.canvas.axes.lines[0].get_xdata()]
+        ys_yes = [float(v) for v in tab.canvas.axes.lines[0].get_ydata()]
+        self.assertEqual(xs_no, xs_yes)
+        self.assertEqual(ys_no, ys_yes)
+        self.assertEqual(tab.lbl_adj_density.text(), f"{tab.spin_density.value():.1f}")
+        self.assertAlmostEqual(tab.get_case_inputs().rho_charge, tab.spin_density.value())
+        self.assertAlmostEqual(tab.get_case_inputs().material_props["rho"], tab.spin_density.value())
+        tab.spin_density.setValue(1700.0)
+        self.app.processEvents()
+        self.assertEqual(tab.lbl_adj_density.text(), "1700.0")
+        self.assertAlmostEqual(tab.get_case_inputs().rho_charge, 1700.0)
+
 
 class ProbeStreamParseTests(unittest.TestCase):
     def test_incomplete_trailing_line_is_left_unread(self):
@@ -162,6 +185,34 @@ class Tab1DBoundariesTests(unittest.TestCase):
         self.assertEqual(tab.get_case_inputs().right_boundary, BOUNDARY_1D_TRANSMIT)
         tab.cmb_right.setCurrentText("Reflect")
         self.assertEqual(tab.get_case_inputs().right_boundary, "Reflect")
+
+
+class Tab1DOutputOptionsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _app()
+
+    def test_output_options_sit_under_solver_default_25_steps(self):
+        from PyQt5.QtWidgets import QGroupBox
+
+        tab = Tab1D()
+        self.assertEqual(tab.group_output.title(), "Output Options")
+        self.assertEqual(tab.spin_gui_refresh.value(), 25)
+        self.assertEqual(tab.spin_gui_refresh.suffix(), "")
+        self.assertEqual(tab.get_case_inputs().probe_write_interval_steps, 25)
+        tab.spin_gui_refresh.setValue(50)
+        self.assertEqual(tab.get_case_inputs().probe_write_interval_steps, 50)
+
+        titles = []
+        layout = tab.left_container.layout()
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            widget = item.widget() if item is not None else None
+            if isinstance(widget, QGroupBox):
+                titles.append(widget.title())
+        self.assertIn("Solver", titles)
+        self.assertIn("Output Options", titles)
+        self.assertEqual(titles.index("Output Options"), titles.index("Solver") + 1)
 
 
 class HiddenVtkPaintGuardTests(unittest.TestCase):

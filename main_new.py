@@ -611,6 +611,7 @@ class BlastFoamApp(QMainWindow):
         # Create tabs
         self.tab_1d = Tab1D()
         self.tab_2d = Tab2D()
+        self.tab_2d.set_source_cases_root(self.base_projects_path)
         self.tab_3d = TabGeneral3D(self.probes_model)
         self.tab_time_history = self._create_placeholder_tab("Time History Viewer", "Time history viewing (not yet implemented)")
         self.tab_pi_curves = self._create_placeholder_tab("PI-Curves", "PI curve analysis (not yet implemented)")
@@ -1778,6 +1779,7 @@ class BlastFoamApp(QMainWindow):
             prefix = "Case_1D"
             case_name = self.service.make_case_name(prefix)
             case_dir = self.service.generate_case(case_name, inputs)
+            self.tab_2d.set_last_1d_case(case_dir)
             self._start_solver(case_dir, cores=1, mode="1D")
             
         except Exception as e:

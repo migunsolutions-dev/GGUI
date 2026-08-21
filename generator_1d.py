@@ -178,8 +178,10 @@ air
 
         wedge_half = math.radians(inputs.wedge_angle_deg) / 2.0
         cone_half = math.radians(inputs.cone_half_angle_deg)
-        # Small theta so axis face has finite area; axis_epsilon is a small number (e.g. 1e-3 rad)
-        axis_eps = max(1e-9, min(float(inputs.axis_epsilon), cone_half * 0.5))
+        # Axis face length is r*sin(θ)*Δφ. Thin wedges + tiny θ freeze CFL at the origin.
+        requested_eps = max(1e-9, float(inputs.axis_epsilon))
+        min_axis_eps = min(0.10, cone_half * 0.45)
+        axis_eps = min(max(requested_eps, min_axis_eps), cone_half * 0.5)
 
         # Spherical wedge: vertices on spheres r=const so rotateFields produces a sphere (not a cylinder).
         # x = r*cos(theta), y = r*sin(theta)*cos(phi), z = r*sin(theta)*sin(phi); axis = x, theta from axis.
@@ -262,6 +264,10 @@ regions ( sphereToCell {{ centre (0 0 0); radius {float(charge_radius):.10g}; fi
         # Safety end time so run does not end before shock can reach target (slow shock ~300 m/s, *2 margin)
         safe_end_time = (target_radius / 300.0) * 2.0
         end_time = max(float(inputs.end_time_s), safe_end_time)
+        # write_interval_s <= 0: one field dump at endTime. Probes still stream the 1D graph.
+        user_write = float(inputs.write_interval_s)
+        field_write_interval = user_write if user_write > 0.0 else end_time
+        probe_steps = max(1, int(inputs.probe_write_interval_steps))
 
         cd = self._foam_header("controlDict", "dictionary", "system") + f"""
 application     blastFoam;
@@ -274,8 +280,8 @@ adjustTimeStep  yes;
 maxCo           {float(rec.maxCo):.10g};
 maxDeltaT       {float(rec.maxDeltaT):.10g};
 writeControl    runTime;
-writeInterval   {float(inputs.write_interval_s):.10g};
-purgeWrite      0;
+writeInterval   {field_write_interval:.10g};
+purgeWrite      1;
 writeFormat     ascii;
 writePrecision  6;
 writeCompression off;
@@ -288,7 +294,7 @@ functions
         libs            ("libfieldFunctionObjects.so");
         fields          (p);
         writeControl    timeStep;
-        writeInterval   {inputs.probe_write_interval_steps};
+        writeInterval   {probe_steps};
         probeLocations  ( {os.linesep.join(probe_points)} );
     }}
     watchdog_probe
@@ -297,7 +303,7 @@ functions
         libs            ("libfieldFunctionObjects.so");
         fields          (p);
         writeControl    timeStep;
-        writeInterval   1;
+        writeInterval   {probe_steps};
         probeLocations  ( {watchdog_point} );
     }}
 }}

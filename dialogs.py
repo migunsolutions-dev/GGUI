@@ -161,3 +161,54 @@ class RemapConfigDialog(QDialog):
             "remap_time_mode": "latest" if self.rad_latest.isChecked() else "specific",
             "remap_specific_time": self.le_specific_time.text().strip() or "1e-4",
         }
+
+
+class RemapFromDialog(QDialog):
+    """Choose whether 2D remap uses the current 1D model or a results file."""
+
+    CURRENT_1D = "current_1d"
+    FILE_1D = "file_1d"
+    FILE_2D = "file_2d"
+
+    def __init__(
+        self,
+        parent: QWidget = None,
+        *,
+        current_kind: str = CURRENT_1D,
+        has_current_1d: bool = True,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Remap from")
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+        title = QLabel("Remap from:")
+        title.setStyleSheet("font-weight: bold;")
+        layout.addWidget(title)
+
+        self.rad_current_1d = QRadioButton("Current 1D model")
+        self.rad_file_1d = QRadioButton("1D results file")
+        self.rad_file_2d = QRadioButton("2D results file")
+        self.rad_current_1d.setEnabled(bool(has_current_1d))
+        for radio in (self.rad_current_1d, self.rad_file_1d, self.rad_file_2d):
+            layout.addWidget(radio)
+
+        kind = current_kind if current_kind in (
+            self.CURRENT_1D, self.FILE_1D, self.FILE_2D
+        ) else self.CURRENT_1D
+        if kind == self.CURRENT_1D and not has_current_1d:
+            kind = self.FILE_1D
+        self.rad_current_1d.setChecked(kind == self.CURRENT_1D)
+        self.rad_file_1d.setChecked(kind == self.FILE_1D)
+        self.rad_file_2d.setChecked(kind == self.FILE_2D)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_kind(self) -> str:
+        if self.rad_file_1d.isChecked():
+            return self.FILE_1D
+        if self.rad_file_2d.isChecked():
+            return self.FILE_2D
+        return self.CURRENT_1D

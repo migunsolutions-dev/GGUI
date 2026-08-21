@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QDialog,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -48,6 +49,7 @@ from axisymmetric_2d import (
 )
 from axisymmetric_viewer import AxisymmetricViewerWidget
 from charge_seed_plan import SEED_MODE_AUTO, SEED_MODE_MANUAL, SEED_MODE_OFF
+from dialogs import RemapFromDialog
 from external_case_workflow_2d import ImportMode2D, import_mode_label
 from imported_case_mapping_2d import FieldProvenance
 from material_catalog import materials_copy
@@ -118,6 +120,50 @@ class CompactDoubleSpinBox(QDoubleSpinBox):
         return compact_spin_text(float(value), self.decimals())
 
 
+def latest_case_1d_dir(work_root: str) -> str:
+    """Newest Case_1D_* folder under the Work/run directory, or empty."""
+    if not work_root or not os.path.isdir(work_root):
+        return ""
+    try:
+        names = os.listdir(work_root)
+    except OSError:
+        return ""
+    newest_name = ""
+    newest_path = ""
+    for name in names:
+        if not name.startswith("Case_1D_"):
+            continue
+        path = os.path.join(work_root, name)
+        if os.path.isdir(path) and name > newest_name:
+            newest_name = name
+            newest_path = path
+    return os.path.normpath(newest_path) if newest_path else ""
+
+
+def case_dir_from_picked_path(path: str) -> str:
+    """Map a picked results file or folder to the OpenFOAM case root."""
+    path = os.path.normpath(path) if path else ""
+    if not path:
+        return ""
+    if os.path.isfile(path):
+        parent = os.path.dirname(path)
+        name = os.path.basename(path).lower()
+        if name.endswith(".foam") and os.path.isdir(os.path.join(parent, "system")):
+            return parent
+        if os.path.isdir(os.path.join(parent, "system")):
+            return parent
+        grand = os.path.dirname(parent)
+        if os.path.isdir(os.path.join(grand, "system")):
+            return grand
+        return parent
+    if os.path.isdir(os.path.join(path, "system")):
+        return path
+    parent = os.path.dirname(path)
+    if os.path.isdir(os.path.join(parent, "system")):
+        return parent
+    return path
+
+
 class Tab2D(QWidget):
     sig_request_init = pyqtSignal(object)
     sig_request_run_exact_end = pyqtSignal()
@@ -142,6 +188,11 @@ class Tab2D(QWidget):
         self._unsupported_features = []
         self._defer_viewer_preview = False
         self._pending_setup_preview = None
+        self._source_cases_root = ""
+        self._remap_case_path = ""
+        self._remap_from_last_1d = True
+        self._remap_kind = RemapFromDialog.CURRENT_1D
+        self._last_1d_case_dir = ""
         self._preview_flush_timer = QTimer(self)
         self._preview_flush_timer.setSingleShot(True)
         self._preview_flush_timer.timeout.connect(self._flush_setup_preview)
@@ -908,9 +959,21 @@ class Tab2D(QWidget):
         form.addRow(self.lbl_axis_lock)
         layout.addWidget(self.grp_charge)
 
-        self.grp_mapping, form = self._group("1D → 2D rotateFields")
-        self.txt_source_case = QComboBox()
-        self.txt_source_case.setEditable(True)
+        self.grp_mapping, form = self._group("Remap")
+        self.txt_source_case = QLabel()
+        self.txt_source_case.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.txt_source_case.setWordWrap(True)
+        self.btn_edit_remap = QPushButton("Edit...")
+        self.btn_edit_remap.setToolTip(
+            "Choose the current 1D model or import 1D/2D results."
+        )
+        self._limit_width_to_half_or_text(self.btn_edit_remap, 438)
+        source_row = QWidget()
+        source_lay = QHBoxLayout(source_row)
+        source_lay.setContentsMargins(0, 0, 0, 0)
+        source_lay.setSpacing(8)
+        source_lay.addWidget(self.txt_source_case, 1)
+        source_lay.addWidget(self.btn_edit_remap, 0)
         self.cmb_source_time_mode = QComboBox()
         self.cmb_source_time_mode.addItems(["latest", "specific"])
         self.txt_source_time = QComboBox()
@@ -923,7 +986,7 @@ class Tab2D(QWidget):
         )
         self.lbl_mapping_note.setWordWrap(True)
         self.lbl_mapping_note.setStyleSheet(WARNING_STYLE)
-        form.addRow("Source case:", self.txt_source_case)
+        form.addRow("Remap from:", source_row)
         form.addRow("Source time:", self.cmb_source_time_mode)
         form.addRow("Specific time:", self.txt_source_time)
         form.addRow("Mapped radius:", self._with_unit(self.spin_mapped_radius, "m"))
@@ -1436,6 +1499,7 @@ class Tab2D(QWidget):
 
     def _connect_signals(self) -> None:
         self.cmb_source.currentTextChanged.connect(self._apply_enablement)
+        self.btn_edit_remap.clicked.connect(self._open_remap_from_dialog)
         self.cmb_shape.currentTextChanged.connect(self._apply_enablement)
         self.cmb_mesh_mode.currentTextChanged.connect(self._apply_enablement)
         self.cmb_mesh_mode.currentTextChanged.connect(self._sync_mesh_mode_radios)
@@ -1540,6 +1604,89 @@ class Tab2D(QWidget):
         self._refresh_derived()
         if not self._defer_viewer_preview:
             self._apply_info_mode_visibility()
+
+    def set_source_cases_root(self, path: str) -> None:
+        """Work folder that the From-1D browse dialog opens in."""
+        self._source_cases_root = os.path.normpath(path) if path else ""
+        self.apply_last_1d_remap_default()
+
+    def apply_last_1d_remap_default(self) -> None:
+        """Fill Remap from the newest 1D run unless the user picked another case."""
+        if not self._remap_from_last_1d:
+            return
+        latest = self._last_1d_case_dir or latest_case_1d_dir(self._source_cases_root)
+        if latest:
+            self._set_remap_case_path(latest, from_last_1d=True)
+
+    def set_last_1d_case(self, path: str) -> None:
+        """Remember the 1D case that just started and refresh the Remap default."""
+        if not path:
+            return
+        self._last_1d_case_dir = os.path.normpath(path)
+        self.apply_last_1d_remap_default()
+
+    def _set_remap_case_path(self, path: str, *, from_last_1d: bool) -> None:
+        path = os.path.normpath(path) if path else ""
+        self._remap_case_path = path
+        self._remap_from_last_1d = bool(from_last_1d)
+        if from_last_1d:
+            self._remap_kind = RemapFromDialog.CURRENT_1D
+        if path:
+            if from_last_1d:
+                self.txt_source_case.setText("Current 1D model")
+            else:
+                self.txt_source_case.setText(os.path.basename(path))
+            self.txt_source_case.setToolTip(path)
+        else:
+            self.txt_source_case.setText("")
+            self.txt_source_case.setToolTip("")
+
+    def _current_1d_remap_path(self) -> str:
+        return self._last_1d_case_dir or latest_case_1d_dir(self._source_cases_root)
+
+    def _open_remap_from_dialog(self) -> None:
+        if self.cmb_source.currentText() != REMAP_SOURCE:
+            return
+        current_1d = self._current_1d_remap_path()
+        dialog = RemapFromDialog(
+            self,
+            current_kind=self._remap_kind,
+            has_current_1d=bool(current_1d and os.path.isdir(current_1d)),
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        self._apply_remap_from_choice(dialog.selected_kind())
+
+    def _apply_remap_from_choice(self, kind: str) -> None:
+        if kind == RemapFromDialog.CURRENT_1D:
+            self._remap_from_last_1d = True
+            self.apply_last_1d_remap_default()
+            if not self._loading:
+                self._on_model_changed()
+            return
+        chosen = self._pick_results_path(kind)
+        if not chosen:
+            return
+        self._remap_kind = kind
+        self._set_remap_case_path(chosen, from_last_1d=False)
+        if not self._loading:
+            self._on_model_changed()
+
+    def _pick_results_path(self, kind: str) -> str:
+        start = getattr(self, "_source_cases_root", "") or ""
+        if kind == RemapFromDialog.FILE_2D:
+            caption = "Select 2D results file"
+        else:
+            caption = "Select 1D results file"
+        path, _filter = QFileDialog.getOpenFileName(
+            self,
+            caption,
+            start,
+            "OpenFOAM (case.foam);;All files (*)",
+        )
+        if not path:
+            return ""
+        return case_dir_from_picked_path(path)
 
     def _on_model_changed(self, *_args) -> None:
         if self._loading:
@@ -1935,7 +2082,7 @@ class Tab2D(QWidget):
             cell_size = float(self.spin_cell.value())
 
         mapping = MappingSource2D(
-            case_path=self.txt_source_case.currentText().strip(),
+            case_path=self._remap_case_path or self.txt_source_case.text().strip(),
             time_mode=self.cmb_source_time_mode.currentText(),
             specific_time=self.txt_source_time.currentText().strip(),
             mapped_radius=self.spin_mapped_radius.value(),
@@ -2110,7 +2257,10 @@ class Tab2D(QWidget):
                     else "Computational Domain View"
                 )
             if mapping:
-                self.txt_source_case.setEditText(str(mapping.get("case_path", "")))
+                loaded_case = str(mapping.get("case_path", "") or "").strip()
+                if loaded_case:
+                    self._remap_kind = RemapFromDialog.FILE_1D
+                    self._set_remap_case_path(loaded_case, from_last_1d=False)
                 self.cmb_source_time_mode.setCurrentText(str(mapping.get("time_mode", "latest")))
                 self.txt_source_time.setEditText(str(mapping.get("specific_time", "")))
                 if mapping.get("mapped_radius") is not None:

@@ -23,8 +23,10 @@ def get_profile(name: str = "Balanced") -> Dict[str, Any]:
             "maxDeltaT": 1e-5,
             "ignition_frac": 0.02,
             "ignition_dx_mult": 2.0,
-            "rmin_frac": 0.002,
-            "rmin_dx_mult": 0.5,
+            # Inner cavity must stay inside the charge, but not at r≈0.
+            # A spherical wedge's CFL uses r*Δθ / r*Δφ, not only radial dx.
+            "rmin_frac": 0.05,
+            "rmin_dx_mult": 10.0,
         }
 
     # Fallback
@@ -43,6 +45,8 @@ def compute_recommended_1d(
     R = max(float(charge_radius), 1e-6)
 
     r_min = max(float(profile["rmin_dx_mult"]) * dx, float(profile["rmin_frac"]) * R, 1e-6)
+    # Keep the cavity well inside the charge. Missing mass is (r_min/R)^3.
+    r_min = min(r_min, max(0.2 * R, dx))
     r_ign = r_min + 0.5 * dx
     ignition_point = (float(r_ign), 0.0, 0.0)
 

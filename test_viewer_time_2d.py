@@ -670,7 +670,7 @@ class Tab2DSetupUnitLabelTests(unittest.TestCase):
             if widget is not None:
                 setup_widgets.append(widget)
         self.assertIs(setup_widgets[-1], tab.grp_mapping)
-        self.assertEqual(tab.grp_mapping.title(), "1D → 2D rotateFields")
+        self.assertEqual(tab.grp_mapping.title(), "Remap")
         self.assertNotIn(tab.grp_solver, setup_widgets)
 
 

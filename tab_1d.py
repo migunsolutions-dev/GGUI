@@ -1,7 +1,7 @@
 import math
 from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QFrame,
-    QGroupBox, QFormLayout, QComboBox, QDoubleSpinBox, QLineEdit,
+    QGroupBox, QFormLayout, QComboBox, QDoubleSpinBox, QSpinBox, QLineEdit,
     QRadioButton, QSplitter, QScrollArea, QSizePolicy, QTabWidget
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
@@ -137,12 +137,9 @@ class Tab1D(QWidget):
     def get_case_inputs(self) -> CaseInputs1D:
         """אוספת את כל הנתונים מהממשק ומחזירה אובייקט מסודר"""
         
-        if self.radio_yes.isChecked():
-            rho_final = self.calculated_adj_rho
-        else:
-            rho_final = self.spin_density.value()
-            
-        mat_props = self.get_selected_material_properties()
+        rho_final = float(self.spin_density.value())
+        mat_props = dict(self.get_selected_material_properties())
+        mat_props["rho"] = rho_final
         
         return CaseInputs1D(
             radius=self.spin_radius.value(),
@@ -156,12 +153,12 @@ class Tab1D(QWidget):
             max_cfl=self.spin_cfl.value(),
             end_time_s=self.spin_endtime.value(), # השם המקורי שלך
             # ברירות מחדל קבועות (כי אין להן שדות ב-UI המקורי)
-            write_interval_s=1e-5,
-            n_probes=1000,
-            probe_write_interval_steps=100,
-            wedge_angle_deg=5.0,
+            write_interval_s=0.0,
+            n_probes=200,
+            probe_write_interval_steps=int(self.spin_gui_refresh.value()),
+            wedge_angle_deg=15.0,
             cone_half_angle_deg=12.0,
-            axis_epsilon=1e-3,
+            axis_epsilon=0.10,
             right_boundary=self.cmb_right.currentText(),
         )
     # ----------------------------------------
@@ -308,6 +305,24 @@ class Tab1D(QWidget):
         
         group_solver.setLayout(solver_layout)
         input_layout.addWidget(group_solver)
+
+        self.group_output = QGroupBox("Output Options")
+        output_layout = QFormLayout()
+        self.spin_gui_refresh = QSpinBox()
+        self.spin_gui_refresh.setObjectName("spin1dGuiRefresh")
+        self.spin_gui_refresh.setRange(1, 1_000_000)
+        self.spin_gui_refresh.setValue(25)
+        self.spin_gui_refresh.setButtonSymbols(QSpinBox.NoButtons)
+        self.spin_gui_refresh.wheelEvent = lambda event: event.ignore()
+        self.spin_gui_refresh.setFixedWidth(100)
+        self.spin_gui_refresh.setAlignment(Qt.AlignRight)
+        lay_refresh = QHBoxLayout()
+        lay_refresh.addWidget(self.spin_gui_refresh)
+        lay_refresh.addWidget(QLabel("Steps"))
+        lay_refresh.addStretch()
+        output_layout.addRow("GUI refresh freq.", lay_refresh)
+        self.group_output.setLayout(output_layout)
+        input_layout.addWidget(self.group_output)
         input_layout.addStretch()
 
         # Scroll area for input parameters only
@@ -440,7 +455,7 @@ class Tab1D(QWidget):
 
     def charge_pressure_pa(self) -> float:
         """Charge pressure for the pre-run sketch from the entered density and energy."""
-        rho = self.calculated_adj_rho if self.radio_yes.isChecked() else float(self.spin_density.value())
+        rho = float(self.spin_density.value())
         try:
             energy = float(self.edit_energy.text())
         except (TypeError, ValueError):
@@ -448,7 +463,7 @@ class Tab1D(QWidget):
         return ideal_gas_charge_pressure_pa(rho, energy)
 
     def initial_overpressure_profile(self):
-        rho = self.calculated_adj_rho if self.radio_yes.isChecked() else float(self.spin_density.value())
+        rho = float(self.spin_density.value())
         charge_r = spherical_charge_radius_m(self.spin_mass.value(), rho)
         return initial_overpressure_step(
             self.spin_radius.value(),
@@ -548,26 +563,13 @@ class Tab1D(QWidget):
             r_charge = ((3.0 * vol) / (4.0 * math.pi))**(1/3.0)
             
             cells_charge = int(r_charge / dx)
-            
-            if self.radio_yes.isChecked(): 
-                if cells_charge > 0:
-                    discrete_radius = cells_charge * dx
-                    discrete_vol = (4.0/3.0) * math.pi * (discrete_radius**3)
-                    adj_rho = mass / discrete_vol
-                    self.calculated_discrete_radius = discrete_radius
-                else:
-                    adj_rho = rho_input
-                    self.calculated_discrete_radius = r_charge
-            else: 
-                adj_rho = rho_input
-                self.calculated_discrete_radius = r_charge
-
-            self.calculated_adj_rho = adj_rho
+            self.calculated_adj_rho = rho_input
+            self.calculated_discrete_radius = r_charge
 
             self.lbl_domain_cells.setText(f"{cells_dom}")
             self.lbl_charge_radius.setText(f"{r_charge:.6f}")
             self.lbl_charge_cells.setText(f"{cells_charge}")
-            self.lbl_adj_density.setText(f"{adj_rho:.1f}")
+            self.lbl_adj_density.setText(f"{rho_input:.1f}")
             self._live_graph = False
             self.plot_initial_condition()
 
@@ -588,10 +590,7 @@ class Tab1D(QWidget):
             try:
                 radius = float(self.spin_radius.value())
                 dx = float(self.spin_cellsize.value())
-                if self.radio_yes.isChecked():
-                    rho = self.calculated_adj_rho
-                else:
-                    rho = float(self.spin_density.value())
+                rho = float(self.spin_density.value())
 
                 vol = float(self.spin_mass.value()) / max(rho, 1.0)
                 r_ch = ((3.0 * vol) / (4.0 * math.pi)) ** (1 / 3.0)

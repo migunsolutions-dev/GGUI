@@ -18,6 +18,80 @@ from wsl_runtime import build_case_command_argv, to_wsl_path_and_distro
 
 # Number of tail lines to capture from each log file for debug_summary.txt
 DEBUG_TAIL_LINES = 50
+DEFAULT_PROBE_WRITE_INTERVAL_STEPS = 25
+WATCHDOG_STRONG_P_PA = 1.5e5
+WATCHDOG_ARRIVAL_OVER_PA = 8.0e3
+WATCHDOG_DROP_FRAC = 0.10
+
+
+class WatchdogState:
+    """Ambient and peak overpressure at the 1D target-radius probe."""
+
+    __slots__ = ("p_ref", "peak_over")
+
+    def __init__(self) -> None:
+        self.p_ref: Optional[float] = None
+        self.peak_over: float = 0.0
+
+
+def watchdog_should_stop(pressure: float, state: WatchdogState) -> bool:
+    """True when the shock has reached the target radius.
+
+    A hard 150 kPa cut misses weak arrivals (e.g. ~149 kPa at 4 m). Stop on a
+    strong jump, or after overpressure at the target has peaked and fallen.
+    """
+    if pressure != pressure or pressure <= 0.0:
+        return False
+    if state.p_ref is None:
+        state.p_ref = float(pressure)
+        return False
+    over = float(pressure) - float(state.p_ref)
+    if over > state.peak_over:
+        state.peak_over = over
+    if float(pressure) >= WATCHDOG_STRONG_P_PA:
+        return True
+    arrived = state.peak_over >= WATCHDOG_ARRIVAL_OVER_PA
+    dropped = over <= (1.0 - WATCHDOG_DROP_FRAC) * state.peak_over
+    return bool(arrived and dropped)
+
+
+def probe_write_interval_from_control_dict(
+    text: str, default: int = DEFAULT_PROBE_WRITE_INTERVAL_STEPS
+) -> int:
+    """Read probes1d writeInterval from a controlDict (GUI refresh cadence)."""
+    match = re.search(r"probes1d\s*\{.*?writeInterval\s+(\d+)", text, re.DOTALL)
+    if not match:
+        return max(1, int(default))
+    try:
+        return max(1, int(match.group(1)))
+    except (TypeError, ValueError):
+        return max(1, int(default))
+
+
+def request_solver_write_and_stop(case_dir: str) -> bool:
+    """Ask a running OpenFOAM solver to dump the current time and exit.
+
+    1D field dumps are sparse (one interval at endTime). The watchdog must not
+    wait for that write; ``stopAt writeNow`` is reread because controlDict is
+    ``runTimeModifiable``.
+    """
+    cd_path = os.path.join(case_dir, "system", "controlDict")
+    try:
+        with open(cd_path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        new_text, n_sub = re.subn(
+            r"(?m)^stopAt\s+\S+\s*;",
+            "stopAt          writeNow;",
+            text,
+            count=1,
+        )
+        if n_sub:
+            with open(cd_path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(new_text)
+            return True
+    except OSError:
+        return False
+    return False
 
 
 def complete_probe_chunk(raw: bytes) -> Tuple[bytes, int]:
@@ -58,7 +132,7 @@ class SolverRunner(QThread):
     Run the case via Allrun in WSL and stream probes data live.
     
     UPDATES:
-    - Calculates Step Number (based on writeInterval=100).
+    - Calculates Step Number from probes1d writeInterval (GUI refresh freq.).
     - Calculates Avg DeltaT (based on time difference).
     - Emits (pressures, time, step, dt).
     - On failure: aggregates last N lines of all log.* into debug_summary.txt at project_root.
@@ -90,6 +164,7 @@ class SolverRunner(QThread):
         self._probe_file: Optional[str] = None
         self._probe_pos: int = 0
         self._end_time_s: Optional[float] = None
+        self._probe_write_interval_steps: int = DEFAULT_PROBE_WRITE_INTERVAL_STEPS
         
         # Stats tracking
         self._total_lines_read = 0
@@ -102,8 +177,9 @@ class SolverRunner(QThread):
 
         # 1D watchdog: trigger stop when shock reaches target radius (only once)
         self._watchdog_triggered: bool = False
-        self._watchdog_stop_requested_time: Optional[float] = None  # time.time() when we created "stop"
-        self._watchdog_grace_seconds: float = 3.0  # wait before forcing process stop if solver ignores "stop"
+        self._watchdog_stop_requested_time: Optional[float] = None  # time.time() when writeNow was requested
+        self._watchdog_grace_seconds: float = 3.0  # wait before forcing process stop if solver ignores writeNow
+        self._watchdog_state = WatchdogState()
 
         path = to_wsl_path_and_distro(win_case_dir)
         self._wsl_distro, self._linux_case_dir = path.distro, path.linux_path
@@ -161,15 +237,21 @@ class SolverRunner(QThread):
         try:
             p = os.path.join(self.win_case_dir, "system", "controlDict")
             with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    s = line.strip()
-                    if s.startswith("endTime"):
-                        tokens = s.replace(";", "").split()
-                        if len(tokens) >= 2:
-                            self._end_time_s = float(tokens[1])
-                            return
+                text = f.read()
         except Exception:
             self._end_time_s = None
+            return
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("endTime"):
+                tokens = s.replace(";", "").split()
+                if len(tokens) >= 2:
+                    try:
+                        self._end_time_s = float(tokens[1])
+                    except ValueError:
+                        self._end_time_s = None
+                    break
+        self._probe_write_interval_steps = probe_write_interval_from_control_dict(text)
 
     def _discover_probe_file(self) -> Optional[str]:
         try:
@@ -378,7 +460,7 @@ class SolverRunner(QThread):
             return 1
 
     def _check_watchdog_trigger(self, case_dir: str) -> None:
-        """If 1D case has watchdog_probe and pressure at target radius > 1.5e5 Pa, create 'stop' for graceful exit."""
+        """Stop when the shock has arrived at the target radius (peak-and-fall or strong p)."""
         if self._watchdog_triggered:
             return
         base = os.path.join(case_dir, "postProcessing", "watchdog_probe")
@@ -409,7 +491,7 @@ class SolverRunner(QThread):
             pressure = float(parts[1])
         except ValueError:
             return
-        if pressure <= 1.5e5:
+        if not watchdog_should_stop(pressure, self._watchdog_state):
             return
         self._watchdog_triggered = True
         radius_str = "?"
@@ -421,16 +503,11 @@ class SolverRunner(QThread):
         except OSError:
             pass
         self.status_signal.emit(f"Shockwave reached target radius ({radius_str}m). Stopping simulation.")
-        try:
-            stop_path = os.path.join(case_dir, "stop")
-            with open(stop_path, "w", encoding="utf-8") as f:
-                pass
-        except OSError:
-            pass
+        request_solver_write_and_stop(case_dir)
         self._watchdog_stop_requested_time = time.time()
 
     def _maybe_stop_after_watchdog(self) -> None:
-        """If watchdog requested stop and grace period elapsed, terminate process so run actually stops."""
+        """If watchdog requested writeNow and grace period elapsed, terminate process so run actually stops."""
         if not self._watchdog_triggered or self._watchdog_stop_requested_time is None:
             return
         if self._proc is None or self._proc.poll() is not None:
@@ -473,11 +550,12 @@ class SolverRunner(QThread):
         try:
             t, ps, count_new = parsed
             self._total_lines_read += count_new
-            current_step = self._total_lines_read * 100
+            interval = max(1, int(self._probe_write_interval_steps))
+            current_step = self._total_lines_read * interval
             dt_est = 0.0
             if count_new > 0 and self._total_lines_read > 1:
                 time_diff = t - self._last_time_val
-                steps_diff = count_new * 100
+                steps_diff = count_new * interval
                 if steps_diff > 0:
                     dt_est = time_diff / steps_diff
             self._last_time_val = t
@@ -524,6 +602,7 @@ class SolverRunner(QThread):
 
         self._watchdog_triggered = False
         self._watchdog_stop_requested_time = None
+        self._watchdog_state = WatchdogState()
         _re_time = re.compile(r"^Time\s*=\s*([\d\.eE\+\-]+)", re.MULTILINE)
         _re_dt = re.compile(r"^deltaT\s*=\s*([\d\.eE\+\-]+)", re.MULTILINE)
         _re_courant = re.compile(r"^Courant Number.*$", re.MULTILINE)
