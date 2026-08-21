@@ -152,9 +152,17 @@ class Tab2D(QWidget):
         self.btn_initialize.setText("Initialise Model")
         self.btn_initialize.setMinimumWidth(140)
         if not self.is_imported_mode:
-            self.btn_initialize.setEnabled(not running)
-            self.btn_exact_end.setEnabled(initialized and not running)
-            self.btn_stop.setEnabled(running)
+            preparing = self._state == SimulationState2D.INITIALIZING
+            self.btn_initialize.setEnabled(not running and not preparing)
+            self.btn_exact_end.setEnabled(initialized and not running and not preparing)
+            if preparing:
+                self.btn_stop.setText("Cancel Preparation")
+                self.btn_stop.setEnabled(True)
+                self.btn_stop.setToolTip("Cancel the active 2D preparation operation")
+            else:
+                self.btn_stop.setText("Interrupt")
+                self.btn_stop.setToolTip("")
+                self.btn_stop.setEnabled(running)
             return
 
         mode = self._import_mode
@@ -165,7 +173,9 @@ class Tab2D(QWidget):
         elif mode == ImportMode2D.IMPORTED_2D_INITIALIZING:
             self.btn_initialize.setEnabled(False)
             self.btn_exact_end.setEnabled(False)
-            self.btn_stop.setEnabled(False)  # prep has no safe interrupt yet
+            self.btn_stop.setText("Cancel Preparation")
+            self.btn_stop.setEnabled(True)
+            self.btn_stop.setToolTip("Cancel the active 2D preparation operation")
         elif mode == ImportMode2D.IMPORTED_2D_READY:
             self.btn_initialize.setText("Reinitialise")
             self.btn_initialize.setEnabled(not running)
@@ -239,21 +249,47 @@ class Tab2D(QWidget):
         self.load_imported_case(state)
 
     def clear_imported_case(self) -> None:
-        self._imported_case = None
-        self._import_mode = ImportMode2D.NATIVE_GGUI_2D
-        self._imported_field_meta = {}
-        self._unrecovered_gui_keys = set()
-        self._case_defined_gui_keys = set()
-        self._clear_all_undefined_controls()
-        self._unsupported_features = []
-        self._restore_native_control_editability()
-        if hasattr(self, "lbl_import_banner"):
-            self.lbl_import_banner.setVisible(False)
-        self.btn_initialize.setText("Initialise Model")
-        self.btn_initialize.setMinimumWidth(140)
-        self.set_simulation_state(SimulationState2D.DRAFT)
-        self._apply_enablement()
-        self._apply_action_buttons(running=False, initialized=False)
+        was_loading = self._loading
+        self._loading = True
+        try:
+            self._imported_case = None
+            self._import_mode = ImportMode2D.NATIVE_GGUI_2D
+            self._imported_field_meta = {}
+            self._unrecovered_gui_keys = set()
+            self._case_defined_gui_keys = set()
+            self._clear_all_undefined_controls()
+            # Undefined spins restore to their minimum (often 0). Reinstate native
+            # defaults so a subsequent Setup Preview refresh cannot abort on
+            # non-positive physics inputs.
+            defaults = CaseInputs2D()
+            if float(self.spin_mass.value()) <= 0.0:
+                self.spin_mass.setValue(float(defaults.mass_kg or 1.0))
+            if float(self.spin_density.value()) <= 0.0:
+                self.spin_density.setValue(float(defaults.rho_charge or 1600.0))
+            if float(self.spin_energy.value()) <= 0.0:
+                self.spin_energy.setValue(float(defaults.energy_j_per_kg or 4.5e6))
+            if float(self.spin_cell.value()) <= 0.0:
+                self.spin_cell.setValue(float(defaults.cell_size or 0.05))
+            if self.cmb_material.currentText() in ("", MATERIAL_UNDEFINED_PLACEHOLDER):
+                self.cmb_material.setCurrentText(str(defaults.material_name or "TNT"))
+            self._unsupported_features = []
+            self._restore_native_control_editability()
+            self._active_case_dir = None
+            if hasattr(self, "lbl_import_banner"):
+                self.lbl_import_banner.setVisible(False)
+            self.btn_initialize.setText("Initialise Model")
+            self.btn_initialize.setMinimumWidth(140)
+            try:
+                clearer = getattr(self.viewer, "clear_simulation_view", None)
+                if callable(clearer):
+                    clearer()
+            except Exception:
+                pass
+            self.set_simulation_state(SimulationState2D.DRAFT)
+            self._apply_enablement()
+            self._apply_action_buttons(running=False, initialized=False)
+        finally:
+            self._loading = was_loading
 
     def clear_external_case(self) -> None:
         self.clear_imported_case()
@@ -263,11 +299,6 @@ class Tab2D(QWidget):
             return
         self.set_import_mode(ImportMode2D.IMPORTED_2D_INITIALIZING)
         self.lbl_state.setText(f"State: Initialising imported case ({utility})")
-        from PyQt5.QtWidgets import QApplication
-
-        app = QApplication.instance()
-        if app:
-            app.processEvents()
 
     def _update_provenance_banner(self) -> None:
         if not hasattr(self, "lbl_import_banner"):
@@ -429,19 +460,26 @@ class Tab2D(QWidget):
             widget.setToolTip("")
 
     def _clear_all_undefined_controls(self) -> None:
-        for key in list(self._undefined_gui_keys):
-            self._clear_control_undefined(key)
-        self._undefined_gui_keys.clear()
-        # Ensure placeholder is removed when leaving imported undefined state.
-        if hasattr(self, "cmb_material"):
-            idx = self.cmb_material.findText(MATERIAL_UNDEFINED_PLACEHOLDER)
-            if idx >= 0:
-                current = self.cmb_material.currentText()
-                self.cmb_material.removeItem(idx)
-                if current == MATERIAL_UNDEFINED_PLACEHOLDER:
-                    self.cmb_material.setCurrentText("TNT")
-            self.cmb_material.setStyleSheet("")
-            self.cmb_material.setToolTip("")
+        # Suppress spin/combo change handlers while restoring defaults — those
+        # handlers refresh the VTK preview and can abort offscreen plotters.
+        was_loading = self._loading
+        self._loading = True
+        try:
+            for key in list(self._undefined_gui_keys):
+                self._clear_control_undefined(key)
+            self._undefined_gui_keys.clear()
+            # Ensure placeholder is removed when leaving imported undefined state.
+            if hasattr(self, "cmb_material"):
+                idx = self.cmb_material.findText(MATERIAL_UNDEFINED_PLACEHOLDER)
+                if idx >= 0:
+                    current = self.cmb_material.currentText()
+                    self.cmb_material.removeItem(idx)
+                    if current == MATERIAL_UNDEFINED_PLACEHOLDER:
+                        self.cmb_material.setCurrentText("TNT")
+                self.cmb_material.setStyleSheet("")
+                self.cmb_material.setToolTip("")
+        finally:
+            self._loading = was_loading
 
     def undefined_gui_keys(self) -> tuple[str, ...]:
         return tuple(sorted(self._undefined_gui_keys))
@@ -581,7 +619,11 @@ class Tab2D(QWidget):
                     f"{current}  |  {note}" if current else note
                 )
 
-    def mark_stale(self) -> None:
+    def set_preparation_step(self, name: str) -> None:
+        """Show the current asynchronous preparation step in the state label."""
+        if hasattr(self, "lbl_state") and self.lbl_state is not None:
+            self.lbl_state.setText(f"Preparing: {name}")
+
         if self._loading:
             return
         if self.is_imported_mode:

@@ -193,16 +193,24 @@ def _is_wsl_unc_path(path: str) -> bool:
     return len(parts) >= 2 and parts[0].lower() in ("wsl.localhost", "wsl$")
 
 
-def _sha256_file_chunked(path: Path, *, expected_size: Optional[int] = None) -> Tuple[str, int]:
+def _sha256_file_chunked(
+    path: Path,
+    *,
+    expected_size: Optional[int] = None,
+    cancel_token=None,
+) -> Tuple[str, int]:
     """Stream SHA-256 of a file in INVENTORY_HASH_CHUNK_SIZE chunks.
 
     Returns (hex_digest, bytes_hashed). Raises OSError on I/O failure and
     RuntimeError if the file size changes during the read (TOCTOU).
+    Raises RuntimeError with message starting ``Cancelled`` when the token fires.
     """
     digest = hashlib.sha256()
     total = 0
     with path.open("rb") as handle:
         while True:
+            if cancel_token is not None and getattr(cancel_token, "cancelled", False):
+                raise RuntimeError("Cancelled during hashing")
             chunk = handle.read(INVENTORY_HASH_CHUNK_SIZE)
             if not chunk:
                 break
@@ -225,12 +233,15 @@ def _sha256_file_chunked(path: Path, *, expected_size: Optional[int] = None) -> 
     return digest.hexdigest(), total
 
 
-def inventory_case(case_dir: str) -> CaseInventory:
+def inventory_case(case_dir: str, *, cancel_token=None) -> CaseInventory:
     """Semantic inventory: relative paths, types, sizes, chunked SHA-256.
 
     Any unreadable / disappearing / mutating file is recorded in
     ``read_errors``. An inventory with read errors is invalid and must fail
     closed in verification.
+
+    ``cancel_token`` (optional) is checked between files and during hashing.
+    Cancellation raises ``RuntimeError("Cancelled...")`` so callers can clean up.
     """
     root = Path(case_dir)
     files: Dict[str, str] = {}
@@ -266,6 +277,8 @@ def inventory_case(case_dir: str) -> CaseInventory:
             ),
         )
     for path in paths:
+        if cancel_token is not None and getattr(cancel_token, "cancelled", False):
+            raise RuntimeError("Cancelled during inventory")
         try:
             rel = path.relative_to(root).as_posix()
         except ValueError as exc:
@@ -293,8 +306,38 @@ def inventory_case(case_dir: str) -> CaseInventory:
                 try:
                     size = path.stat().st_size
                 except OSError as exc:
-                    raise OSError(f"stat failed: {exc}") from exc
-                digest, hashed = _sha256_file_chunked(path, expected_size=size)
+                    read_errors.append(
+                        InventoryReadError(
+                            rel=rel,
+                            exception_type=type(exc).__name__,
+                            message=str(exc),
+                        )
+                    )
+                    continue
+                try:
+                    digest, hashed = _sha256_file_chunked(
+                        path, expected_size=size, cancel_token=cancel_token
+                    )
+                except RuntimeError as exc:
+                    if str(exc).startswith("Cancelled"):
+                        raise
+                    read_errors.append(
+                        InventoryReadError(
+                            rel=rel,
+                            exception_type=type(exc).__name__,
+                            message=str(exc),
+                        )
+                    )
+                    continue
+                except OSError as exc:
+                    read_errors.append(
+                        InventoryReadError(
+                            rel=rel,
+                            exception_type=type(exc).__name__,
+                            message=str(exc),
+                        )
+                    )
+                    continue
                 files[rel] = digest
                 entries[rel] = InventoryEntry(
                     rel=rel, kind="file", size=hashed, sha256=digest
@@ -304,13 +347,15 @@ def inventory_case(case_dir: str) -> CaseInventory:
                     InventoryReadError(
                         rel=rel,
                         exception_type="UnsupportedFileType",
-                        message=f"Unsupported filesystem object type for {rel}",
+                        message=f"Unsupported path type for inventory: {path}",
                     )
                 )
-        except (OSError, RuntimeError) as exc:
+        except RuntimeError:
+            raise
+        except OSError as exc:
             read_errors.append(
                 InventoryReadError(
-                    rel=rel,
+                    rel=rel if "rel" in locals() else str(path),
                     exception_type=type(exc).__name__,
                     message=str(exc),
                 )
@@ -560,11 +605,18 @@ def _wsl_path_and_distro(win_path: str) -> Tuple[Optional[str], str]:
     return path.distro, path.linux_path
 
 
-def _run_wsl_argv(distro: Optional[str], script: str) -> subprocess.CompletedProcess:
+def _run_wsl_argv(
+    distro: Optional[str],
+    script: str,
+    *,
+    cancel_token=None,
+) -> subprocess.CompletedProcess:
     """Invoke WSL with bash -lc via the central runtime module."""
     from wsl_runtime import run_wsl_script
 
-    result = run_wsl_script(script, distro=distro)
+    result = run_wsl_script(script, distro=distro, cancel_token=cancel_token)
+    if result.cancelled:
+        raise RuntimeError("Cancelled during WSL copy")
     return subprocess.CompletedProcess(
         args=list(result.argv),
         returncode=result.exit_code,
@@ -577,6 +629,8 @@ def _copy_tree_via_wsl(
     source_dir: str,
     staging_dir: str,
     dest_dir: str,
+    *,
+    cancel_token=None,
 ) -> Tuple[str, str, str]:
     """Copy with Linux-side cp -a; returns (distro, source_linux, dest_linux)."""
     src_distro, src_linux = _wsl_path_and_distro(source_dir)
@@ -596,7 +650,7 @@ def _copy_tree_via_wsl(
         f"cp -a {shlex.quote(src_linux)} {shlex.quote(staging_linux)}; "
         f"test -d {shlex.quote(staging_linux)}"
     )
-    completed = _run_wsl_argv(distro, script)
+    completed = _run_wsl_argv(distro, script, cancel_token=cancel_token)
     if completed.returncode != 0:
         raise RuntimeError(
             "WSL cp -a failed "
@@ -640,6 +694,7 @@ def create_working_copy(
     repo_root: str,
     *,
     diagnostic_dir: Optional[str] = None,
+    cancel_token=None,
 ) -> WorkingCopyPaths:
     """Transactional copy: stage → verify → finalize; never touch the source.
 
@@ -648,6 +703,8 @@ def create_working_copy(
     ``shutil.copytree`` into that UNC root materializes Mark-of-the-Web
     ``Zone.Identifier`` ADS as extra files and fails verification.
     """
+    if cancel_token is not None and getattr(cancel_token, "cancelled", False):
+        raise RuntimeError("Cancelled before copy")
     validate_working_copy_destination(source_dir, dest_dir, repo_root)
     source = Path(os.path.normpath(source_dir))
     dest = Path(os.path.normpath(dest_dir))
@@ -673,7 +730,7 @@ def create_working_copy(
         if use_wsl:
             copy_method = "wsl_cp"
             distro, src_linux, dest_linux = _copy_tree_via_wsl(
-                str(source), str(staging), str(dest)
+                str(source), str(staging), str(dest), cancel_token=cancel_token
             )
             created_staging = True
         else:
@@ -681,10 +738,13 @@ def create_working_copy(
             shutil.copytree(str(source), str(staging))
             created_staging = True
 
+        if cancel_token is not None and getattr(cancel_token, "cancelled", False):
+            raise RuntimeError("Cancelled during copy")
+
         # Verify immediately after copy — before *.orig restore or OF mutation.
         # Inventories are computed once per side for this transaction (no stale cache).
-        src_inv = inventory_case(str(source))
-        dst_inv = inventory_case(str(staging))
+        src_inv = inventory_case(str(source), cancel_token=cancel_token)
+        dst_inv = inventory_case(str(staging), cancel_token=cancel_token)
         comparison = compare_inventories(
             src_inv,
             dst_inv,
@@ -736,6 +796,7 @@ def create_automatic_working_copy(
     *,
     when: Optional[datetime] = None,
     diagnostic_dir: Optional[str] = None,
+    cancel_token=None,
 ) -> WorkingCopyPaths:
     """Create a unique persistent working case under the production case root."""
     if not case_root:
@@ -762,7 +823,11 @@ def create_automatic_working_copy(
         n += 1
         dest = os.path.join(case_root, f"{base_name}_{n}")
     return create_working_copy(
-        source_dir, dest, repo_root, diagnostic_dir=diagnostic_dir
+        source_dir,
+        dest,
+        repo_root,
+        diagnostic_dir=diagnostic_dir,
+        cancel_token=cancel_token,
     )
 
 

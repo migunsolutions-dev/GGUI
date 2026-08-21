@@ -13,7 +13,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt5.QtWidgets import QApplication
 
 from execution_plan import ExecutionIntent, build_execution_plan
-from preparation_worker_qt import PreparationResult, PreparationStep, PreparationWorker
+from preparation_service_2d import PreparationResult
+from preparation_worker_qt import PreparationStep, PreparationWorker
 from wsl_runtime import (
     WslCancelToken,
     build_case_command_argv,
@@ -190,6 +191,9 @@ class PreparationWorkerTests(unittest.TestCase):
         win.tab_2d = Tab2D()
         win.status_bar = mock.Mock()
         win.active_case_initialized_2d = False
+        win._prep_result_handled = False
+        win._prep_phase = "active"
+        win._pending_exact_end_after_prep = False
         win._set_preparation_controls_enabled = mock.Mock()
         result = PreparationResult(ok=False, error="fail")
         with mock.patch("PyQt5.QtWidgets.QMessageBox.critical"):
@@ -204,6 +208,9 @@ class PreparationWorkerTests(unittest.TestCase):
         win.tab_2d = Tab2D()
         win.status_bar = mock.Mock()
         win.active_case_initialized_2d = True  # should be cleared
+        win._prep_result_handled = False
+        win._prep_phase = "active"
+        win._pending_exact_end_after_prep = False
         win._set_preparation_controls_enabled = mock.Mock()
         win._on_imported_2d_prep_cancelled(PreparationResult(ok=False, cancelled=True))
         self.assertFalse(win.active_case_initialized_2d)

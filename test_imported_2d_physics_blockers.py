@@ -331,6 +331,10 @@ class InitialiseModelBlockedTests(unittest.TestCase):
             )
             win._resolved_case_root = mock.Mock(return_value=td)
             win.active_case_initialized_2d = False
+            win._prep_phase = "idle"
+            win._prep_worker = None
+            win._force_sync_prep = True
+            win.openfoam_bashrc = ""
 
             state = inspect_imported_axisymmetric_case(str(source))
             state.mode = ImportMode2D.IMPORTED_2D_UNINITIALIZED

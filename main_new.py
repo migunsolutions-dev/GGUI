@@ -40,12 +40,9 @@ from case_loader_2d import (
     inspect_imported_axisymmetric_case,
 )
 from external_case_workflow_2d import (
-    CopyVerificationError,
     ImportMode2D,
     WHITELISTED_UTILITIES,
-    create_automatic_working_copy,
     gui_values_to_control_updates,
-    inventory_case,
     preparation_commands_for_case,
     prepare_working_copy,
     write_control_dict_entries,
@@ -431,7 +428,11 @@ class BlastFoamApp(QMainWindow):
         # State
         self.runner = None
         self._prep_worker = None
-        self._force_sync_prep = False  # tests may set True to avoid QThread races
+        self._prep_phase = "idle"  # idle|starting|active|cancelling|finished
+        self._prep_kind = None  # native_2d|import_copy|imported_init
+        self._prep_result_handled = False
+        self._force_sync_prep = False  # older tests may set True; prefer async tests
+        self._pending_exact_end_after_prep = False
         self.active_case_dir_3d = None
         self.active_case_initialized_3d = False
         self.active_case_dir_2d = None
@@ -887,75 +888,71 @@ class BlastFoamApp(QMainWindow):
         return fallback
 
     def _open_axisymmetric_imported_case(self, case_dir: str, classification) -> None:
-        """Classify wedge → auto-create working case → populate normal 2D UI."""
+        """Classify wedge → async working-copy + inspect → populate 2D UI on success."""
+        if self._prep_is_active():
+            QMessageBox.information(
+                self,
+                "Preparation In Progress",
+                "A 2D preparation operation is already running. Cancel it or wait.",
+            )
+            return
         source_dir = os.path.normpath(case_dir)
+        if not os.path.isdir(source_dir):
+            QMessageBox.critical(self, "Import Failed", f"Not a directory:\n{source_dir}")
+            return
         repo_root = os.path.normpath(
             getattr(self, "_repo_root", None)
             or os.path.dirname(os.path.abspath(__file__))
         )
         case_root = self._resolved_case_root()
-        print(
-            f"[Import] source={source_dir!r} case_root={case_root!r}",
-            file=sys.stderr,
+        self.status_bar.set_status("Importing axisymmetric case…", "#f39c12")
+        self.tabs.setCurrentWidget(self.tab_2d)
+        self.tab_2d.set_simulation_state(SimulationState2D.INITIALIZING)
+
+        from preparation_service_2d import (
+            ImportCopyContext,
+            prepare_imported_copy_and_inspect,
         )
-        # Never treat the source as the active case.
-        try:
-            before = inventory_case(source_dir)
-            paths = create_automatic_working_copy(
-                source_dir,
-                case_root,
-                repo_root,
-            )
-            after = inventory_case(source_dir)
-            if before != after:
-                QMessageBox.critical(
-                    self,
-                    "Import Integrity Failure",
-                    "Source case hashes changed during copy — aborting.",
-                )
-                return
-            print(
-                f"[Import] working={paths.working_copy_dir!r} "
-                f"method={paths.copy_method!r} distro={paths.distro!r} "
-                f"src_linux={paths.source_linux!r} dest_linux={paths.dest_linux!r}",
-                file=sys.stderr,
-            )
-        except CopyVerificationError as exc:
-            QMessageBox.critical(
-                self,
-                "Import Failed",
-                "Could not create an automatic working case under:\n"
-                f"{case_root}\n\n"
-                f"Source:\n{source_dir}\n\n"
-                f"{exc}",
-            )
-            return
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "Import Failed",
-                "Could not create an automatic working case under:\n"
-                f"{case_root}\n\n"
-                f"Source:\n{source_dir}\n\n"
-                f"{exc}",
-            )
-            return
+        from preparation_worker_qt import PreparationStep, PreparationWorker
 
-        try:
-            state = inspect_imported_axisymmetric_case(
-                paths.working_copy_dir,
-                source_dir=paths.source_dir,
-                working_copy_dir=paths.working_copy_dir,
-                mode=ImportMode2D.IMPORTED_2D_UNINITIALIZED,
-            )
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "2D Load Error",
-                f"Failed to inspect imported working case:\n{exc}",
-            )
-            return
+        ctx = ImportCopyContext(
+            source_dir=source_dir,
+            case_root=case_root,
+            repo_root=repo_root,
+        )
 
+        def _work(cancel_token, progress):
+            return prepare_imported_copy_and_inspect(ctx, cancel_token, progress)
+
+        worker = PreparationWorker(
+            [PreparationStep("Import axisymmetric case", _work)],
+            openfoam_bashrc=self.openfoam_bashrc,
+            parent=self,
+        )
+        self._begin_preparation(
+            worker,
+            kind="import_copy",
+            on_ok=self._on_import_copy_prep_ok,
+            on_err=self._on_import_copy_prep_failed,
+            on_cancel=self._on_import_copy_prep_cancelled,
+        )
+
+    def _on_import_copy_prep_ok(self, result) -> None:
+        # Defer GUI application so VTK/widget updates never run nested inside
+        # PreparationWorker.run() under DirectConnection (_force_sync_prep).
+        if getattr(self, "_force_sync_prep", False):
+            self._apply_import_copy_success(result)
+        else:
+            QTimer.singleShot(0, lambda: self._apply_import_copy_success(result))
+
+    def _apply_import_copy_success(self, result) -> None:
+        self._finish_preparation_controls(success=True)
+        payload = result.payload or {}
+        state = payload.get("state")
+        if state is None:
+            QMessageBox.critical(self, "Import Failed", "Worker returned no case state.")
+            self.tab_2d.set_simulation_state(SimulationState2D.FAILED)
+            return
         if not state.display_compatible:
             QMessageBox.warning(
                 self,
@@ -965,14 +962,50 @@ class BlastFoamApp(QMainWindow):
                 "Radius–Height viewer.\n\n"
                 + "\n".join(state.compatibility_notes),
             )
+            self.tab_2d.set_simulation_state(SimulationState2D.DRAFT)
             return
-
         self.tabs.setCurrentWidget(self.tab_2d)
         self.tab_2d.load_imported_case(state)
-        self.active_case_dir_2d = paths.working_copy_dir
+        self.active_case_dir_2d = payload.get("working_copy_dir")
         self.active_case_initialized_2d = False
         self.current_project_path = None
+        self.status_bar.set_status("Imported case ready (uninitialized)", "#2ecc71")
         self._show_load_summary_dialog_2d(state)
+
+    def _on_import_copy_prep_failed(self, result) -> None:
+        if getattr(self, "_force_sync_prep", False):
+            self._apply_import_copy_failure(result)
+        else:
+            QTimer.singleShot(0, lambda: self._apply_import_copy_failure(result))
+
+    def _apply_import_copy_failure(self, result) -> None:
+        self._finish_preparation_controls(success=False)
+        self.active_case_initialized_2d = False
+        self.tab_2d.set_simulation_state(SimulationState2D.FAILED)
+        payload = result.payload or {}
+        case_root = payload.get("case_root") or self._resolved_case_root()
+        source = payload.get("source_dir") or ""
+        self.status_bar.set_status("Import failed", "#e74c3c")
+        QMessageBox.critical(
+            self,
+            "Import Failed",
+            "Could not create an automatic working case under:\n"
+            f"{case_root}\n\n"
+            f"Source:\n{source}\n\n"
+            f"{result.error or 'Preparation failed.'}",
+        )
+
+    def _on_import_copy_prep_cancelled(self, result) -> None:
+        if getattr(self, "_force_sync_prep", False):
+            self._apply_import_copy_cancelled(result)
+        else:
+            QTimer.singleShot(0, lambda: self._apply_import_copy_cancelled(result))
+
+    def _apply_import_copy_cancelled(self, result) -> None:
+        self._finish_preparation_controls(success=False)
+        self.active_case_initialized_2d = False
+        self.tab_2d.set_simulation_state(SimulationState2D.FAILED)
+        self.status_bar.set_status("Import cancelled", "#e67e22")
 
     def _show_load_summary_dialog_2d(self, state) -> None:
         """Show the concise 2D imported-case report."""
@@ -999,6 +1032,13 @@ class BlastFoamApp(QMainWindow):
         The BF source directory stays read-only. Initialise Model never patches
         or prepares the copied source dictionaries as the runtime case.
         """
+        if self._prep_is_active():
+            QMessageBox.information(
+                self,
+                "Preparation In Progress",
+                "A 2D preparation operation is already running. Cancel it or wait.",
+            )
+            return
         ext = getattr(self.tab_2d, "_imported_case", None)
         if ext is None:
             QMessageBox.warning(
@@ -1046,110 +1086,163 @@ class BlastFoamApp(QMainWindow):
         self.tab_2d.set_simulation_state(SimulationState2D.INITIALIZING)
         self.active_case_initialized_2d = False
         self.status_bar.set_status("Generating GGUI case from imported model…", "#f39c12")
-        self._set_preparation_controls_enabled(False)
 
-        from preparation_worker_qt import PreparationResult, PreparationStep, PreparationWorker
+        from preparation_service_2d import (
+            ImportedInitContext,
+            prepare_imported_model_generation,
+        )
+        from preparation_worker_qt import PreparationStep, PreparationWorker
 
-        ctx = {
-            "source": source,
-            "inputs": inputs,
-            "case_root": self._resolved_case_root(),
-        }
+        ctx = ImportedInitContext(
+            source=source,
+            inputs=inputs,
+            case_root=self._resolved_case_root(),
+            openfoam_bashrc=self.openfoam_bashrc,
+            make_case_name=self.service.make_case_name,
+        )
 
-        def _generate_and_init(cancel_token):
-            if cancel_token.cancelled:
-                return PreparationResult(ok=False, cancelled=True, error="Cancelled")
-            case_root = ctx["case_root"]
-            src_base = os.path.basename(source.rstrip("\\/")) or "imported"
-            case_name = self.service.make_case_name(f"Case_2D_from_{src_base}")
-            case_dir = self.service.generate_case(case_name, inputs)
-            if os.path.normpath(case_dir) == source:
-                raise RuntimeError("Refusing to generate into the source directory.")
-            gen2d = self.service.generator_2d
-            if gen2d is None:
-                from generator_2d import Generator2D
-
-                gen2d = Generator2D(case_root, self.openfoam_bashrc)
-                self.service.generator_2d = gen2d
-            command = gen2d.initialization_command(inputs)
-            if cancel_token.cancelled:
-                return PreparationResult(ok=False, cancelled=True, error="Cancelled")
-            success = self._run_wsl_commands(case_dir, command)
-            if not success:
-                return PreparationResult(
-                    ok=False,
-                    failed_step="initialize",
-                    error=(
-                        "blockMesh / setRefinedFields / checkMesh failed in the "
-                        "generated GGUI case. See log.initialize. Source was not modified."
-                    ),
-                    payload={"case_dir": case_dir, "command": command, "source": source},
-                )
-            check_ok = False
-            for log_name in ("log.checkMesh", "log.initialize"):
-                log_path = os.path.join(case_dir, log_name)
-                if os.path.isfile(log_path):
-                    with open(log_path, encoding="utf-8", errors="ignore") as handle:
-                        text = handle.read()
-                    if "Mesh OK" in text:
-                        check_ok = True
-                        break
-            if not check_ok:
-                return PreparationResult(
-                    ok=False,
-                    failed_step="checkMesh",
-                    error=(
-                        "checkMesh did not report Mesh OK in the generated GGUI case.\n"
-                        "Source was not modified. See log.checkMesh / log.initialize."
-                    ),
-                    payload={"case_dir": case_dir, "command": command, "source": source},
-                )
-            return PreparationResult(
-                ok=True,
-                payload={
-                    "case_dir": case_dir,
-                    "command": command,
-                    "source": source,
-                    "inputs": inputs,
-                    "check_ok": check_ok,
-                },
-            )
+        def _work(cancel_token, progress):
+            return prepare_imported_model_generation(ctx, cancel_token, progress)
 
         worker = PreparationWorker(
-            [PreparationStep("generate_and_initialize", _generate_and_init)],
-            case_dir="",
+            [PreparationStep("Generate and initialize imported model", _work)],
             openfoam_bashrc=self.openfoam_bashrc,
             parent=self,
         )
-        worker.progress.connect(
-            lambda name: self.status_bar.set_status(f"Preparing: {name}", "#f39c12")
+        self._begin_preparation(
+            worker,
+            kind="imported_init",
+            on_ok=self._on_imported_2d_prep_ok,
+            on_err=self._on_imported_2d_prep_failed,
+            on_cancel=self._on_imported_2d_prep_cancelled,
         )
-        worker.finished_ok.connect(self._on_imported_2d_prep_ok)
-        worker.finished_error.connect(self._on_imported_2d_prep_failed)
-        worker.finished_cancelled.connect(self._on_imported_2d_prep_cancelled)
+
+    def _prep_is_active(self) -> bool:
+        try:
+            phase = object.__getattribute__(self, "_prep_phase")
+        except (AttributeError, RuntimeError):
+            return False
+        return phase in ("starting", "active", "cancelling")
+
+    def _begin_preparation(
+        self,
+        worker,
+        *,
+        kind: str,
+        on_ok,
+        on_err,
+        on_cancel,
+    ) -> None:
+        """Attach a PreparationWorker and start it (async unless forced sync)."""
+        self._prep_kind = kind
+        self._prep_phase = "starting"
+        self._prep_result_handled = False
         self._prep_worker = worker
-        # Unit tests may force synchronous execution; production uses a QThread.
+        self._set_preparation_ui(active=True)
+        worker.progress.connect(self._on_prep_progress)
+        worker.log_line.connect(self._on_prep_log)
+        worker.finished_ok.connect(on_ok)
+        worker.finished_error.connect(on_err)
+        worker.finished_cancelled.connect(on_cancel)
+        worker.finished_ok.connect(self._dispose_prep_worker)
+        worker.finished_error.connect(self._dispose_prep_worker)
+        worker.finished_cancelled.connect(self._dispose_prep_worker)
+        self._prep_phase = "active"
         if getattr(self, "_force_sync_prep", False):
+            # Deterministic tests: run on the calling thread without QThread.start().
             worker.run()
         else:
             worker.start()
 
+    def _on_prep_progress(self, name: str) -> None:
+        self.status_bar.set_status(f"Preparing: {name}", "#f39c12")
+        setter = getattr(self.tab_2d, "set_preparation_step", None)
+        if callable(setter):
+            setter(name)
+
+    def _on_prep_log(self, line: str) -> None:
+        log_tab = getattr(self, "tab_log", None)
+        if log_tab is not None and hasattr(log_tab, "append_line"):
+            try:
+                log_tab.append_line(line)
+                return
+            except Exception:
+                pass
+        # Fallback: avoid flooding dialogs; stderr is acceptable for diagnostics.
+        print(line, file=sys.stderr)
+
+    def _set_preparation_ui(self, *, active: bool) -> None:
+        """Disable conflicting actions and enable Cancel Preparation while active."""
+        tab = getattr(self, "tab_2d", None)
+        if tab is None:
+            return
+        btn_init = getattr(tab, "btn_initialize", None)
+        btn_end = getattr(tab, "btn_exact_end", None)
+        btn_stop = getattr(tab, "btn_stop", None)
+        if active:
+            if btn_init is not None:
+                btn_init.setEnabled(False)
+            if btn_end is not None:
+                btn_end.setEnabled(False)
+            if btn_stop is not None:
+                btn_stop.setText("Cancel Preparation")
+                btn_stop.setEnabled(True)
+                btn_stop.setToolTip("Cancel the active 2D preparation operation")
+        else:
+            if btn_stop is not None:
+                btn_stop.setText("Interrupt")
+                btn_stop.setToolTip("")
+            apply = getattr(tab, "_apply_action_buttons", None)
+            if callable(apply):
+                apply(
+                    running=False,
+                    initialized=bool(getattr(self, "active_case_initialized_2d", False)),
+                )
+
+    def _finish_preparation_controls(self, *, success: bool) -> None:
+        if getattr(self, "_prep_result_handled", False):
+            return
+        self._prep_result_handled = True
+        self._prep_phase = "finished"
+        self._set_preparation_ui(active=False)
+
+    def _dispose_prep_worker(self, *_args) -> None:
+        worker = self._prep_worker
+        self._prep_worker = None
+        self._prep_kind = None
+        if self._prep_phase != "idle":
+            self._prep_phase = "idle"
+        if worker is None:
+            return
+        # Never destroy a QThread while its run() is on the stack. Under
+        # ``_force_sync_prep`` the finished handlers run inside run(), so skip
+        # deleteLater and let Python/Qt reclaim the object later.
+        if getattr(self, "_force_sync_prep", False):
+            return
+        try:
+            if worker.isRunning():
+                worker.wait(5000)
+            QTimer.singleShot(0, worker.deleteLater)
+        except RuntimeError:
+            pass
+
+    def _request_cancel_preparation(self) -> None:
+        worker = self._prep_worker
+        if worker is None or not self._prep_is_active():
+            return
+        self._prep_phase = "cancelling"
+        self.status_bar.set_status("Cancelling preparation…", "#e67e22")
+        worker.request_cancel()
+
     def _set_preparation_controls_enabled(self, enabled: bool) -> None:
-        for attr in ("btn_initialize", "btn_exact_end", "btn_stop"):
-            widget = getattr(self.tab_2d, attr, None)
-            if widget is not None:
-                if enabled:
-                    # Restore from state helpers.
-                    self.tab_2d._apply_action_buttons(
-                        running=False,
-                        initialized=bool(getattr(self, "active_case_initialized_2d", False)),
-                    )
-                else:
-                    widget.setEnabled(False)
+        # Compatibility for older tests — prefer _set_preparation_ui.
+        self._set_preparation_ui(active=not enabled)
 
     def _on_imported_2d_prep_failed(self, result) -> None:
-        self._set_preparation_controls_enabled(True)
+        self._pending_exact_end_after_prep = False
+        self._finish_preparation_controls(success=False)
         self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_FAILED)
+        self.tab_2d.set_simulation_state(SimulationState2D.FAILED)
         self.active_case_initialized_2d = False
         self.status_bar.set_status("2D Init Failed", "#e74c3c")
         QMessageBox.critical(
@@ -1159,13 +1252,15 @@ class BlastFoamApp(QMainWindow):
         )
 
     def _on_imported_2d_prep_cancelled(self, result) -> None:
-        self._set_preparation_controls_enabled(True)
+        self._pending_exact_end_after_prep = False
+        self._finish_preparation_controls(success=False)
         self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_FAILED)
+        self.tab_2d.set_simulation_state(SimulationState2D.FAILED)
         self.active_case_initialized_2d = False
-        self.status_bar.set_status("2D Init cancelled", "#e74c3c")
+        self.status_bar.set_status("2D Init cancelled", "#e67e22")
 
     def _on_imported_2d_prep_ok(self, result) -> None:
-        self._set_preparation_controls_enabled(True)
+        self._finish_preparation_controls(success=True)
         payload = result.payload or {}
         case_dir = payload["case_dir"]
         command = payload["command"]
@@ -1247,6 +1342,10 @@ class BlastFoamApp(QMainWindow):
             self.tab_2d._set_result_controls_available(True)
             self.tab_2d.mark_initialized(case_dir, actual_cells)
             self.status_bar.set_status("GGUI case generated from import", "#27ae60")
+            if self._pending_exact_end_after_prep:
+                self._pending_exact_end_after_prep = False
+                # Defer so success dialogs can close cleanly first.
+                QTimer.singleShot(0, self.run_imported_2d_exact_end)
             codes = ", ".join(f"{k}={v}" for k, v in state.prepare_results.items())
             QMessageBox.information(
                 self,
@@ -1598,63 +1697,27 @@ class BlastFoamApp(QMainWindow):
     
     # ====== Simulation Control (Preserved from original) ======
     
-    def _run_wsl_commands(self, case_dir, cmds):
-        """Execute WSL commands in case directory via central ``wsl_runtime``.
+    def _run_wsl_commands(self, case_dir, cmds, cancel_token=None):
+        """Execute WSL commands via ``wsl_runtime`` with optional cancellation.
 
-        Supports UNC (\\\\wsl.localhost\\Distro\\...) and Windows paths (C:\\...).
-        All path/command quoting is performed by ``wsl_runtime``.
+        Returns True only on success. Cancellation and failures both return False;
+        callers that need the distinction should use ``run_initialization_wsl`` /
+        ``run_wsl_command`` directly and inspect ``WslRunResult``.
         """
-        import sys
-        from pathlib import Path
+        from preparation_service_2d import run_initialization_wsl
 
-        from wsl_runtime import run_wsl_command, to_wsl_path_and_distro
+        result = run_initialization_wsl(
+            case_dir,
+            str(cmds),
+            openfoam_bashrc=self.openfoam_bashrc,
+            cancel_token=cancel_token,
+        )
+        print(
+            f"\n[Initialize] Command "
+            f"{'succeeded' if result.ok else ('CANCELLED' if result.cancelled else 'FAILED with code ' + str(result.exit_code))}"
+        )
+        return bool(result.ok) and not result.cancelled
 
-        path = to_wsl_path_and_distro(case_dir)
-        log_file = Path(case_dir) / "log.initialize"
-        try:
-            result = run_wsl_command(
-                case_dir,
-                str(cmds),
-                openfoam_bashrc=self.openfoam_bashrc,
-                quiet_source=False,
-            )
-            with open(log_file, "w", encoding="utf-8") as log:
-                log.write("=" * 60 + "\n")
-                log.write("Initialize Command Log\n")
-                log.write("=" * 60 + "\n")
-                log.write(f"Directory: {path.linux_path}\n")
-                log.write(f"Command: {cmds}\n")
-                log.write(f"Safe: {result.safe_command}\n")
-                log.write("=" * 60 + "\n\n")
-                if result.stdout:
-                    log.write("STDOUT:\n")
-                    log.write(result.stdout)
-                    log.write("\n\n")
-                if result.stderr:
-                    log.write("STDERR:\n")
-                    log.write(result.stderr)
-                    log.write("\n\n")
-                log.write("=" * 60 + "\n")
-                log.write(
-                    "Result: "
-                    + (
-                        "SUCCESS"
-                        if result.ok
-                        else f"FAILED with exit code {result.exit_code}"
-                    )
-                    + "\n"
-                )
-                log.write("=" * 60 + "\n")
-            print(
-                f"\n[Initialize] Command "
-                f"{'succeeded' if result.ok else 'FAILED with code ' + str(result.exit_code)}"
-            )
-            print(f"[Initialize] Log saved to: {log_file}")
-            return bool(result.ok)
-        except Exception as e:
-            print(f"ERROR running WSL commands: {e}", file=sys.stderr)
-            return False
-    
     def run_active_tab(self):
         """Run simulation for active tab"""
         current_widget = self.tabs.currentWidget()
@@ -1706,14 +1769,18 @@ class BlastFoamApp(QMainWindow):
         return norm, None
 
     def on_initialize_model_2d(self, inputs):
-        """Generate and initialize one validated axisymmetric wedge case.
-
-        Converted imported models regenerate via generator_2d into a fresh case.
-        """
+        """Validate on GUI thread, then generate/initialize via PreparationWorker."""
         if getattr(self.tab_2d, "is_imported_mode", False):
             self.on_initialize_imported_model_2d()
             return
         if not isinstance(inputs, CaseInputs2D):
+            return
+        if self._prep_is_active():
+            QMessageBox.information(
+                self,
+                "Preparation In Progress",
+                "A 2D preparation operation is already running. Cancel it or wait.",
+            )
             return
         try:
             checked = validate_case_inputs_2d(inputs)
@@ -1749,57 +1816,40 @@ class BlastFoamApp(QMainWindow):
                     ),
                 )
 
-            self.status_bar.set_status("Generating 2D Case...", "#f39c12")
-            QApplication.processEvents()
-            case_name = self.service.make_case_name("Case_2D")
-            case_dir = self.service.generate_case(case_name, effective_inputs)
-            self.active_case_dir_2d = case_dir
+            expected_cells = (
+                checked.domain.total_cells if checked.domain is not None else None
+            )
             self.active_case_initialized_2d = False
-            command = self.service.generator_2d.initialization_command(effective_inputs)
-            success = self._run_wsl_commands(case_dir, command)
-            if not success:
-                self.active_case_initialized_2d = False
-                self.tab_2d.handle_initialization_failure(
-                    case_dir,
-                    "Initialization failed — see Open Log. Partial mesh is not a valid result.",
-                )
-                self.status_bar.set_status("2D Init Failed", "#e74c3c")
-                QMessageBox.critical(
-                    self, "2D Init Error",
-                    "blockMesh / charge initialization / rotateFields validation failed. "
-                    "See log.initialize.",
-                )
-                return
-            self.active_case_initialized_2d = True
-            actual_cells = self._count_poly_mesh_cells(case_dir)
-            if actual_cells is None and checked.domain is not None:
-                actual_cells = checked.domain.total_cells
-            selected_field = self.tab_2d.cmb_field.currentText().strip() or "p"
-            self.tab_2d.viewer.set_axisymmetric_domain(
-                inputs.radius, inputs.height
+            self.tab_2d.set_simulation_state(SimulationState2D.INITIALIZING)
+            self.status_bar.set_status("Generating 2D Case...", "#f39c12")
+
+            from preparation_service_2d import NativePrepContext, prepare_native_2d_case
+            from preparation_worker_qt import PreparationStep, PreparationWorker
+
+            ctx = NativePrepContext(
+                inputs=effective_inputs,
+                case_root=self._resolved_case_root(),
+                openfoam_bashrc=self.openfoam_bashrc,
+                make_case_name=self.service.make_case_name,
+                expected_cells=expected_cells,
+                mapping_report=mapping_report,
             )
-            self.tab_2d.viewer.load_case(
-                case_dir,
-                charge_center=(0.0, inputs.height_of_burst, 0.0),
-                cell_size=inputs.cell_size,
+
+            def _work(cancel_token, progress):
+                return prepare_native_2d_case(ctx, cancel_token, progress)
+
+            worker = PreparationWorker(
+                [PreparationStep("Native 2D initialization", _work)],
+                openfoam_bashrc=self.openfoam_bashrc,
+                parent=self,
             )
-            # Keep the UI field selector, rendered array, and scalar-bar title synchronized.
-            self.tab_2d.cmb_field.blockSignals(True)
-            if self.tab_2d.cmb_field.findText(selected_field) >= 0:
-                self.tab_2d.cmb_field.setCurrentText(selected_field)
-            self.tab_2d.cmb_field.blockSignals(False)
-            self.tab_2d.viewer.set_field(selected_field)
-            self.tab_2d.mark_initialized(case_dir, actual_cells)
-            if mapping_report is not None:
-                import json
-                with open(
-                    os.path.join(case_dir, "mapping_report.json"),
-                    "w",
-                    encoding="utf-8",
-                ) as stream:
-                    json.dump(mapping_report.to_dict(), stream, indent=2, sort_keys=True)
-                    stream.write("\n")
-            self.status_bar.set_status("2D Initialized", "#2ecc71")
+            self._begin_preparation(
+                worker,
+                kind="native_2d",
+                on_ok=self._on_native_2d_prep_ok,
+                on_err=self._on_native_2d_prep_failed,
+                on_cancel=self._on_native_2d_prep_cancelled,
+            )
         except Exception as exc:
             self.active_case_initialized_2d = False
             self.tab_2d.handle_initialization_failure(
@@ -1808,6 +1858,96 @@ class BlastFoamApp(QMainWindow):
             )
             self.status_bar.set_status("2D Init Error", "#e74c3c")
             QMessageBox.critical(self, "2D Init Error", str(exc))
+
+    def _on_native_2d_prep_ok(self, result) -> None:
+        self._finish_preparation_controls(success=True)
+        payload = result.payload or {}
+        case_dir = payload.get("case_dir")
+        inputs = payload.get("inputs")
+        mapping_report = payload.get("mapping_report")
+        expected_cells = payload.get("expected_cells")
+        if not case_dir or inputs is None:
+            self.active_case_initialized_2d = False
+            self.tab_2d.set_simulation_state(SimulationState2D.FAILED)
+            QMessageBox.critical(self, "2D Init Error", "Preparation returned incomplete data.")
+            return
+        try:
+            self.active_case_dir_2d = case_dir
+            self.active_case_initialized_2d = True
+            actual_cells = self._count_poly_mesh_cells(case_dir)
+            if actual_cells is None and expected_cells is not None:
+                actual_cells = expected_cells
+            selected_field = self.tab_2d.cmb_field.currentText().strip() or "p"
+            self.tab_2d.viewer.set_axisymmetric_domain(inputs.radius, inputs.height)
+            self.tab_2d.viewer.load_case(
+                case_dir,
+                charge_center=(0.0, inputs.height_of_burst, 0.0),
+                cell_size=inputs.cell_size,
+            )
+            self.tab_2d.cmb_field.blockSignals(True)
+            if self.tab_2d.cmb_field.findText(selected_field) >= 0:
+                self.tab_2d.cmb_field.setCurrentText(selected_field)
+            self.tab_2d.cmb_field.blockSignals(False)
+            self.tab_2d.viewer.set_field(selected_field)
+            self.tab_2d.mark_initialized(case_dir, actual_cells)
+            if mapping_report is not None:
+                import json
+
+                with open(
+                    os.path.join(case_dir, "mapping_report.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as stream:
+                    json.dump(mapping_report.to_dict(), stream, indent=2, sort_keys=True)
+                    stream.write("\n")
+            self.status_bar.set_status("2D Initialized", "#2ecc71")
+            self._set_preparation_ui(active=False)
+            if self._pending_exact_end_after_prep:
+                self._pending_exact_end_after_prep = False
+                QTimer.singleShot(0, self.run_2d_process_exact_end)
+        except Exception as exc:
+            self._pending_exact_end_after_prep = False
+            self.active_case_initialized_2d = False
+            self.tab_2d.handle_initialization_failure(
+                case_dir, f"Post-init UI update failed: {exc}"
+            )
+            self.status_bar.set_status("2D Init Error", "#e74c3c")
+            QMessageBox.critical(self, "2D Init Error", str(exc))
+
+    def _on_native_2d_prep_failed(self, result) -> None:
+        self._pending_exact_end_after_prep = False
+        self._finish_preparation_controls(success=False)
+        payload = result.payload or {}
+        case_dir = payload.get("case_dir")
+        self.active_case_initialized_2d = False
+        self.tab_2d.handle_initialization_failure(
+            case_dir,
+            result.error
+            or "Initialization failed — see Open Log. Partial mesh is not a valid result.",
+        )
+        self.tab_2d.set_simulation_state(SimulationState2D.FAILED)
+        self.status_bar.set_status("2D Init Failed", "#e74c3c")
+        QMessageBox.critical(
+            self,
+            "2D Init Error",
+            result.error
+            or (
+                "blockMesh / charge initialization / rotateFields validation failed. "
+                "See log.initialize."
+            ),
+        )
+
+    def _on_native_2d_prep_cancelled(self, result) -> None:
+        self._pending_exact_end_after_prep = False
+        self._finish_preparation_controls(success=False)
+        payload = result.payload or {}
+        case_dir = payload.get("case_dir")
+        self.active_case_initialized_2d = False
+        self.tab_2d.handle_initialization_failure(
+            case_dir, "Initialization cancelled — case is not initialized."
+        )
+        self.tab_2d.set_simulation_state(SimulationState2D.FAILED)
+        self.status_bar.set_status("2D Init cancelled", "#e67e22")
 
     @staticmethod
     def _count_poly_mesh_cells(case_dir: str):
@@ -1852,7 +1992,9 @@ class BlastFoamApp(QMainWindow):
                 or not self.active_case_initialized_2d
                 or self.tab_2d.simulation_state == SimulationState2D.STALE
             ):
+                self._pending_exact_end_after_prep = True
                 self.on_initialize_model_2d(inputs)
+                # Async prep: exact END continues from the success handler.
                 if not self.active_case_initialized_2d:
                     return
             write_param = (
@@ -2423,7 +2565,10 @@ class BlastFoamApp(QMainWindow):
         self.runner.start()
     
     def on_stop_request(self):
-        """Handle stop/interrupt request"""
+        """Handle stop/interrupt: cancel preparation or stop the solver."""
+        if self._prep_is_active():
+            self._request_cancel_preparation()
+            return
         if self.runner:
             self.runner.stop()
             self.status_bar.stop_et_timing()

@@ -315,6 +315,7 @@ class ImportUiEditableTests(unittest.TestCase):
         for p in cls._patches:
             p.start()
         cls.win = BlastFoamApp()
+        cls.win._force_sync_prep = True
 
     @classmethod
     def tearDownClass(cls):
@@ -363,6 +364,7 @@ class ImportInitUsesGeneratorTests(unittest.TestCase):
         for p in cls._patches:
             p.start()
         cls.win = BlastFoamApp()
+        cls.win._force_sync_prep = True
 
     @classmethod
     def tearDownClass(cls):

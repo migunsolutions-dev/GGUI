@@ -160,14 +160,16 @@ class InventoryIntegrityTests(unittest.TestCase):
 
             real_chunked = _sha256_file_chunked
 
-            def flaky(path, *, expected_size=None):
+            def flaky(path, *, expected_size=None, cancel_token=None):
                 if path.name == "vanishing.dat":
                     try:
                         path.unlink()
                     except OSError:
                         pass
                     raise OSError("No such file")
-                return real_chunked(path, expected_size=expected_size)
+                return real_chunked(
+                    path, expected_size=expected_size, cancel_token=cancel_token
+                )
 
             with mock.patch(
                 "external_case_workflow_2d._sha256_file_chunked", side_effect=flaky

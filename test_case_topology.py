@@ -241,6 +241,7 @@ class RoutingAndExternalLoadTests(unittest.TestCase):
         for p in cls._msg_patches:
             p.start()
         cls.win = BlastFoamApp()
+        cls.win._force_sync_prep = True
 
     @classmethod
     def tearDownClass(cls):
@@ -257,6 +258,7 @@ class RoutingAndExternalLoadTests(unittest.TestCase):
         self.win.active_case_dir_2d = None
         self.win.active_case_dir_3d = None
         self.win.tabs.setCurrentIndex(0)
+        self.win._force_sync_prep = True
 
     def test_axisymmetric_routing_selects_cylindrical_2d(self):
         with tempfile.TemporaryDirectory() as td:
