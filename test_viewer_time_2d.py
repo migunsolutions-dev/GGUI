@@ -579,9 +579,7 @@ class Tab2DMeshModeSelectorTests(unittest.TestCase):
         self.assertFalse(tab.lbl_info_grid.isHidden())
         self.assertFalse(tab.lbl_info_charge.isHidden())
         self.assertFalse(tab.lbl_info_resolution.isHidden())
-        self.assertTrue(
-            tab.lbl_info_total.text().startswith("Estimated cells before initialization")
-        )
+        self.assertTrue(tab.lbl_info_total.isHidden())
         self.assertEqual(
             tab.btn_mesh_amr.maximumWidth(),
             max(438 // 2, tab.btn_mesh_amr.sizeHint().width()),
@@ -605,8 +603,9 @@ class Tab2DMeshModeSelectorTests(unittest.TestCase):
             self.assertFalse(tab.lbl_radial_cells.isHidden())
             self.assertFalse(tab.lbl_vertical_cells.isHidden())
             self.assertTrue(tab.lbl_info_grid.isHidden())
-            self.assertTrue(tab.lbl_info_charge.isHidden())
+            self.assertFalse(tab.lbl_info_charge.isHidden())
             self.assertTrue(tab.lbl_info_resolution.isHidden())
+            self.assertFalse(tab.lbl_info_total.isHidden())
             tab.cmb_mesh_mode.blockSignals(True)
             tab.cmb_mesh_mode.setCurrentText(DYNAMIC_MESH)
             tab.cmb_mesh_mode.blockSignals(False)
@@ -622,6 +621,7 @@ class Tab2DMeshModeSelectorTests(unittest.TestCase):
         self.assertEqual(tab.cmb_mesh_mode.currentText(), FIXED_MESH)
         self.assertFalse(tab.lbl_radial_cells.isHidden())
         self.assertTrue(tab.lbl_info_grid.isHidden())
+        self.assertFalse(tab.lbl_info_total.isHidden())
         tab.rad_dyn_mesh.setChecked(True)
         QApplication.processEvents()
         self.assertEqual(tab.cmb_mesh_mode.currentText(), DYNAMIC_MESH)

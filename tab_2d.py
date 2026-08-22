@@ -178,6 +178,7 @@ class Tab2D(QWidget):
         self._state = SimulationState2D.DRAFT
         self._loading = False
         self._actual_cell_count = None
+        self._initialized_charge_cell_count = None
         self._active_case_dir = None
         self._imported_case = None
         self._import_mode = ImportMode2D.NATIVE_GGUI_2D
@@ -248,6 +249,8 @@ class Tab2D(QWidget):
         )
         self._apply_action_buttons(running=running, initialized=initialized)
         self.sig_state_changed.emit(state.value)
+        if hasattr(self, "_info_row_widgets"):
+            self._refresh_info()
 
     def _apply_action_buttons(
         self, *, running: bool = False, initialized: bool = False
@@ -314,6 +317,7 @@ class Tab2D(QWidget):
         self._import_mode = state.mode
         self._active_case_dir = state.active_case_path
         self._actual_cell_count = state.cell_count
+        self._initialized_charge_cell_count = state.charge_cell_count
         if apply_mapping:
             self._apply_import_mapping(state)
         self._update_provenance_banner()
@@ -377,6 +381,8 @@ class Tab2D(QWidget):
             self._unsupported_features = []
             self._restore_native_control_editability()
             self._active_case_dir = None
+            self._actual_cell_count = None
+            self._initialized_charge_cell_count = None
             if hasattr(self, "lbl_import_banner"):
                 self.lbl_import_banner.setVisible(False)
             self.btn_initialize.setText("Initialise Model")
@@ -676,9 +682,15 @@ class Tab2D(QWidget):
                 widget.setSpecialValueText("")
             # Actual enablement is owned by _apply_enablement.
 
-    def mark_initialized(self, case_dir: str, actual_cells: int | None = None) -> None:
+    def mark_initialized(
+        self,
+        case_dir: str,
+        actual_cells: int | None = None,
+        charge_cells: int | None = None,
+    ) -> None:
         self._active_case_dir = case_dir
         self._actual_cell_count = actual_cells
+        self._initialized_charge_cell_count = charge_cells
         self.set_simulation_state(SimulationState2D.INITIALIZED)
         self._on_probe_view_toggled(self.chk_view_probes.isChecked())
         self._refresh_info()
@@ -689,6 +701,7 @@ class Tab2D(QWidget):
         """Failed init must not look like a valid initialized model."""
         self._active_case_dir = case_dir
         self._actual_cell_count = None
+        self._initialized_charge_cell_count = None
         self.set_simulation_state(SimulationState2D.FAILED)
         if hasattr(self.viewer, "clear_simulation_view"):
             self.viewer.clear_simulation_view(
@@ -711,16 +724,8 @@ class Tab2D(QWidget):
             settings = self.viewer.field_settings.get(self.viewer.current_field)
             if settings is not None:
                 settings.log_scale = False
-        if hasattr(self, "lbl_info_actual"):
-            tip = str(message or "Log scale disabled: field has non-positive values.")
-            self.chk_log_scale.setToolTip(tip)
-            # Surface the policy in the info strip without changing physics/data.
-            current = self.lbl_info_actual.text()
-            note = f"Log scale off: {tip}"
-            if note not in current:
-                self.lbl_info_actual.setText(
-                    f"{current}  |  {note}" if current else note
-                )
+        tip = str(message or "Log scale disabled: field has non-positive values.")
+        self.chk_log_scale.setToolTip(tip)
 
     def set_preparation_step(self, name: str) -> None:
         """Show the current asynchronous preparation step in the state label."""
@@ -1228,55 +1233,84 @@ class Tab2D(QWidget):
 
     def _build_info_panel(self) -> QFrame:
         frame = QFrame()
-        frame.setFixedHeight(INFO_PANEL_HEIGHT + 84)
+        frame.setObjectName("cylindrical2dInfoPanel")
+        frame.setFixedHeight(INFO_PANEL_HEIGHT + 25)
         frame.setStyleSheet(
-            "background:#eef2f6; border:1px solid #c7d0da; border-radius:4px;"
+            "QFrame#cylindrical2dInfoPanel { background:transparent; border:none; }"
         )
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(3)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         title = QLabel("Info")
-        title.setStyleSheet(INFO_TITLE_STYLE)
+        title.setObjectName("cylindrical2dInfoHeader")
+        title.setStyleSheet(
+            "QLabel#cylindrical2dInfoHeader {"
+            " background:#eef2f6; border:1px solid #c7d0da;"
+            " padding:3px 7px; font-weight:bold; font-size:9pt; color:#333;"
+            "}"
+        )
         layout.addWidget(title)
-        layout.addSpacing(3)
-        cells = QFormLayout()
-        cells.setContentsMargins(0, 0, 0, 0)
-        cells.setHorizontalSpacing(8)
-        cells.setVerticalSpacing(2)
-        self.lbl_radial_cells_title = QLabel("Radial cells:")
-        self.lbl_vertical_cells_title = QLabel("Vertical cells:")
-        self.lbl_radial_cells = QLabel("—")
-        self.lbl_vertical_cells = QLabel("—")
-        for label in (
-            self.lbl_radial_cells_title,
-            self.lbl_vertical_cells_title,
-            self.lbl_radial_cells,
-            self.lbl_vertical_cells,
+
+        body = QFrame()
+        body.setObjectName("cylindrical2dInfoBody")
+        body.setStyleSheet(
+            "QFrame#cylindrical2dInfoBody {"
+            " background:palette(window); border:1px solid #c7d0da;"
+            " border-top:none;"
+            "}"
+        )
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(7, 4, 7, 4)
+        body_layout.setSpacing(2)
+        rows = QFormLayout()
+        rows.setContentsMargins(0, 0, 0, 0)
+        rows.setHorizontalSpacing(10)
+        rows.setVerticalSpacing(2)
+        self._info_row_widgets = {}
+        for key, caption in (
+            ("radius_cells", "Radius Cells"),
+            ("height_cells", "Height Cells"),
+            ("cell_size", "Cell Size"),
+            ("base_cell", "Base Cell"),
+            ("finest_cell", "Finest Cell"),
+            ("charge_radius", "Charge Radius"),
+            ("charge_res", "Charge Res."),
+            ("charge_cells", "Charge Cells"),
+            ("total_cells", "Total Cells"),
         ):
+            label = QLabel(f"{caption}:")
+            value = QLabel("—")
+            label.setObjectName(f"info2d_{key}_label")
+            value.setObjectName(f"info2d_{key}_value")
             label.setStyleSheet(INFO_ROW_STYLE)
-        cells.addRow(self.lbl_radial_cells_title, self.lbl_radial_cells)
-        cells.addRow(self.lbl_vertical_cells_title, self.lbl_vertical_cells)
-        layout.addLayout(cells)
-        self.lbl_effective_domain = QLabel("—")
-        self.lbl_effective_domain.setWordWrap(True)
-        self.lbl_effective_domain.setStyleSheet(INFO_ROW_STYLE)
-        layout.addWidget(self.lbl_effective_domain)
-        self.lbl_info_total = QLabel("Total computational cells: —")
-        self.lbl_info_grid = QLabel("Base grid: —")
-        self.lbl_info_charge = QLabel("Charge size/radius: —")
-        self.lbl_info_resolution = QLabel("Planned charge resolution: —")
-        self.lbl_info_actual = QLabel("")
-        for label in (
-            self.lbl_info_total,
-            self.lbl_info_grid,
-            self.lbl_info_charge,
-            self.lbl_info_resolution,
-            self.lbl_info_actual,
-        ):
-            label.setStyleSheet(INFO_ROW_STYLE)
-            label.setWordWrap(False)
-            layout.addWidget(label)
-        layout.addStretch()
+            value.setStyleSheet(INFO_ROW_STYLE)
+            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            rows.addRow(label, value)
+            self._info_row_widgets[key] = (label, value)
+        body_layout.addLayout(rows)
+        self.lbl_info_warning = QLabel("")
+        self.lbl_info_warning.setObjectName("info2d_warning")
+        self.lbl_info_warning.setWordWrap(True)
+        self.lbl_info_warning.setStyleSheet(WARNING_STYLE)
+        self.lbl_info_warning.hide()
+        body_layout.addWidget(self.lbl_info_warning)
+        body_layout.addStretch()
+        layout.addWidget(body, 1)
+
+        # Compatibility names retained for callers while rows are state-driven.
+        self.lbl_radial_cells_title, self.lbl_radial_cells = self._info_row_widgets[
+            "radius_cells"
+        ]
+        self.lbl_vertical_cells_title, self.lbl_vertical_cells = self._info_row_widgets[
+            "height_cells"
+        ]
+        self.lbl_effective_domain = self.lbl_info_warning
+        self.lbl_info_total = self._info_row_widgets["total_cells"][1]
+        self.lbl_info_grid = self._info_row_widgets["base_cell"][1]
+        self.lbl_info_charge = self._info_row_widgets["charge_radius"][1]
+        self.lbl_info_resolution = self._info_row_widgets["charge_res"][1]
+        self.lbl_info_actual = self._info_row_widgets["charge_cells"][1]
+        self.info_body = body
         self.info_frame = frame
         return frame
 
@@ -1845,11 +1879,16 @@ class Tab2D(QWidget):
                 self.lbl_vertical_cells.setText(str(domain.vertical_cells))
                 if domain.adjusted:
                     self.lbl_effective_domain.setText(
-                        f"Requested R×H {domain.requested_radius:.6g}×{domain.requested_height:.6g} m; "
-                        f"effective {domain.effective_radius:.6g}×{domain.effective_height:.6g} m."
+                        "Warning: Effective domain differs from requested."
+                    )
+                    self.lbl_effective_domain.setToolTip(
+                        f"Requested R×H {domain.requested_radius:.6g}×"
+                        f"{domain.requested_height:.6g} m; effective "
+                        f"{domain.effective_radius:.6g}×{domain.effective_height:.6g} m."
                     )
                 else:
-                    self.lbl_effective_domain.setText("Requested and effective domain match.")
+                    self.lbl_effective_domain.setText("")
+                    self.lbl_effective_domain.setToolTip("")
             charge = physical_charge_geometry(inputs)
             radius = charge.radius_m if charge.shape == "Sphere" else charge.cylinder_radius_m
             self.lbl_charge_r.setText(f"{radius:.6g} m")
@@ -1914,131 +1953,184 @@ class Tab2D(QWidget):
             )
         self._refresh_info()
 
+    @staticmethod
+    def _format_info_length(value: float) -> str:
+        value = float(value)
+        return f"{value:.3e} m" if 0.0 < abs(value) < 1.0e-4 else f"{value:.5f} m"
+
+    @staticmethod
+    def _fixed_direct_charge_cells(domain, inputs, charge) -> int:
+        """Exact fixed-grid cell-centre selection used by setFields geometry."""
+        from generator_2d import WEDGE_HALF_ANGLE_DEG
+
+        dx = float(domain.cell_size)
+        radial_cells = int(domain.radial_cells)
+        height_cells = int(domain.vertical_cells)
+        cos_angle = math.cos(math.radians(WEDGE_HALF_ANGLE_DEG))
+        centre_h = float(inputs.height_of_burst)
+        radius = (
+            float(charge.radius_m)
+            if charge.shape == "Sphere"
+            else float(charge.cylinder_radius_m)
+        )
+        tol = 1.0e-12
+        radial_centres = []
+        for i in range(radial_cells):
+            inner = i * dx
+            outer = (i + 1) * dx
+            # blockMesh's wedge cells are trapezoidal annular sectors.  Their
+            # volume centroid is the difference of the two similar triangles.
+            radial = (
+                (2.0 * cos_angle / 3.0)
+                * ((outer**3 - inner**3) / (outer**2 - inner**2))
+            )
+            if radial > radius + tol:
+                break
+            radial_centres.append(radial)
+        if charge.shape == "Cylinder":
+            radial_count = len(radial_centres)
+            half_length = 0.5 * float(charge.length_m)
+            low = max(
+                0, math.ceil((centre_h - half_length) / dx - 0.5 - tol)
+            )
+            high = min(
+                height_cells - 1,
+                math.floor((centre_h + half_length) / dx - 0.5 + tol),
+            )
+            height_count = max(0, high - low + 1)
+            return radial_count * height_count
+
+        total = 0
+        for radial in radial_centres:
+            remaining_sq = radius * radius - radial * radial
+            half_height = math.sqrt(max(0.0, remaining_sq))
+            low = max(0, math.ceil((centre_h - half_height) / dx - 0.5 - tol))
+            high = min(
+                height_cells - 1,
+                math.floor((centre_h + half_height) / dx - 0.5 + tol),
+            )
+            if high >= low:
+                total += high - low + 1
+        return total
+
+    def _set_info_rows(self, rows, warning: str = "", warning_detail: str = "") -> None:
+        values = dict(rows)
+        for key, (label, value) in self._info_row_widgets.items():
+            visible = key in values
+            label.setVisible(visible)
+            value.setVisible(visible)
+            if visible:
+                value.setText(str(values[key]))
+        self.lbl_info_warning.setText(warning)
+        self.lbl_info_warning.setToolTip(warning_detail)
+        self.lbl_info_warning.setVisible(bool(warning))
+
+    def _info_rows_for_state(self, inputs, result):
+        domain = result.domain
+        if domain is None:
+            return []
+        direct = inputs.initialization_source == DIRECT_SOURCE
+        dynamic = inputs.mesh_mode == DYNAMIC_MESH
+        initialized = self._state in (
+            SimulationState2D.INITIALIZED,
+            SimulationState2D.RUNNING,
+            SimulationState2D.INTERRUPTED,
+            SimulationState2D.COMPLETED,
+        )
+        actual_total = (
+            int(self._actual_cell_count)
+            if initialized and self._actual_cell_count is not None
+            else None
+        )
+
+        if not direct:
+            rows = [
+                ("radius_cells", f"{domain.radial_cells:,}"),
+                ("height_cells", f"{domain.vertical_cells:,}"),
+                ("cell_size", self._format_info_length(domain.cell_size)),
+            ]
+            if not dynamic:
+                rows.append(("total_cells", f"{domain.total_cells:,}"))
+            elif actual_total is not None:
+                rows = [
+                    ("base_cell", self._format_info_length(domain.cell_size)),
+                    ("total_cells", f"{actual_total:,}"),
+                ]
+            else:
+                rows = [("base_cell", self._format_info_length(domain.cell_size))]
+            return rows
+
+        charge = result.charge
+        if charge is None:
+            return []
+        radius = (
+            charge.radius_m if charge.shape == "Sphere" else charge.cylinder_radius_m
+        )
+        if not dynamic:
+            charge_cells = (
+                self._initialized_charge_cell_count
+                if initialized and self._initialized_charge_cell_count is not None
+                else self._fixed_direct_charge_cells(domain, inputs, charge)
+            )
+            return [
+                ("radius_cells", f"{domain.radial_cells:,}"),
+                ("height_cells", f"{domain.vertical_cells:,}"),
+                ("charge_radius", self._format_info_length(radius)),
+                ("charge_cells", f"{int(charge_cells):,}"),
+                (
+                    "total_cells",
+                    f"{actual_total if actual_total is not None else domain.total_cells:,}",
+                ),
+            ]
+
+        level = result.seed_plan.level_effective if result.seed_plan else 0
+        finest = float(domain.cell_size) / (2 ** max(0, int(level)))
+        charge_resolution = (2.0 * float(radius)) / max(finest, 1.0e-15)
+        rows = [
+            ("finest_cell", self._format_info_length(finest)),
+            ("charge_radius", self._format_info_length(radius)),
+            ("charge_res", f"{charge_resolution:.2f} cells/D"),
+        ]
+        if not initialized:
+            rows.insert(0, ("base_cell", self._format_info_length(domain.cell_size)))
+            return rows
+        charge_cells = self._initialized_charge_cell_count
+        rows.extend(
+            [
+                (
+                    "charge_cells",
+                    f"{int(charge_cells):,}" if charge_cells is not None else "—",
+                ),
+                (
+                    "total_cells",
+                    f"{actual_total:,}" if actual_total is not None else "—",
+                ),
+            ]
+        )
+        return rows
+
     def _refresh_info(self) -> None:
         try:
-            if self.is_imported_mode and self._imported_case is not None:
-                ext = self._imported_case
-                self.lbl_info_total.setText(
-                    f"Imported working case: {os.path.basename(ext.active_case_path)}"
-                )
-                rc = (ext.mapping.get("radial_cells").displayed_value
-                      if ext.mapping and ext.mapping.get("radial_cells") else None)
-                vc = (ext.mapping.get("vertical_cells").displayed_value
-                      if ext.mapping and ext.mapping.get("vertical_cells") else None)
-                if rc is not None and vc is not None:
-                    self.lbl_info_grid.setText(
-                        f"Base grid: {int(rc)} radial × {int(vc)} vertical"
-                    )
-                else:
-                    self.lbl_info_grid.setText(
-                        f"Mode: {ext.lifecycle_label} | evidence: "
-                        f"{ext.classification.evidence.source}"
-                    )
-                cr = None
-                if ext.mapping and ext.mapping.get("charge_radius"):
-                    cr = ext.mapping.get("charge_radius").displayed_value
-                centre = None
-                if ext.mapping and ext.mapping.get("charge_centre"):
-                    centre = ext.mapping.get("charge_centre").displayed_value
-                mat = None
-                if ext.mapping and ext.mapping.get("material_name"):
-                    mat = ext.mapping.get("material_name").displayed_value
-                self.lbl_info_charge.setText(
-                    f"Charge: {mat or '—'} | r={cr if cr is not None else '—'} m | "
-                    f"centre={centre if centre is not None else '—'}"
-                )
-                self.lbl_info_resolution.setText(
-                    f"Source unchanged | R={ext.radius_m if ext.radius_m is not None else '—'} "
-                    f"H={ext.height_m if ext.height_m is not None else '—'}"
-                )
-                if ext.cell_count is not None:
-                    owner = os.path.basename(os.path.dirname(ext.mesh_owner_path)) if ext.mesh_owner_path else ""
-                    self.lbl_info_actual.setText(
-                        f"Actual current cells: {ext.cell_count:,} "
-                        f"({ext.cell_count_source}"
-                        + (f" / {owner}" if owner else "")
-                        + ")"
-                    )
-                else:
-                    self.lbl_info_actual.setText(
-                        "Actual current cells: (initialise to generate mesh)"
-                    )
-                self._apply_info_mode_visibility()
-                return
             inputs = self.get_case_inputs()
             result = validate_case_inputs_2d(inputs)
-            if not result.domain:
-                self._apply_info_mode_visibility()
-                return
-            domain = result.domain
-            self.lbl_info_total.setText(
-                f"{'Estimated cells before initialization' if inputs.mesh_mode == DYNAMIC_MESH else 'Total computational cells'}: "
-                f"{domain.total_cells:,}"
-            )
-            self.lbl_info_grid.setText(
-                f"Base grid: {domain.radial_cells} radial × {domain.vertical_cells} vertical"
-            )
-            if result.charge:
-                charge = result.charge
-                radius = charge.radius_m if charge.shape == "Sphere" else charge.cylinder_radius_m
-                self.lbl_info_charge.setText(
-                    f"Charge size/radius: {2 * radius:.5g} m diameter / {radius:.5g} m radius"
+            warning = ""
+            detail = ""
+            if result.domain is not None and result.domain.adjusted:
+                warning = "Warning: Effective domain differs from requested."
+                detail = (
+                    f"Requested R×H {result.domain.requested_radius:.6g}×"
+                    f"{result.domain.requested_height:.6g} m; effective "
+                    f"{result.domain.effective_radius:.6g}×"
+                    f"{result.domain.effective_height:.6g} m."
                 )
-                level = result.seed_plan.level_effective if result.seed_plan else 0
-                resolution = charge.d_min_m / (inputs.cell_size / (2**level))
-                self.lbl_info_resolution.setText(
-                    f"Planned {'startup ' if result.seed_plan else ''}charge resolution: {resolution:.2f} cells"
-                )
-            else:
-                self.lbl_info_charge.setText("Charge size/radius: mapped source state")
-                self.lbl_info_resolution.setText(
-                    f"Planned target resolution: {inputs.cell_size:.6g} m"
-                )
-            source = getattr(self.viewer, "_cell_count_source", None)
-            count_time = getattr(self.viewer, "_cell_count_time", None)
-            if (
-                self._actual_cell_count is not None
-                and self._state
-                in (
-                    SimulationState2D.INITIALIZED,
-                    SimulationState2D.RUNNING,
-                    SimulationState2D.INTERRUPTED,
-                    SimulationState2D.COMPLETED,
-                )
-            ):
-                suffix = ""
-                if source and source != "none":
-                    if count_time is not None and source == "time_polyMesh":
-                        suffix = f" (measured at t={count_time:.6g} s)"
-                    elif source == "constant_polyMesh":
-                        suffix = " (initialized mesh)"
-                    elif source == "vtk_internalMesh":
-                        suffix = " (loaded mesh)"
-                self.lbl_info_actual.setText(
-                    f"Actual current cells: {self._actual_cell_count:,}{suffix}"
-                )
-            else:
-                self.lbl_info_actual.setText("")
+            self._set_info_rows(self._info_rows_for_state(inputs, result), warning, detail)
         except Exception:
-            self.lbl_info_total.setText("Total computational cells: —")
-        if not self._defer_viewer_preview:
-            self._apply_info_mode_visibility()
+            self._set_info_rows([])
 
     def _apply_info_mode_visibility(self) -> None:
         if not hasattr(self, "info_frame"):
             return
-        imported = bool(self.is_imported_mode and self._imported_case is not None)
-        dynamic = self.cmb_mesh_mode.currentText() == DYNAMIC_MESH
-        show_fixed_counts = imported or not dynamic
-        show_amr = imported or dynamic
-        self.lbl_radial_cells_title.setVisible(show_fixed_counts)
-        self.lbl_radial_cells.setVisible(show_fixed_counts)
-        self.lbl_vertical_cells_title.setVisible(show_fixed_counts)
-        self.lbl_vertical_cells.setVisible(show_fixed_counts)
-        self.lbl_info_grid.setVisible(show_amr)
-        self.lbl_info_charge.setVisible(show_amr)
-        self.lbl_info_resolution.setVisible(show_amr)
-        self.lbl_info_actual.setVisible(bool(self.lbl_info_actual.text().strip()))
+        self._refresh_info()
 
     def _flush_setup_preview(self) -> None:
         preview = self._pending_setup_preview
@@ -2366,6 +2458,7 @@ class Tab2D(QWidget):
         if clear_imported:
             self._active_case_dir = None
             self._actual_cell_count = None
+            self._initialized_charge_cell_count = None
             self.clear_imported_case()
             self.set_simulation_state(SimulationState2D.DRAFT)
             self._apply_enablement()

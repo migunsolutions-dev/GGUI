@@ -78,15 +78,16 @@ class Tab2DWorkflowTests(unittest.TestCase):
         for forbidden in ("Exec 1", "Exec 10", "Exec 100", "Exec 1000", "Run / Resume"):
             self.assertNotIn(forbidden, texts)
 
-    def test_info_first_count_and_no_base_cell_size(self):
-        labels = [
-            self.tab.lbl_info_total.text(),
-            self.tab.lbl_info_grid.text(),
-            self.tab.lbl_info_charge.text(),
-            self.tab.lbl_info_resolution.text(),
-        ]
-        self.assertTrue(labels[0].startswith("Estimated cells before initialization"))
-        self.assertNotIn("Base Cell Size", "\n".join(labels))
+    def test_info_preinit_uses_compact_planned_rows(self):
+        rows = {
+            label.text().rstrip(":"): value.text()
+            for label, value in self.tab._info_row_widgets.values()
+            if not label.isHidden()
+        }
+        self.assertEqual(
+            list(rows), ["Base Cell", "Finest Cell", "Charge Radius", "Charge Res."]
+        )
+        self.assertNotIn("Total Cells", rows)
 
     def test_remap_edit_replaces_path_and_browse(self):
         self.assertFalse(hasattr(self.tab, "btn_browse_source_case"))

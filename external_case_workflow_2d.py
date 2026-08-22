@@ -916,7 +916,10 @@ def _check_mesh_ok(log_text: str) -> bool:
     return bool(re.search(r"\bMesh OK\b", log_text))
 
 
-def _count_nonzero_alpha(case_dir: str, time_name: str = "0") -> Optional[int]:
+def count_initialized_charge_cells(
+    case_dir: str, time_name: str = "0"
+) -> Optional[int]:
+    """Count initialized cells containing explosive fraction from one field file."""
     for name in ("alpha.c4", "alpha.c4.orig"):
         path = Path(case_dir) / time_name / name
         if not path.is_file():
@@ -941,6 +944,9 @@ def _count_nonzero_alpha(case_dir: str, time_name: str = "0") -> Optional[int]:
             return None
         return sum(1 for v in values[:n] if float(v) > 1e-12)
     return None
+
+
+_count_nonzero_alpha = count_initialized_charge_cells
 
 
 def prepare_working_copy(
@@ -1096,7 +1102,7 @@ def prepare_working_copy(
             )
 
     cell_count, cell_source, owner_path = _count_owner_cells(wc)
-    charge_cells = _count_nonzero_alpha(wc, "0")
+    charge_cells = count_initialized_charge_cells(wc, "0")
     if charge_cells is None:
         charge_cells = _parse_charge_cells_from_setrefined_log(wc)
     fields: List[str] = []

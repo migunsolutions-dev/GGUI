@@ -34,7 +34,7 @@ from solver_runner import (
 from simulation_service import SimulationService
 from models import CaseInputs1D, CaseInputs3D
 from models_2d import CaseInputs2D, SimulationState2D
-from axisymmetric_2d import validate_case_inputs_2d, validate_mapping_source
+from axisymmetric_2d import FIXED_MESH, validate_case_inputs_2d, validate_mapping_source
 from path_utils import get_latest_time_dir, win_to_wsl_path
 from case_loader import load_case
 from case_topology import CaseDimension, classify_case_topology
@@ -45,6 +45,7 @@ from case_loader_2d import (
 from external_case_workflow_2d import (
     ImportMode2D,
     WHITELISTED_UTILITIES,
+    count_initialized_charge_cells,
     gui_values_to_control_updates,
     preparation_commands_for_case,
     prepare_working_copy,
@@ -1977,8 +1978,17 @@ class BlastFoamApp(QMainWindow):
             self.active_case_dir_2d = case_dir
             self.active_case_initialized_2d = True
             actual_cells = self._count_poly_mesh_cells(case_dir)
-            if actual_cells is None and expected_cells is not None:
+            if (
+                actual_cells is None
+                and expected_cells is not None
+                and inputs.mesh_mode == FIXED_MESH
+            ):
                 actual_cells = expected_cells
+            charge_cells = (
+                count_initialized_charge_cells(case_dir)
+                if inputs.initialization_source == "Direct Charge"
+                else None
+            )
             selected_field = self.tab_2d.cmb_field.currentText().strip() or "p"
             self.tab_2d.viewer.set_axisymmetric_domain(inputs.radius, inputs.height)
             self.tab_2d.viewer.load_case(
@@ -1991,7 +2001,7 @@ class BlastFoamApp(QMainWindow):
                 self.tab_2d.cmb_field.setCurrentText(selected_field)
             self.tab_2d.cmb_field.blockSignals(False)
             self.tab_2d.viewer.set_field(selected_field)
-            self.tab_2d.mark_initialized(case_dir, actual_cells)
+            self.tab_2d.mark_initialized(case_dir, actual_cells, charge_cells)
             if mapping_report is not None:
                 import json
 

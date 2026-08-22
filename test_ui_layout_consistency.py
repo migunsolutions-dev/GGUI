@@ -261,12 +261,14 @@ class TestUILayoutConsistency(unittest.TestCase):
             self.assertFalse(domain.isAncestorOf(tab.lbl_vertical_cells))
             self.assertTrue(tab.info_frame.isAncestorOf(tab.lbl_effective_domain))
             self.assertFalse(domain.isAncestorOf(tab.lbl_effective_domain))
-            self.assertEqual(tab.lbl_radial_cells_title.text(), "Radial cells:")
-            self.assertEqual(tab.lbl_vertical_cells_title.text(), "Vertical cells:")
+            self.assertEqual(tab.lbl_radial_cells_title.text(), "Radius Cells:")
+            self.assertEqual(tab.lbl_vertical_cells_title.text(), "Height Cells:")
             self.assertTrue(tab.lbl_radial_cells.isHidden())
             self.assertTrue(tab.lbl_vertical_cells.isHidden())
             self.assertFalse(tab.lbl_info_grid.isHidden())
             self.assertFalse(tab.lbl_info_resolution.isHidden())
+            self.assertTrue(tab.info_frame.isAncestorOf(tab.info_body))
+            self.assertFalse(tab._left_setup_scroll.isAncestorOf(tab.info_frame))
         finally:
             win.close()
 
