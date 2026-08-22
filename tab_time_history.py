@@ -218,6 +218,8 @@ class TabTimeHistory(QWidget):
         self._rows: List[GaugeRow] = []
         self._added: List[Tuple[str, int]] = []
         self._sim_time = {"1d": 0.0, "2d": 0.0, "3d": 0.0}
+        self._run_cases = {"1d": "", "2d": "", "3d": ""}
+        self._run_baselines = {}
         self._plot_timer = QTimer(self)
         self._plot_timer.setSingleShot(True)
         self._plot_timer.setInterval(50)
@@ -428,6 +430,28 @@ class TabTimeHistory(QWidget):
     def refresh_plot(self) -> None:
         self._plot_timer.start()
 
+    def begin_run(self, mode: str, case_dir: str) -> None:
+        """Start a viewer session without exposing samples from an earlier run."""
+        dim = _DIM_FROM_MODE.get(str(mode), "")
+        if not dim:
+            return
+        case_dir = os.path.normpath(case_dir) if case_dir else ""
+        self._run_cases[dim] = case_dir
+        self._sim_time[dim] = 0.0
+        for field in ("p", "impulse"):
+            path = latest_probe_field_file(case_dir, PROBE_FO[dim], field)
+            count = 0
+            size = 0
+            if path:
+                _locs, times, _columns = parse_probe_history(path)
+                count = len(times)
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    size = 0
+            self._run_baselines[(dim, field)] = (path, count, size)
+        self.refresh_plot()
+
     def note_sim_progress(self, mode: str, time_s: float) -> None:
         """Track live solver time so the plot grows with the current run."""
         dim = _DIM_FROM_MODE.get(str(mode), "")
@@ -483,7 +507,7 @@ class TabTimeHistory(QWidget):
             if row is None:
                 continue
             color = self._color_for_key(key)
-            case_dir = self._case_dir_fn(row.dim) or ""
+            case_dir = self._run_cases.get(row.dim, "") or self._case_dir_fn(row.dim) or ""
             p_atm = float(self._p_atm_fn(row.dim) or DEFAULT_P_ATM)
             fo_name = PROBE_FO[row.dim]
             both_fields = "p" in fields and "impulse" in fields
@@ -498,6 +522,9 @@ class TabTimeHistory(QWidget):
                         values = list(columns[row.index])
                         if field == "p":
                             values = [value - p_atm for value in values]
+                        times, values = self._current_run_samples(
+                            row.dim, field, path, times, values
+                        )
                 if len(times) != len(values):
                     times, values = [], []
                 style = "--" if field == "impulse" else "-"
@@ -523,6 +550,30 @@ class TabTimeHistory(QWidget):
             self.canvas.draw_idle()
         except Exception:
             pass
+
+    def _current_run_samples(
+        self,
+        dim: str,
+        field: str,
+        path: str,
+        times: Sequence[float],
+        values: Sequence[float],
+    ) -> Tuple[List[float], List[float]]:
+        baseline_path, baseline_count, baseline_size = self._run_baselines.get(
+            (dim, field), ("", 0, 0)
+        )
+        try:
+            current_size = os.path.getsize(path)
+        except OSError:
+            current_size = 0
+        # A different/truncated file belongs to the new run; otherwise skip
+        # the rows that already existed when this run was started.
+        start = 0
+        if path == baseline_path and current_size >= baseline_size:
+            start = min(int(baseline_count), len(times), len(values))
+        else:
+            self._run_baselines[(dim, field)] = (path, 0, 0)
+        return list(times[start:]), list(values[start:])
 
     def _live_sim_time(self) -> float:
         latest = 0.0

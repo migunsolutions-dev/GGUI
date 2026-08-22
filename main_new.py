@@ -17,7 +17,7 @@ from PyQt5.QtCore import Qt, QTimer, QSize
 from PyQt5.QtGui import QIcon, QFont, QFontMetrics
 
 from tab_1d import Tab1D
-from tab_2d import Tab2D, latest_case_1d_dir
+from tab_2d import Tab2D
 from tab_time_history import TabTimeHistory
 from dialogs import OutputFileOptionsDialog
 from time_history_dialog import TimeHistoryLocationsDialog
@@ -2678,6 +2678,7 @@ class BlastFoamApp(QMainWindow):
         )
         self._active_run_mode = mode
         self._run_user_interrupted = False
+        self.tab_time_history.begin_run(mode, case_dir)
         # Queued delivery keeps status/viewport updates on the Qt GUI thread.
         self.runner.data_signal.connect(
             lambda p, t, s, dt: self.on_new_data(p, t, s, dt, mode),
@@ -2736,16 +2737,10 @@ class BlastFoamApp(QMainWindow):
         self.tab_time_history.note_sim_progress(mode, sim_time_s)
 
     def _time_history_case_dir(self, dim: str) -> str:
-        if dim == "1d":
-            return self.tab_2d._current_1d_remap_path() or latest_case_1d_dir(
-                self.base_projects_path
-            )
-        if dim == "2d":
-            return self.active_case_dir_2d or getattr(self.tab_2d, "_active_case_dir", "") or ""
-        if dim == "3d":
-            viewer = getattr(self.tab_3d, "viewer", None)
-            return self.active_case_dir_3d or getattr(viewer, "current_case_dir", "") or ""
-        return ""
+        tab = getattr(self, "tab_time_history", None)
+        if tab is None:
+            return ""
+        return tab._run_cases.get(dim, "") or ""
 
     def _time_history_p_atm(self, dim: str) -> float:
         if dim == "1d":

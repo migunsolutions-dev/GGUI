@@ -184,6 +184,31 @@ class TabTimeHistoryUiTests(unittest.TestCase):
             self.assertLessEqual(ylim[0], 0.0)
             self.assertGreater(ylim[1], 100000.0)
 
+    def test_begin_run_hides_existing_samples_and_shows_only_new_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            fo = os.path.join(td, "postProcessing", "gauges1d", "0")
+            os.makedirs(fo)
+            path = os.path.join(fo, "p")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("# Probe 0 (1.5 0 0)\n")
+                handle.write("0.0 101325\n")
+                handle.write("0.001 201325\n")
+            self.tab.tbl_gauges.selectRow(0)
+            self.tab.add_selected()
+            self.tab.begin_run("1D", td)
+            self.tab._redraw_plot()
+            line = self.tab.canvas.axes.lines[0]
+            self.assertEqual(list(line.get_xdata()), [])
+            self.assertEqual(list(line.get_ydata()), [])
+
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write("0.002 301325\n")
+            self.tab.note_sim_progress("1D", 0.002)
+            self.tab._redraw_plot()
+            line = self.tab.canvas.axes.lines[0]
+            self.assertEqual(list(line.get_xdata()), [0.002])
+            self.assertEqual(list(line.get_ydata()), [200000.0])
+
     def test_added_gauges_have_distinct_colors_and_right_legend(self):
         self.tab.tbl_gauges.selectRow(0)
         self.tab.add_selected()
@@ -344,5 +369,6 @@ class TabTimeHistoryAppWireTests(unittest.TestCase):
                 for row in range(win.tab_time_history.tbl_gauges.rowCount())
             ]
             self.assertIn("LiveG", labels)
+            self.assertEqual(win._time_history_case_dir("1d"), "")
         finally:
             win.close()
