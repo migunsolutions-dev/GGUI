@@ -1,4 +1,5 @@
 import math
+import numpy as np
 from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QFrame,
     QGroupBox, QFormLayout, QComboBox, QDoubleSpinBox, QSpinBox, QLineEdit,
@@ -57,6 +58,29 @@ def initial_overpressure_step(
     return [0.0, r_c, r_c, r_max], [over, over, 0.0, 0.0]
 
 
+def _qimage_from_rgba(rgba: np.ndarray, width: int, height: int) -> QImage:
+    """Build a Qt-owned QImage. Never wrap a Python/numpy buffer (that aborts on Windows)."""
+    image = QImage(width, height, QImage.Format_RGBA8888)
+    if image.isNull():
+        return image
+    raw = np.ascontiguousarray(rgba, dtype=np.uint8).tobytes()
+    expected = width * height * 4
+    if len(raw) < expected:
+        return QImage()
+    bits = image.bits()
+    nbytes = image.byteCount() if hasattr(image, "byteCount") else image.sizeInBytes()
+    bits.setsize(nbytes)
+    bpl = image.bytesPerLine()
+    if bpl == width * 4:
+        bits[:expected] = raw
+    else:
+        for y in range(height):
+            src = y * width * 4
+            dst = y * bpl
+            bits[dst : dst + width * 4] = raw[src : src + width * 4]
+    return image
+
+
 class MplCanvas(QLabel):
     """Raster matplotlib figure. Avoids Qt5Agg OpenGL swaps that abort on Windows."""
 
@@ -67,6 +91,10 @@ class MplCanvas(QLabel):
         self.axes = self.figure.add_subplot(111)
         self._agg = FigureCanvasAgg(self.figure)
         self._drawing = False
+        self._draw_timer = QTimer(self)
+        self._draw_timer.setSingleShot(True)
+        self._draw_timer.setInterval(0)
+        self._draw_timer.timeout.connect(self._render_to_label)
         self.setMinimumHeight(120)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setAlignment(Qt.AlignCenter)
@@ -83,11 +111,15 @@ class MplCanvas(QLabel):
         self._render_to_label()
 
     def draw_idle(self):
+        if not self.isVisible():
+            return
         self._render_to_label()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.draw_idle()
+        if not self.isVisible() or self._draw_timer.isActive():
+            return
+        self._draw_timer.start()
 
     def _render_to_label(self) -> None:
         if self._drawing:
@@ -110,10 +142,13 @@ class MplCanvas(QLabel):
                     pass
             self._agg.draw()
             renderer = self._agg.get_renderer()
-            width = int(renderer.width)
-            height = int(renderer.height)
-            buf = renderer.buffer_rgba()
-            image = QImage(bytes(buf), width, height, QImage.Format_RGBA8888)
+            buf = np.asarray(renderer.buffer_rgba())
+            if buf.ndim != 3 or buf.shape[0] < 1 or buf.shape[1] < 1:
+                return
+            height, width = int(buf.shape[0]), int(buf.shape[1])
+            image = _qimage_from_rgba(np.ascontiguousarray(buf[:, :, :4]), width, height)
+            if image is None or image.isNull():
+                return
             self.setPixmap(QPixmap.fromImage(image))
         except Exception:
             pass

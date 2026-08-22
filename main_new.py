@@ -2890,8 +2890,13 @@ def main():
     # Set application style
     app.setStyle("Fusion")
     
-    window = BlastFoamApp()
-    window.show()
+    try:
+        window = BlastFoamApp()
+        window.show()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        raise
     
     sys.exit(app.exec_())
 

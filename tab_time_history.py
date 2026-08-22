@@ -279,10 +279,9 @@ class TabTimeHistory(QWidget):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([COMPUTATIONAL_LEFT_PANEL_WIDTH, 1100])
-        splitter.splitterMoved.connect(self.canvas.draw_idle)
+        splitter.splitterMoved.connect(self._on_plot_splitter_moved)
         self._plot_splitter = splitter
         root.addWidget(splitter)
-        self._redraw_plot()
 
     def _build_left(self) -> QWidget:
         left = QWidget()
@@ -349,6 +348,10 @@ class TabTimeHistory(QWidget):
         super().showEvent(event)
         self.refresh_catalog()
         QTimer.singleShot(0, self.canvas.draw_idle)
+
+    def _on_plot_splitter_moved(self, *_args) -> None:
+        if self.isVisible() and self.canvas.isVisible():
+            self.canvas.draw_idle()
 
     def has_series(self) -> bool:
         return bool(self._added)
@@ -461,6 +464,12 @@ class TabTimeHistory(QWidget):
         return GAUGE_COLORS[index % len(GAUGE_COLORS)]
 
     def _redraw_plot(self) -> None:
+        try:
+            self._redraw_plot_body()
+        except Exception:
+            return
+
+    def _redraw_plot_body(self) -> None:
         axes = self.canvas.axes
         axes.clear()
         fields = self._active_fields() or ["p"]
@@ -489,6 +498,8 @@ class TabTimeHistory(QWidget):
                         values = list(columns[row.index])
                         if field == "p":
                             values = [value - p_atm for value in values]
+                if len(times) != len(values):
+                    times, values = [], []
                 style = "--" if field == "impulse" else "-"
                 label = "_nolegend_" if both_fields and field == "impulse" else wrapped
                 axes.plot(times, values, color=color, linestyle=style, label=label)
@@ -508,7 +519,10 @@ class TabTimeHistory(QWidget):
                 fontsize=8,
             )
         axes.grid(True, alpha=0.3)
-        self.canvas.draw_idle()
+        try:
+            self.canvas.draw_idle()
+        except Exception:
+            pass
 
     def _live_sim_time(self) -> float:
         latest = 0.0

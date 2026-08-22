@@ -139,6 +139,20 @@ class TabTimeHistoryUiTests(unittest.TestCase):
         self.assertFalse(self.tab.has_series())
         self.assertEqual(self.tab.tbl_gauges.rowCount(), 4)
 
+    def test_add_with_legend_on_large_canvas_does_not_crash(self):
+        self.tab.show()
+        self.tab.resize(1685, 1060)
+        self.app.processEvents()
+        self.tab.tbl_gauges.selectRow(0)
+        self.tab.add_selected()
+        self.tab._redraw_plot()
+        self.app.processEvents()
+        pix = self.tab.canvas.pixmap()
+        self.assertIsNotNone(pix)
+        self.assertFalse(pix.isNull())
+        legend = self.tab.canvas.axes.get_legend()
+        self.assertIsNotNone(legend)
+
     def test_synthetic_gauges1d_file_plots_overpressure(self):
         with tempfile.TemporaryDirectory() as td:
             fo = os.path.join(td, "postProcessing", "gauges1d", "0")
@@ -275,6 +289,23 @@ class TabTimeHistoryUiTests(unittest.TestCase):
             self.assertGreater(after, before)
             _lo, hi = padded_axis_limits(0.0, 0.05)
             self.assertAlmostEqual(after, hi)
+
+
+    def test_missing_gauge_column_does_not_plot_mismatched_xy(self):
+        with tempfile.TemporaryDirectory() as td:
+            fo = os.path.join(td, "postProcessing", "gauges1d", "0")
+            os.makedirs(fo)
+            with open(os.path.join(fo, "p"), "w", encoding="utf-8") as handle:
+                handle.write("# Probe 0 (1.5 0 0)\n")
+                handle.write("0.0 101325\n")
+            self.tab.set_source_provider(case_dir=lambda dim: td if dim == "1d" else "")
+            self.tab.tbl_gauges.selectRow(1)
+            self.tab.add_selected()
+            self.tab._redraw_plot()
+            lines = self.tab.canvas.axes.lines
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(list(lines[0].get_xdata()), [])
+            self.assertEqual(list(lines[0].get_ydata()), [])
 
 
 class ProbeHistoryIncompleteTests(unittest.TestCase):
