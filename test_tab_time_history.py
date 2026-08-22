@@ -17,6 +17,7 @@ from tab_time_history import (
     TabTimeHistory,
     catalog_rows,
     latest_probe_field_file,
+    padded_axis_limits,
     parse_probe_history,
     wrap_legend_name,
 )
@@ -162,6 +163,12 @@ class TabTimeHistoryUiTests(unittest.TestCase):
             legend = self.tab.canvas.axes.get_legend()
             self.assertIsNotNone(legend)
             self.assertEqual([text.get_text() for text in legend.get_texts()], ["G1"])
+            xlim = self.tab.canvas.axes.get_xlim()
+            ylim = self.tab.canvas.axes.get_ylim()
+            self.assertLessEqual(xlim[0], 0.0)
+            self.assertGreater(xlim[1], 0.001)
+            self.assertLessEqual(ylim[0], 0.0)
+            self.assertGreater(ylim[1], 100000.0)
 
     def test_added_gauges_have_distinct_colors_and_right_legend(self):
         self.tab.tbl_gauges.selectRow(0)
@@ -247,6 +254,40 @@ class TabTimeHistoryUiTests(unittest.TestCase):
             self.assertEqual(lines[1].get_linestyle(), "--")
             legend = self.tab.canvas.axes.get_legend()
             self.assertEqual([text.get_text() for text in legend.get_texts()], ["G1"])
+
+    def test_live_sim_time_extends_x_axis_above_data(self):
+        with tempfile.TemporaryDirectory() as td:
+            fo = os.path.join(td, "postProcessing", "gauges1d", "0")
+            os.makedirs(fo)
+            with open(os.path.join(fo, "p"), "w", encoding="utf-8") as handle:
+                handle.write("# Probe 0 (1.5 0 0)\n")
+                handle.write("0.0 101325\n")
+                handle.write("0.001 201325\n")
+            self.tab.set_source_provider(case_dir=lambda dim: td if dim == "1d" else "")
+            self.tab.tbl_gauges.selectRow(0)
+            self.tab.add_selected()
+            self.tab._redraw_plot()
+            before = self.tab.canvas.axes.get_xlim()[1]
+            self.tab.note_sim_progress("1D", 0.05)
+            self.tab._redraw_plot()
+            after = self.tab.canvas.axes.get_xlim()[1]
+            self.assertGreater(after, 0.05)
+            self.assertGreater(after, before)
+            _lo, hi = padded_axis_limits(0.0, 0.05)
+            self.assertAlmostEqual(after, hi)
+
+
+class ProbeHistoryIncompleteTests(unittest.TestCase):
+    def test_parse_skips_incomplete_trailing_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "p")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("# Probe 0 (1 0 0)\n")
+                handle.write("0.0 101325\n")
+                handle.write("0.002 201")
+            _locs, times, columns = parse_probe_history(path)
+            self.assertEqual(times, [0.0])
+            self.assertEqual(columns[0], [101325.0])
 
 
 class TabTimeHistoryAppWireTests(unittest.TestCase):

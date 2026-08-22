@@ -30,6 +30,8 @@ from ui_metrics import COMPUTATIONAL_LEFT_PANEL_MIN, COMPUTATIONAL_LEFT_PANEL_WI
 
 DEFAULT_P_ATM = 101325.0
 PROBE_FO = {"1d": "gauges1d", "2d": "probes2d", "3d": "probes3d"}
+PLOT_PAD = 0.12
+_DIM_FROM_MODE = {"1D": "1d", "2D": "2d", "3D": "3d", "1d": "1d", "2d": "2d", "3d": "3d"}
 GAUGE_COLORS = (
     "#1f77b4",
     "#d62728",
@@ -142,6 +144,8 @@ def parse_probe_history(path: str) -> Tuple[List[str], List[float], List[List[fl
             lines = handle.readlines()
     except OSError:
         return locations, times, columns
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        lines = lines[:-1]
     for raw in lines:
         line = raw.strip()
         if not line:
@@ -181,6 +185,25 @@ def wrap_legend_name(name: str, max_chars: int) -> str:
     return textwrap.fill(text, width=width, break_long_words=True, break_on_hyphens=True)
 
 
+def padded_axis_limits(
+    low: float,
+    high: float,
+    *,
+    pad: float = PLOT_PAD,
+    pin_zero: bool = True,
+) -> Tuple[float, float]:
+    """Keep data inside the axes with a little headroom above the peak."""
+    lo = float(low)
+    hi = float(high)
+    if pin_zero:
+        lo = min(lo, 0.0)
+        hi = max(hi, 0.0)
+    span = hi - lo
+    if span <= 0.0:
+        span = max(abs(hi), 1.0)
+    return lo, hi + span * pad
+
+
 class TabTimeHistory(QWidget):
     """Main-tab viewer: filter gauges, add series, plot live probe histories."""
 
@@ -194,6 +217,7 @@ class TabTimeHistory(QWidget):
         self._impulse_ok_fn: Callable[[], bool] = lambda: True
         self._rows: List[GaugeRow] = []
         self._added: List[Tuple[str, int]] = []
+        self._sim_time = {"1d": 0.0, "2d": 0.0, "3d": 0.0}
         self._plot_timer = QTimer(self)
         self._plot_timer.setSingleShot(True)
         self._plot_timer.setInterval(50)
@@ -401,6 +425,17 @@ class TabTimeHistory(QWidget):
     def refresh_plot(self) -> None:
         self._plot_timer.start()
 
+    def note_sim_progress(self, mode: str, time_s: float) -> None:
+        """Track live solver time so the plot grows with the current run."""
+        dim = _DIM_FROM_MODE.get(str(mode), "")
+        if dim:
+            try:
+                self._sim_time[dim] = max(self._sim_time.get(dim, 0.0), float(time_s))
+            except (TypeError, ValueError):
+                pass
+        if self.has_series():
+            self.refresh_plot()
+
     def _active_fields(self) -> List[str]:
         fields: List[str] = []
         if self.chk_pressure.isChecked():
@@ -432,6 +467,8 @@ class TabTimeHistory(QWidget):
         plotted = False
         wrap_chars = self._legend_wrap_chars()
         lookup = {row.key: row for row in self._rows}
+        all_times: List[float] = []
+        all_values: List[float] = []
         for key in self._added:
             row = lookup.get(key)
             if row is None:
@@ -456,9 +493,12 @@ class TabTimeHistory(QWidget):
                 label = "_nolegend_" if both_fields and field == "impulse" else wrapped
                 axes.plot(times, values, color=color, linestyle=style, label=label)
                 plotted = True
+                all_times.extend(times)
+                all_values.extend(v for v in values if v == v)
         only_impulse = fields == ["impulse"]
         axes.set_xlabel("Time (s)")
         axes.set_ylabel("Impulse" if only_impulse else "Overpressure (Pa)")
+        self._apply_live_limits(axes, all_times, all_values)
         if plotted:
             axes.legend(
                 loc="center left",
@@ -469,6 +509,21 @@ class TabTimeHistory(QWidget):
             )
         axes.grid(True, alpha=0.3)
         self.canvas.draw_idle()
+
+    def _live_sim_time(self) -> float:
+        latest = 0.0
+        for dim, _index in self._added:
+            latest = max(latest, float(self._sim_time.get(dim, 0.0) or 0.0))
+        return latest
+
+    def _apply_live_limits(self, axes, times: Sequence[float], values: Sequence[float]) -> None:
+        t_max = max(times) if times else 0.0
+        t_max = max(t_max, self._live_sim_time())
+        x0, x1 = padded_axis_limits(0.0, t_max)
+        axes.set_xlim(x0, x1)
+        if values:
+            y0, y1 = padded_axis_limits(min(values), max(values))
+            axes.set_ylim(y0, y1)
 
     @staticmethod
     def _fmt(value: float) -> str:

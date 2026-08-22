@@ -2733,8 +2733,7 @@ class BlastFoamApp(QMainWindow):
                     request()
         elif mode == "3D":
             self.status_bar.update_3d(step=step_n, tt=sim_time_s, dt=dt_val)
-        if self.tab_time_history.has_series():
-            self.tab_time_history.refresh_plot()
+        self.tab_time_history.note_sim_progress(mode, sim_time_s)
 
     def _time_history_case_dir(self, dim: str) -> str:
         if dim == "1d":
