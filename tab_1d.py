@@ -132,6 +132,7 @@ class Tab1D(QWidget):
         self._probe_fields = ("p", "impulse")
         self._enable_impulse = True
         self._enable_dynamic_pressure = False
+        self._gauge_locations = ()
 
         self.setup_ui()
         self.recalc_stats()
@@ -166,7 +167,45 @@ class Tab1D(QWidget):
             probe_fields=tuple(getattr(self, "_probe_fields", ("p", "impulse"))),
             enable_impulse=bool(getattr(self, "_enable_impulse", True)),
             enable_dynamic_pressure=bool(getattr(self, "_enable_dynamic_pressure", False)),
+            gauge_locations=tuple(getattr(self, "_gauge_locations", ()) or ()),
+            material_name=self.combo_comp.currentText(),
         )
+
+    def set_case_inputs(self, data: dict) -> None:
+        """Restore persisted 1D inputs without changing control semantics."""
+        values = dict(data)
+        material_name = str(values.get("material_name") or "")
+        if self.combo_comp.findText(material_name) < 0:
+            material_name = "Custom"
+        self.combo_comp.blockSignals(True)
+        try:
+            self.combo_comp.setCurrentText(material_name or "Custom")
+            for widget, key in (
+                (self.spin_radius, "radius"),
+                (self.spin_cellsize, "cell_size"),
+                (self.spin_press, "p_atm"),
+                (self.spin_temp, "t_atm"),
+                (self.spin_mass, "mass_kg"),
+                (self.spin_density, "rho_charge"),
+                (self.spin_cfl, "max_cfl"),
+                (self.spin_endtime, "end_time_s"),
+                (self.spin_gui_refresh, "probe_write_interval_steps"),
+            ):
+                if key in values:
+                    widget.setValue(values[key])
+            if "energy_j_per_kg" in values:
+                self.edit_energy.setText(f"{float(values['energy_j_per_kg']):.12g}")
+            if "right_boundary" in values:
+                self.cmb_right.setCurrentText(str(values["right_boundary"]))
+            self._probe_fields = tuple(values.get("probe_fields") or ("p",))
+            self._enable_impulse = bool(values.get("enable_impulse", True))
+            self._enable_dynamic_pressure = bool(
+                values.get("enable_dynamic_pressure", False)
+            )
+            self.set_gauge_locations(tuple(values.get("gauge_locations") or ()))
+        finally:
+            self.combo_comp.blockSignals(False)
+        self.recalc_stats()
 
     def apply_output_gauges(self, fields: tuple, *, impulse: bool, dynamic_pressure: bool) -> None:
         """Store gauge field list from Output File Options (1D probes)."""
@@ -176,6 +215,11 @@ class Tab1D(QWidget):
         self._probe_fields = names
         self._enable_impulse = bool(impulse)
         self._enable_dynamic_pressure = bool(dynamic_pressure)
+
+    def set_gauge_locations(self, locations: tuple) -> None:
+        self._gauge_locations = tuple(
+            (float(radius), str(label)) for radius, label in (locations or ())
+        )
 
     def get_selected_material_properties(self):
         mat_name = self.combo_comp.currentText()

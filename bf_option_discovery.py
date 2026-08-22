@@ -23,6 +23,26 @@ DECOMPOSITION_METHOD_BUILTIN: List[str] = ["scotch", "simple", "hierarchical", "
 _cache: dict = {}
 
 
+def _deduplicate_scan_roots(root_dirs: List[str]) -> List[str]:
+    """Return the smallest set of roots covering the same directory trees."""
+    candidates = {
+        os.path.normcase(os.path.abspath(root))
+        for root in root_dirs
+        if root and os.path.isdir(root)
+    }
+    roots: List[str] = []
+    for candidate in sorted(candidates, key=lambda path: (len(path), path)):
+        try:
+            covered = any(
+                os.path.commonpath((candidate, parent)) == parent for parent in roots
+            )
+        except ValueError:
+            covered = False
+        if not covered:
+            roots.append(candidate)
+    return roots
+
+
 def _scan_file_for_tokens(path: str, patterns: List[Tuple[str, str]]) -> Set[str]:
     """Scan file at path for regex patterns; return set of first group matches."""
     out: Set[str] = set()
@@ -45,16 +65,15 @@ def _discover_phase_tokens(root_dirs: List[str]) -> Tuple[List[str], List[str], 
     eos_set: Set[str] = set(EOS_BUILTIN)
     act_set: Set[str] = set(ACTIVATION_BUILTIN)
     thermo_set: Set[str] = set(THERMO_BUILTIN)
-    for root in root_dirs:
-        if not root or not os.path.isdir(root):
-            continue
+    for root in _deduplicate_scan_roots(root_dirs):
         for dirpath, _dirnames, filenames in os.walk(root):
             for f in filenames:
                 if f != "phaseProperties":
                     continue
                 path = os.path.join(dirpath, f)
                 try:
-                    text = open(path, encoding="utf-8", errors="ignore").read()
+                    with open(path, encoding="utf-8", errors="ignore") as stream:
+                        text = stream.read()
                 except OSError:
                     continue
                 for m in re.finditer(r"equationOfState\s+(\w+)", text):
@@ -71,9 +90,7 @@ def _discover_phase_tokens(root_dirs: List[str]) -> Tuple[List[str], List[str], 
 def _discover_decomposition_methods(root_dirs: List[str]) -> List[str]:
     """Scan decomposeParDict for method tokens."""
     methods: Set[str] = set(DECOMPOSITION_METHOD_BUILTIN)
-    for root in root_dirs:
-        if not root or not os.path.isdir(root):
-            continue
+    for root in _deduplicate_scan_roots(root_dirs):
         for dirpath, _dirnames, filenames in os.walk(root):
             for f in filenames:
                 if f != "decomposeParDict":

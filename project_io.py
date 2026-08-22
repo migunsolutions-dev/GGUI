@@ -10,8 +10,9 @@ from types import SimpleNamespace
 from typing import Any, Dict, Protocol
 
 from charge_seed_plan import charge_dims_from_inputs, migrate_case_inputs_seed_fields
-from models import CaseInputs3D, ObstacleData
+from models import CaseInputs1D, CaseInputs3D, ObstacleData
 from models_2d import CaseInputs2D, MappingSource2D, ProbePoint2D
+from output_options import OutputFileOptions
 
 SCHEMA_VERSION = 2
 PROJECT_SUFFIX = ".ggui.json"
@@ -41,6 +42,11 @@ class _SupportsProbesDict(Protocol):
 
 class _SupportsProjectCapture2D(Protocol):
     def get_case_inputs(self) -> CaseInputs2D: ...
+    def set_case_inputs(self, data: dict) -> None: ...
+
+
+class _SupportsProjectCapture1D(Protocol):
+    def get_case_inputs(self) -> CaseInputs1D: ...
     def set_case_inputs(self, data: dict) -> None: ...
 
 
@@ -98,10 +104,21 @@ def _normalize_v2(payload: Dict[str, Any]) -> Dict[str, Any]:
             section.setdefault("display_only_fields", list(_DISPLAY_ONLY_2D_FIELDS))
         dimensions["2D"] = section
 
+    section_1d = dimensions.get("1D")
+    if isinstance(section_1d, dict):
+        section = dict(section_1d)
+        nested_1d = section.get("case_inputs")
+        if isinstance(nested_1d, dict):
+            section.setdefault("input_fields", sorted(nested_1d.keys()))
+            section.setdefault("display_only_fields", [])
+        dimensions["1D"] = section
+
     out["dimensions"] = dimensions
     available = out.get("dimensions_available")
     if not isinstance(available, list) or not available:
         available = ["3D"]
+        if "1D" in dimensions:
+            available.insert(0, "1D")
         if "2D" in dimensions:
             available.append("2D")
         out["dimensions_available"] = available
@@ -139,6 +156,7 @@ def build_project(
     *,
     probes: Dict[str, Any],
     gui_state: Dict[str, Any],
+    inputs_1d: CaseInputs1D | None = None,
     inputs_2d: CaseInputs2D | None = None,
     simulation_state_2d: str | None = None,
 ) -> Dict[str, Any]:
@@ -151,6 +169,15 @@ def build_project(
         }
     }
     dimensions_available = ["3D"]
+    if inputs_1d is not None:
+        case_inputs_1d = asdict(inputs_1d)
+        dimensions["1D"] = {
+            "model": "spherical-1d",
+            "case_inputs": case_inputs_1d,
+            "input_fields": sorted(case_inputs_1d.keys()),
+            "display_only_fields": [],
+        }
+        dimensions_available.insert(0, "1D")
     if inputs_2d is not None:
         case_inputs_2d = asdict(inputs_2d)
         undefined = list(getattr(inputs_2d, "undefined_keys", ()) or ())
@@ -201,18 +228,24 @@ def capture_project_payload(
     tab: _SupportsProjectCapture,
     probes_model: _SupportsProbesDict,
     tab_2d: _SupportsProjectCapture2D | None = None,
+    tab_1d: _SupportsProjectCapture1D | None = None,
     selected_primary_tab: str = "General 3D",
+    output_file_options: OutputFileOptions | None = None,
 ) -> Dict[str, Any]:
     """Capture dialog-independent project JSON from the live 3D GUI state."""
+    gui_state = {
+        "selected_primary_tab": selected_primary_tab,
+        "sections": [asdict(section) for section in tab.sections],
+        "obstacles": [asdict(obstacle) for obstacle in tab.obstacles],
+    }
+    if output_file_options is not None:
+        gui_state["output_file_options"] = asdict(output_file_options)
     return build_project(
         tab.get_case_inputs(),
         probes=probes_model.to_dict(),
+        inputs_1d=tab_1d.get_case_inputs() if tab_1d is not None else None,
         inputs_2d=tab_2d.get_case_inputs() if tab_2d is not None else None,
-        gui_state={
-            "selected_primary_tab": selected_primary_tab,
-            "sections": [asdict(section) for section in tab.sections],
-            "obstacles": [asdict(obstacle) for obstacle in tab.obstacles],
-        },
+        gui_state=gui_state,
     )
 
 
@@ -221,6 +254,7 @@ def apply_project_payload(
     probes_model: _SupportsProbesDict,
     project: Dict[str, Any],
     tab_2d: _SupportsProjectCapture2D | None = None,
+    tab_1d: _SupportsProjectCapture1D | None = None,
 ) -> None:
     """Apply a read_project() result to the 3D tab without file dialogs.
 
@@ -264,6 +298,8 @@ def apply_project_payload(
     tab.load_project_gui_state(project["gui_state"])
     if tab_2d is not None and project.get("inputs_2d") is not None:
         tab_2d.set_case_inputs(asdict(project["inputs_2d"]))
+    if tab_1d is not None and project.get("inputs_1d") is not None:
+        tab_1d.set_case_inputs(asdict(project["inputs_1d"]))
 
 
 def write_project_atomic(path: str, payload: Dict[str, Any]) -> None:
@@ -405,6 +441,15 @@ def _case_inputs_from_dict(data: Dict[str, Any]) -> CaseInputs3D:
     ):
         if values.get(key) is not None:
             values[key] = tuple(values[key])
+    for key in ("probe_fields", "section_fields", "obstacle_fields", "volume_fields"):
+        if key in values:
+            values[key] = tuple(values[key])
+    for key in ("probe_points", "surface_planes"):
+        if key in values:
+            values[key] = tuple(
+                tuple(item) if isinstance(item, list) else item
+                for item in values[key]
+            )
     obstacles = values.get("obstacles", [])
     if not isinstance(obstacles, list):
         raise ProjectFormatError("case_inputs.obstacles must be a list")
@@ -451,6 +496,36 @@ def _case_inputs_2d_from_dict(data: Dict[str, Any]) -> CaseInputs2D:
         raise ProjectFormatError(f"Invalid CaseInputs2D data: {exc}") from exc
 
 
+def _case_inputs_1d_from_dict(data: Dict[str, Any]) -> CaseInputs1D:
+    if not isinstance(data, dict):
+        raise ProjectFormatError("dimensions.1D.case_inputs must be a JSON object")
+    allowed = {f.name: f for f in fields(CaseInputs1D)}
+    unknown = sorted(set(data) - set(allowed))
+    if unknown:
+        raise ProjectFormatError(f"Unknown CaseInputs1D field(s): {', '.join(unknown)}")
+    required = [
+        name
+        for name, field_info in allowed.items()
+        if field_info.default is MISSING and field_info.default_factory is MISSING
+    ]
+    missing = [name for name in required if name not in data]
+    if missing:
+        raise ProjectFormatError(
+            f"Missing required 1D project field(s): {', '.join(missing)}"
+        )
+    values = dict(data)
+    for key in ("probe_fields", "gauge_locations"):
+        if key in values:
+            values[key] = tuple(
+                tuple(item) if isinstance(item, list) else item
+                for item in values[key]
+            )
+    try:
+        return CaseInputs1D(**values)
+    except (TypeError, ValueError) as exc:
+        raise ProjectFormatError(f"Invalid CaseInputs1D data: {exc}") from exc
+
+
 def read_project(path: str) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as stream:
@@ -480,6 +555,14 @@ def read_project(path: str) -> Dict[str, Any]:
     if isinstance(section_3d, dict) and isinstance(section_3d.get("case_inputs"), dict):
         case_inputs_raw = section_3d["case_inputs"]
     inputs = _case_inputs_from_dict(case_inputs_raw)
+    section_1d = dimensions.get("1D")
+    inputs_1d = None
+    if section_1d is not None:
+        if not isinstance(section_1d, dict):
+            raise ProjectFormatError("dimensions.1D must be a JSON object")
+        if section_1d.get("model") != "spherical-1d":
+            raise ProjectFormatError("Unsupported dimensions.1D model")
+        inputs_1d = _case_inputs_1d_from_dict(section_1d.get("case_inputs"))
     section_2d = dimensions.get("2D")
     inputs_2d = None
     if section_2d is not None:
@@ -501,6 +584,7 @@ def read_project(path: str) -> Dict[str, Any]:
     return {
         "payload": payload,
         "inputs": inputs,
+        "inputs_1d": inputs_1d,
         "inputs_2d": inputs_2d,
         "probes": probes,
         "gui_state": gui_state,

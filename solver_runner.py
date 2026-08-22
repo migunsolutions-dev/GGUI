@@ -3,6 +3,7 @@ import os
 import re
 import time
 import subprocess
+import threading
 from typing import Optional, Tuple, List
 
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -14,7 +15,12 @@ from execution_plan import (  # noqa: F401 — re-export for existing imports
     ExecutionPreparationError,
     build_execution_plan,
 )
-from wsl_runtime import build_case_command_argv, to_wsl_path_and_distro
+from wsl_runtime import (
+    build_case_command_argv,
+    popen_group_kwargs,
+    terminate_process_tree,
+    to_wsl_path_and_distro,
+)
 
 # Number of tail lines to capture from each log file for debug_summary.txt
 DEBUG_TAIL_LINES = 50
@@ -159,6 +165,8 @@ class SolverRunner(QThread):
         self.cores = max(1, int(cores))
         self.intent = ExecutionIntent(intent)
         self.keep_running = True
+        self._stop_requested = False
+        self._process_lock = threading.Lock()
         self._proc: Optional[subprocess.Popen] = None
 
         self._probe_file: Optional[str] = None
@@ -186,18 +194,22 @@ class SolverRunner(QThread):
 
     def stop(self) -> None:
         self.keep_running = False
-        if self._proc and self._proc.poll() is None:
-            try:
-                self.status_signal.emit("Stopping solver...")
-                self._proc.terminate()
-                for _ in range(40):
-                    if self._proc.poll() is not None:
-                        break
-                    time.sleep(0.05)
-                if self._proc.poll() is None:
-                    self._proc.kill()
-            except Exception:
-                pass
+        self._stop_requested = True
+        with self._process_lock:
+            solver = self._proc
+            reconstruct = self._reconstruct_proc
+        if solver and solver.poll() is None:
+            self.status_signal.emit("Stopping solver...")
+            terminate_process_tree(solver)
+        if (
+            reconstruct is not None
+            and reconstruct is not solver
+            and reconstruct.poll() is None
+        ):
+            terminate_process_tree(reconstruct)
+        with self._process_lock:
+            if self._reconstruct_proc is reconstruct:
+                self._reconstruct_proc = None
 
     @staticmethod
     def _win_unc_to_wsl_path_and_distro(win_path: str) -> Tuple[Optional[str], str]:
@@ -389,13 +401,18 @@ class SolverRunner(QThread):
         cmd = "reconstructPar -newTimes > log.reconstructPar 2>&1"
         try:
             args = self._build_wsl_cmd(self._linux_case_dir, cmd)
-            self._reconstruct_proc = subprocess.Popen(
-                args,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            with self._process_lock:
+                if self._stop_requested or not self.keep_running:
+                    return
+                self._reconstruct_proc = subprocess.Popen(
+                    args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    **popen_group_kwargs(),
+                )
         except Exception:
-            self._reconstruct_proc = None
+            with self._process_lock:
+                self._reconstruct_proc = None
 
     def _wait_for_inflight_reconstruction(self, timeout_s: float = 120.0) -> bool:
         """Wait for any in-flight reconstructPar -newTimes process.
@@ -447,17 +464,28 @@ class SolverRunner(QThread):
             )
             return 1
         self.status_signal.emit("Final reconstruction (reconstructPar -latestTime)...")
+        proc = None
         try:
             args = self._build_wsl_cmd(self._linux_case_dir, FINAL_RECONSTRUCT_CMD)
-            completed = subprocess.run(
-                args,
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return int(completed.returncode)
+            with self._process_lock:
+                if self._stop_requested or not self.keep_running:
+                    return 1
+                proc = subprocess.Popen(
+                    args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    **popen_group_kwargs(),
+                )
+                self._reconstruct_proc = proc
+            while proc.poll() is None:
+                time.sleep(0.05)
+            return int(proc.returncode)
         except Exception:
             return 1
+        finally:
+            with self._process_lock:
+                if self._reconstruct_proc is proc:
+                    self._reconstruct_proc = None
 
     def _check_watchdog_trigger(self, case_dir: str) -> None:
         """Stop when the shock has arrived at the target radius (peak-and-fall or strong p)."""
@@ -516,16 +544,7 @@ class SolverRunner(QThread):
         if elapsed < self._watchdog_grace_seconds:
             return
         self.keep_running = False
-        try:
-            self._proc.terminate()
-            for _ in range(40):
-                if self._proc.poll() is not None:
-                    break
-                time.sleep(0.05)
-            if self._proc.poll() is None:
-                self._proc.kill()
-        except Exception:
-            pass
+        terminate_process_tree(self._proc)
 
     def _read_new_probe_lines(self) -> Optional[Tuple[float, List[float], int, float]]:
         if not self._probe_file:
@@ -582,7 +601,11 @@ class SolverRunner(QThread):
         self.status_signal.emit(f"Running: {self.intent.value}")
         args = self._build_wsl_cmd(linux_dir, execution.command)
         try:
-            self._proc = subprocess.Popen(args)
+            with self._process_lock:
+                if self._stop_requested or not self.keep_running:
+                    self.finished_signal.emit(False)
+                    return
+                self._proc = subprocess.Popen(args, **popen_group_kwargs())
         except Exception as e:
             self.status_signal.emit(
                 f"Failed command `{execution.command}`: {e}. Log: {execution.log_name}"

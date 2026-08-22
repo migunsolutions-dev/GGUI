@@ -4,7 +4,7 @@ Dialogs for the BlastFoam GUI.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from PyQt5.QtWidgets import (
     QButtonGroup,
@@ -31,12 +31,17 @@ from PyQt5.QtCore import Qt
 from output_options import (
     GAUGE_LABELS_1D,
     GAUGE_LABELS_2D,
+    QUANTITY_COLUMN_LABELS_3D,
+    QUANTITY_COLUMNS_3D,
+    QUANTITY_ROWS_3D,
+    REMAP_2D_FILENAME,
     VTK_KEYS_2D,
     Dim1DOutput,
     Dim2DOutput,
     Dim3DOutput,
     GaugeFlags,
     OutputFileOptions,
+    default_3d_quantities,
 )
 
 
@@ -320,6 +325,7 @@ class OutputFileOptionsDialog(QDialog):
         self._gauges_2d: Dict[str, QCheckBox] = {}
         self._vtk_2d: Dict[str, QCheckBox] = {}
         self._gauges_3d: Dict[str, QCheckBox] = {}
+        self._qty_3d: Dict[Tuple[str, str], QCheckBox] = {}
         self._build()
         self._load(self._initial)
 
@@ -380,12 +386,24 @@ class OutputFileOptionsDialog(QDialog):
             g.setObjectName(f"chk2dGauge_{key}")
             self._gauges_2d[key] = g
             grid.addWidget(g, row, 1, Qt.AlignCenter)
-            if key in VTK_KEYS_2D and key != "dynamic_pressure":
+            if key in VTK_KEYS_2D:
                 v = QCheckBox()
                 v.setObjectName(f"chk2dVtk_{key}")
                 self._vtk_2d[key] = v
                 grid.addWidget(v, row, 2, Qt.AlignCenter)
         layout.addLayout(grid)
+
+        remap_box = QGroupBox("Remap data")
+        remap_lay = QVBoxLayout(remap_box)
+        self.chk_remap_2d = QCheckBox("Output 2D remap data")
+        self.chk_remap_2d.setObjectName("chk2dRemapData")
+        remap_note = QLabel(
+            f'Remap data will be exported to "{REMAP_2D_FILENAME}" at the end-time of the simulation.'
+        )
+        remap_note.setWordWrap(True)
+        remap_lay.addWidget(self.chk_remap_2d)
+        remap_lay.addWidget(remap_note)
+        layout.addWidget(remap_box)
         layout.addStretch()
         return page
 
@@ -414,29 +432,25 @@ class OutputFileOptionsDialog(QDialog):
         form.addRow(self._rate_row(self.chk_volumes, self.rate_3d))
         layout.addWidget(vtk_box)
 
-        title = QLabel("Output quantities")
+        title = QLabel("Output Quantities")
         title.setStyleSheet("font-weight: bold;")
         layout.addWidget(title)
         grid = QGridLayout()
-        hdr = QLabel("Gauges")
-        hdr.setStyleSheet("font-weight: bold;")
-        hdr.setAlignment(Qt.AlignCenter)
-        grid.addWidget(hdr, 0, 1)
-        for row, (key, label) in enumerate(GAUGE_LABELS_2D, start=1):
+        for col, key in enumerate(QUANTITY_COLUMNS_3D, start=1):
+            hdr = QLabel(QUANTITY_COLUMN_LABELS_3D[key])
+            hdr.setStyleSheet("font-weight: bold;")
+            hdr.setAlignment(Qt.AlignCenter)
+            grid.addWidget(hdr, 0, col)
+        self._qty_3d = {}
+        for row, (key, label, cols) in enumerate(QUANTITY_ROWS_3D, start=1):
             grid.addWidget(QLabel(label), row, 0)
-            box = QCheckBox()
-            box.setObjectName(f"chk3dGauge_{key}")
-            self._gauges_3d[key] = box
-            grid.addWidget(box, row, 1, Qt.AlignCenter)
-        peak_row = len(GAUGE_LABELS_2D) + 1
-        grid.addWidget(QLabel("Peak overpressure"), peak_row, 0)
-        self.chk_peak_over = QCheckBox()
-        self.chk_peak_over.setObjectName("chk3dPeakOverpressure")
-        grid.addWidget(self.chk_peak_over, peak_row, 1, Qt.AlignCenter)
-        grid.addWidget(QLabel("Peak impulse"), peak_row + 1, 0)
-        self.chk_peak_imp = QCheckBox()
-        self.chk_peak_imp.setObjectName("chk3dPeakImpulse")
-        grid.addWidget(self.chk_peak_imp, peak_row + 1, 1, Qt.AlignCenter)
+            for col, column in enumerate(QUANTITY_COLUMNS_3D, start=1):
+                if column not in cols:
+                    continue
+                box = QCheckBox()
+                box.setObjectName(f"chk3dQty_{key}_{column}")
+                self._qty_3d[(key, column)] = box
+                grid.addWidget(box, row, col, Qt.AlignCenter)
         layout.addLayout(grid)
         layout.addStretch()
         return page
@@ -487,6 +501,7 @@ class OutputFileOptionsDialog(QDialog):
         }
         for key, box in self._vtk_2d.items():
             box.setChecked(bool(vtk_map.get(key, False)))
+        self.chk_remap_2d.setChecked(bool(d2.output_remap_data))
 
         d3 = opts.dim3d
         self.chk_surfaces.setChecked(d3.write_surfaces)
@@ -501,27 +516,17 @@ class OutputFileOptionsDialog(QDialog):
         self.rate_3d.spin_time.setValue(d3.vtk_time_s)
         self.rate_3d.spin_steps.setValue(d3.vtk_steps)
         self.rate_3d.set_enabled_rate(d3.write_volumes)
-        g3 = d3.gauges
-        mapping_3d = {
-            "pressure": g3.pressure,
-            "impulse": g3.impulse,
-            "density": g3.density,
-            "velocity": g3.velocity,
-            "mass_fractions": g3.mass_fractions,
-            "temperature": g3.temperature,
-            "energy": g3.energy,
-            "dynamic_pressure": g3.dynamic_pressure,
-        }
-        for key, box in self._gauges_3d.items():
-            box.setChecked(bool(mapping_3d.get(key, False)))
-        self.chk_peak_over.setChecked(d3.peak_overpressure)
-        self.chk_peak_imp.setChecked(d3.peak_impulse)
+        table = d3.quantities or default_3d_quantities()
+        for (key, column), box in self._qty_3d.items():
+            box.setChecked(bool(table.get(key, {}).get(column, False)))
 
     def get_options(self) -> OutputFileOptions:
         g1 = _flags_from_checks(self._gauges_1d)
         g2 = _flags_from_checks(self._gauges_2d)
         v2 = _flags_from_checks(self._vtk_2d)
-        g3 = _flags_from_checks(self._gauges_3d)
+        g3_table = default_3d_quantities()
+        for (key, column), box in self._qty_3d.items():
+            g3_table.setdefault(key, {})[column] = box.isChecked()
         return OutputFileOptions(
             dim1d=Dim1DOutput(gauges=g1),
             dim2d=Dim2DOutput(
@@ -530,6 +535,7 @@ class OutputFileOptionsDialog(QDialog):
                 vtk_steps=self.rate_2d.steps(),
                 gauges=g2,
                 vtk=v2,
+                output_remap_data=self.chk_remap_2d.isChecked(),
             ),
             dim3d=Dim3DOutput(
                 write_surfaces=self.chk_surfaces.isChecked(),
@@ -540,9 +546,7 @@ class OutputFileOptionsDialog(QDialog):
                 vtk_by_time=self.rate_3d.by_time(),
                 vtk_time_s=self.rate_3d.time_s(),
                 vtk_steps=self.rate_3d.steps(),
-                gauges=g3,
-                peak_overpressure=self.chk_peak_over.isChecked(),
-                peak_impulse=self.chk_peak_imp.isChecked(),
+                quantities=g3_table,
             ),
         )
 

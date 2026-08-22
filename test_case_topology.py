@@ -345,13 +345,19 @@ class RoutingAndExternalLoadTests(unittest.TestCase):
                 "main_new.load_case",
                 return_value={"_load_summary": summary, "domain_Lx": 1.0},
             ) as mocked_load:
-                with mock.patch.object(self.win.tab_3d, "set_case_inputs") as set_inputs:
+                with mock.patch.object(self.win.tab_3d, "set_case_inputs") as set_inputs, \
+                     mock.patch.object(self.win.tab_3d.viewer, "load_case") as viewer_load:
                     value = self.win.open_openfoam_case_path(str(root))
             self.assertEqual(value, CaseDimension.GENERAL_3D.value)
             self.assertIs(self.win.tabs.currentWidget(), self.win.tab_3d)
             self.assertEqual(self.win.active_case_dir_3d, os.path.normpath(str(root)))
             mocked_load.assert_called_once()
             set_inputs.assert_called_once()
+            viewer_load.assert_called_once()
+            self.assertEqual(
+                os.path.normpath(viewer_load.call_args.args[0]),
+                os.path.normpath(str(root)),
+            )
 
     def test_external_report_and_initialize_guard(self):
         with tempfile.TemporaryDirectory() as td:

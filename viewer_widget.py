@@ -227,7 +227,7 @@ class BlastViewerWidget(QWidget):
         self.current_field = name
         if name not in self.field_settings:
             self.field_settings[name] = FieldViewSettings()
-        self.refresh_view()
+        self.force_refresh_view()
 
     def set_field_range(self, mn, mx, auto):
         if self.current_field in self.field_settings:
@@ -235,15 +235,15 @@ class BlastViewerWidget(QWidget):
             s.min_val = mn
             s.max_val = mx
             s.auto_scale = auto
-            self.refresh_view()
+            self.force_refresh_view()
     
     def toggle_mesh_lines(self, state):
         self.show_mesh_lines = state
-        self.refresh_view()
+        self.force_refresh_view()
     
     def toggle_boundaries(self, state):
         self.show_boundaries = state
-        self.refresh_view()
+        self.force_refresh_view()
 
     def force_refresh_view(self) -> None:
         """Force a full redraw (e.g. after viewport option change) even if time step unchanged."""
@@ -258,7 +258,7 @@ class BlastViewerWidget(QWidget):
 
     def toggle_tracers(self, state):
         self.show_tracers = state
-        self.refresh_view()
+        self.force_refresh_view()
 
     def set_log_scale(self, state: bool) -> None:
         for s in self.field_settings.values():
@@ -315,7 +315,7 @@ class BlastViewerWidget(QWidget):
     def update_sections(self, sections: List[SectionItem]):
         self.sections = sections
         if self.is_simulating:
-            self.refresh_view()
+            self.force_refresh_view()
         else:
             if self._last_preview_data:
                 self.update_preview(*self._last_preview_data)
@@ -446,10 +446,6 @@ class BlastViewerWidget(QWidget):
             self.update_preview(*self._last_preview_data)
             return
         if not self.is_simulating or not self.current_case_dir:
-            return
-
-        poly_points = os.path.join(self.current_case_dir, "constant", "polyMesh", "points")
-        if not os.path.exists(poly_points):
             return
 
         foam_file = os.path.join(self.current_case_dir, "case.foam")

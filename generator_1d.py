@@ -280,6 +280,25 @@ regions ( sphereToCell {{ centre (0 0 0); radius {float(charge_radius):.10g}; fi
             dynamic_pressure=bool(getattr(inputs, "enable_dynamic_pressure", False)),
             peaks=False,
         )
+        gauges_block = ""
+        user_gauges = tuple(getattr(inputs, "gauge_locations", ()) or ())
+        if user_gauges:
+            gauge_pts = []
+            for radius, _label in user_gauges:
+                r_i = max(r_min + 1e-7, min(float(radius), r_max_val - 1e-7))
+                v = vtx_spherical(r_i, theta_mid, 0.0)
+                gauge_pts.append(f"            ({v[0]:.6g} {v[1]:.6g} {v[2]:.6g})")
+            gauges_block = f"""
+    gauges1d
+    {{
+        type            probes;
+        libs            ("libfieldFunctionObjects.so");
+        fields          ({fields_txt});
+        writeControl    timeStep;
+        writeInterval   {probe_steps};
+        probeLocations  ( {os.linesep.join(gauge_pts)} );
+    }}
+"""
 
         cd = self._foam_header("controlDict", "dictionary", "system") + f"""
 application     blastFoam;
@@ -309,7 +328,7 @@ functions
         writeInterval   {probe_steps};
         probeLocations  ( {os.linesep.join(probe_points)} );
     }}
-    watchdog_probe
+{gauges_block}    watchdog_probe
     {{
         type            probes;
         libs            ("libfieldFunctionObjects.so");

@@ -213,12 +213,17 @@ def build_case_command_argv(
     return argv, path, safe
 
 
-def _popen_kwargs() -> dict:
+def popen_group_kwargs() -> dict:
     """Start children in a new session/group so cancel can target the tree."""
     if os.name == "nt":
         # CREATE_NEW_PROCESS_GROUP lets taskkill /T walk the host tree.
         return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
     return {"start_new_session": True}
+
+
+def _popen_kwargs() -> dict:
+    """Backward-compatible internal alias for existing tests and callers."""
+    return popen_group_kwargs()
 
 
 def run_wsl_command(

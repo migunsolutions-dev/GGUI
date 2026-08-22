@@ -336,14 +336,16 @@ class RunnerIntentTests(unittest.TestCase):
 
         inflight.poll.side_effect = poll
         runner._reconstruct_proc = inflight
+        final_proc = MagicMock()
+        final_proc.poll.return_value = 0
+        final_proc.returncode = 0
         with patch.object(runner, "_build_wsl_cmd", return_value=["true"]), \
-             patch("solver_runner.subprocess.run") as run_mock, \
+             patch("solver_runner.subprocess.Popen", return_value=final_proc) as popen_mock, \
              patch.object(runner, "status_signal"), \
              patch("solver_runner.time.sleep"):
-            run_mock.return_value = MagicMock(returncode=0)
             rc = runner._final_reconstruct_latest()
         self.assertEqual(rc, 0)
-        run_mock.assert_called_once()
+        popen_mock.assert_called_once()
         self.assertGreaterEqual(polls["n"], 3)
 
     def test_final_reconstruct_timeout_does_not_launch_second(self):
@@ -357,12 +359,12 @@ class RunnerIntentTests(unittest.TestCase):
         )
         statuses = []
         with patch.object(runner, "_wait_for_inflight_reconstruction", return_value=False), \
-             patch("solver_runner.subprocess.run") as run_mock, \
+             patch("solver_runner.subprocess.Popen") as popen_mock, \
              patch.object(runner, "status_signal") as status_sig:
             status_sig.emit.side_effect = lambda msg: statuses.append(msg)
             rc = runner._final_reconstruct_latest()
         self.assertEqual(rc, 1)
-        run_mock.assert_not_called()
+        popen_mock.assert_not_called()
         self.assertTrue(any("timeout" in s.lower() for s in statuses))
 
     def test_wait_timeout_terminates_and_kills_when_needed(self):

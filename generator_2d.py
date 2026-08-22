@@ -20,7 +20,7 @@ from charge_capture import CAPTURE_CELL_SAFETY, auto_charge_capture_radius_m
 from material_catalog import jwl_parameters
 from material_validation import validate_required_values
 from models_2d import CaseInputs2D
-from output_options import extra_function_objects
+from output_options import REMAP_2D_FILENAME, extra_function_objects
 from path_utils import win_to_wsl_path
 
 
@@ -465,6 +465,16 @@ snGradSchemes { default corrected; }
             dynamic_pressure=bool(getattr(inputs, "enable_dynamic_pressure", False)),
             peaks=False,
         )
+        remap_block = ""
+        if bool(getattr(inputs, "output_remap_data", False)):
+            remap_block = """    remapDump
+    {
+        type            writeObjects;
+        libs            ("libutilityFunctionObjects.so");
+        objects         (p U rho T alpha.c4);
+        writeControl    onEnd;
+    }
+"""
         probes_block = ""
         if probes:
             probes_block = f"""
@@ -501,7 +511,7 @@ timePrecision 10;
 runTimeModifiable true;
 functions
 {{
-{extras}{probes_block}}}
+{extras}{probes_block}{remap_block}}}
 """
         self._write_text(os.path.join(system, "controlDict"), control)
         decompose = (
@@ -526,10 +536,20 @@ set -e
 {init}
 {decompose}{solver} 2>&1 | tee log.blastFoam
 """
-        allclean = """#!/usr/bin/env bash
+        if bool(getattr(inputs, "output_remap_data", False)):
+            allrun += f"""
+latest=$(ls -1d [0-9]* 0.[0-9]* 2>/dev/null | sort -g | tail -1)
+{{
+  echo '/* GGUI 2D remap snapshot ({REMAP_2D_FILENAME}) */'
+  echo "time            ${{latest:-latest}};"
+  echo 'sourceCase      ".";'
+  echo 'fields          (p rho U T alpha.c4);'
+}} > {REMAP_2D_FILENAME}
+"""
+        allclean = f"""#!/usr/bin/env bash
 cd "$(dirname "$0")" || exit 1
 rm -rf processor* [1-9]* 0.[0-9]* constant/polyMesh postProcessing dynamicCode 2>/dev/null || true
-rm -f log.* *.foam 2>/dev/null || true
+rm -f log.* *.foam {REMAP_2D_FILENAME} 2>/dev/null || true
 rm -rf 0 2>/dev/null || true
 """
         self._write_text(os.path.join(case_dir, "Allrun"), allrun)

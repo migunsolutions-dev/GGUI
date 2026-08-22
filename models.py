@@ -57,6 +57,8 @@ class CaseInputs1D:
     probe_fields: Tuple[str, ...] = ("p", "impulse")
     enable_impulse: bool = True
     enable_dynamic_pressure: bool = False
+    gauge_locations: Tuple[Tuple[float, str], ...] = ()
+    material_name: str = ""
 
 @dataclass(frozen=True)
 class ObstacleData:
@@ -178,13 +180,18 @@ class CaseInputs3D:
     fast_run_mode: bool = True               # skip stage_check/log.stageVerification/checkMesh/check_charge_region/check_internal_patch in Allrun
     probe_points: Tuple[Vec3, ...] = ()
     probe_fields: Tuple[str, ...] = ("p",)
-    write_volumes: bool = True
+    write_volumes: bool = False
     write_surfaces: bool = True
     surface_write_by_time: bool = True
     surface_write_interval_time: float = 0.001
     surface_write_interval_steps: int = 25
     # (name, ox, oy, oz, nx, ny, nz) for VTK cutting planes
     surface_planes: Tuple[Tuple[str, float, float, float, float, float, float], ...] = ()
+    section_fields: Tuple[str, ...] = ("p", "overpressure", "impulse")
+    obstacle_fields: Tuple[str, ...] = ("p", "overpressure", "impulse")
+    volume_fields: Tuple[str, ...] = ()
+    write_arrival: bool = False
+    write_obstacle_id: bool = False
 
     # --- Charge outer refinement (snappyHexMesh refinement region); expert/legacy only ---
     # New cases: Off. Legacy None on load is migrated to True in project_io.

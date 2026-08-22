@@ -127,6 +127,7 @@ class CaseInputs2D:
     output_fields: Tuple[str, ...] = ("p", "rho", "T", "U", "alpha.c4")
     enable_impulse: bool = False
     enable_dynamic_pressure: bool = False
+    output_remap_data: bool = False
 
     # Display-only state. It is persisted but never consumed by generation.
     mirrored_view: bool = True

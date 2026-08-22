@@ -35,24 +35,7 @@ jobs:
 
       - name: Syntax / compile check
         run: |
-          python -m compileall -q \
-            allrun_commands.py \
-            axisymmetric_2d.py \
-            case_topology.py \
-            charge_seed_plan.py \
-            execution_plan.py \
-            external_case_workflow_2d.py \
-            generator_2d.py \
-            ggui_logging.py \
-            imported_case_mapping_2d.py \
-            material_catalog.py \
-            material_validation.py \
-            models_2d.py \
-            preparation_worker_qt.py \
-            project_io.py \
-            solver_runner.py \
-            state_machine_2d.py \
-            wsl_runtime.py
+          python -m compileall -q .
 
       - name: Core-module import checks
         env:

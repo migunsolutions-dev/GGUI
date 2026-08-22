@@ -195,6 +195,7 @@ class Tab2D(QWidget):
         self._last_1d_case_dir = ""
         self._enable_impulse = True
         self._enable_dynamic_pressure = False
+        self._output_remap_data = False
         self._preview_flush_timer = QTimer(self)
         self._preview_flush_timer.setSingleShot(True)
         self._preview_flush_timer.timeout.connect(self._flush_setup_preview)
@@ -1181,7 +1182,7 @@ class Tab2D(QWidget):
         )
         for field, label in labels:
             check = QCheckBox(label)
-            check.setChecked(field in ("p", "rho", "T", "U", "alpha.c4"))
+            check.setChecked(field == "p")
             self.output_checks[field] = check
             form.addRow(field + ":", check)
         layout.addWidget(group)
@@ -1324,7 +1325,7 @@ class Tab2D(QWidget):
         self.cmb_write_control.addItem("timeStep", "timeStep")
         self.cmb_write_control.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.cmb_write_control.setMaximumWidth(self.cmb_write_control.sizeHint().width())
-        self.spin_write_time = self._double(1e-5, 1e-12, 1e6, 9)
+        self.spin_write_time = self._double(0.001, 1e-12, 1e6, 9)
         self.spin_write_steps = self._int(100, 1)
         self.spin_cycle_write = self._int(0, 0)
         self.spin_cores = self._int(1, 1, 1024)
@@ -2017,6 +2018,17 @@ class Tab2D(QWidget):
             self.viewer.update_axisymmetric_preview(*preview)
         self._apply_info_mode_visibility()
 
+    def replace_probes(self, probes) -> None:
+        """Replace 2D probe table from Time History Locations."""
+        self.tbl_probes.setRowCount(0)
+        for probe in probes or ():
+            row = self.tbl_probes.rowCount()
+            self.tbl_probes.insertRow(row)
+            self.tbl_probes.setItem(row, 0, QTableWidgetItem(str(probe.name)))
+            self.tbl_probes.setItem(row, 1, QTableWidgetItem(f"{float(probe.radius):.6g}"))
+            self.tbl_probes.setItem(row, 2, QTableWidgetItem(f"{float(probe.height):.6g}"))
+        self.mark_stale()
+
     def _add_probe(self) -> None:
         row = self.tbl_probes.rowCount()
         self.tbl_probes.insertRow(row)
@@ -2068,6 +2080,7 @@ class Tab2D(QWidget):
                 self.output_checks[field].setChecked(bool(on))
         self._enable_impulse = bool(g.impulse)
         self._enable_dynamic_pressure = bool(g.dynamic_pressure)
+        self._output_remap_data = bool(getattr(dim2d, "output_remap_data", False))
 
     def get_case_inputs(self) -> CaseInputs2D:
         name = self.cmb_material.currentText()
@@ -2177,6 +2190,7 @@ class Tab2D(QWidget):
             ),
             enable_impulse=bool(getattr(self, "_enable_impulse", True)),
             enable_dynamic_pressure=bool(getattr(self, "_enable_dynamic_pressure", False)),
+            output_remap_data=bool(getattr(self, "_output_remap_data", False)),
             mirrored_view=self.cmb_view_mode.currentText() == "Mirrored View",
             show_mesh=self.chk_view_mesh.isChecked(),
             show_probes=self.chk_view_probes.isChecked(),
@@ -2314,6 +2328,8 @@ class Tab2D(QWidget):
                 self._enable_impulse = bool(values["enable_impulse"])
             if "enable_dynamic_pressure" in values:
                 self._enable_dynamic_pressure = bool(values["enable_dynamic_pressure"])
+            if "output_remap_data" in values:
+                self._output_remap_data = bool(values["output_remap_data"])
         finally:
             if manage_loading:
                 self._loading = False

@@ -1,4 +1,5 @@
 import json
+import math
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem,
     QFileDialog, QMessageBox, QLabel
@@ -96,6 +97,10 @@ class TabProbes(QWidget):
         try:
             val = float(text)
         except ValueError:
+            self._refresh_from_model()
+            return
+        if not math.isfinite(val):
+            self._refresh_from_model()
             return
 
         if col == 1:

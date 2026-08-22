@@ -19,6 +19,8 @@ from PyQt5.QtGui import QIcon, QFont, QFontMetrics
 from tab_1d import Tab1D
 from tab_2d import Tab2D
 from dialogs import OutputFileOptionsDialog
+from time_history_dialog import TimeHistoryLocationsDialog
+from output_options import OutputFileOptions, output_file_options_from_dict
 from tab_log import LogTab
 from tab_3d_general import TabGeneral3D
 from tab_probes import TabProbes
@@ -63,7 +65,6 @@ try:
     from verification.verify_output import get_charge_cell_count
 except ImportError:
     get_charge_cell_count = None  # optional for case_init_mode.json update
-# from dialogs import TimeHistoryLocationsDialog, OutputFileOptionsDialog  # Not yet implemented
 
 
 class InfoPanel(QFrame):
@@ -452,13 +453,14 @@ class BlastFoamApp(QMainWindow):
         self._prep_result_handled = False
         self._force_sync_prep = False  # older tests may set True; prefer async tests
         self._pending_exact_end_after_prep = False
+        self._run_user_interrupted = False
         self._ui_review = None  # attached only by ui_preview / tests
         self.active_case_dir_3d = None
         self.active_case_initialized_3d = False
         self.active_case_dir_2d = None
         self.active_case_initialized_2d = False
         self.current_project_path = None
-        self.view_timer = QTimer()
+        self.view_timer = QTimer(self)
         self.view_timer.timeout.connect(self.check_3d_updates)
         
         # Build UI
@@ -513,6 +515,24 @@ class BlastFoamApp(QMainWindow):
     def closeEvent(self, event):
         """Stop the solver and close VTK windows while Qt HWNDs are still valid."""
         self.view_timer.stop()
+        prep_worker = self._prep_worker
+        if prep_worker is not None and self._prep_is_active():
+            prep_worker.request_cancel()
+            if prep_worker.isRunning() and not prep_worker.wait(5000):
+                self.status_bar.set_status(
+                    "Waiting for preparation to stop before closing…", "#e67e22"
+                )
+                event.ignore()
+                return
+        if self.runner and self.runner.isRunning():
+            self.runner.stop()
+            if not self.runner.wait(3000):
+                self.status_bar.set_status(
+                    "Waiting for solver to stop before closing…", "#e67e22"
+                )
+                event.ignore()
+                return
+        self.tab_jotter.stop_monitoring()
         # Shutdown order: stop updates first, then close each embedded plotter
         # before Qt destroys native children (prevents wglMakeCurrent on invalid handles).
         for tab_name in ("tab_2d", "tab_3d"):
@@ -523,9 +543,6 @@ class BlastFoamApp(QMainWindow):
             shutdown = getattr(viewer, "shutdown_viewer", None)
             if callable(shutdown):
                 shutdown()
-        if self.runner and self.runner.isRunning():
-            self.runner.stop()
-            self.runner.wait(3000)
         event.accept()
 
     def _init_toolbar(self):
@@ -573,6 +590,7 @@ class BlastFoamApp(QMainWindow):
         
         # Time history locations
         act_time_history = QAction("📍 Time History Locations", self)
+        act_time_history.setObjectName("actTimeHistoryLocations")
         act_time_history.setToolTip("Edit gauge/probe locations for time history output")
         act_time_history.triggered.connect(self._on_time_history_locations)
         toolbar.addAction(act_time_history)
@@ -621,6 +639,8 @@ class BlastFoamApp(QMainWindow):
         self.tab_jotter = LogTab()  # Keep exact name "Jotter"
         self.tab_plotter = self._create_placeholder_tab("Plotter", "Data plotting utility (not yet implemented)")
         self.tab_probes = TabProbes(self.probes_model)
+        self._output_file_options = OutputFileOptions()
+        self._apply_output_file_options(self._output_file_options)
         
         # Add tabs in specified order
         self.tabs.addTab(self.tab_1d, "Spherical – 1D")
@@ -657,7 +677,6 @@ class BlastFoamApp(QMainWindow):
         # Shared computational left-panel width across 1D / 2D / 3D (session-preserved).
         from ui_metrics import COMPUTATIONAL_LEFT_PANEL_WIDTH
         self._computational_left_width = COMPUTATIONAL_LEFT_PANEL_WIDTH
-        self.tabs.currentChanged.connect(self._on_main_tab_changed)
         for _tab in self._computational_tabs():
             if hasattr(_tab, "set_computational_left_width"):
                 _tab.set_computational_left_width(self._computational_left_width)
@@ -717,12 +736,6 @@ class BlastFoamApp(QMainWindow):
             if hasattr(tab, "set_computational_left_width"):
                 tab.set_computational_left_width(self._computational_left_width)
 
-    def _on_main_tab_changed(self, _index: int) -> None:
-        """Preserve shared left-panel width across 1D/2D/3D tab switches."""
-        self._sync_computational_left_width(
-            self.tabs.currentWidget(), record_from_current=False
-        )
-
     def _sync_computational_left_width(self, widget, record_from_current: bool = False) -> None:
         if widget not in self._computational_tabs():
             return
@@ -772,7 +785,21 @@ class BlastFoamApp(QMainWindow):
             return
         try:
             project = read_project(path)
-            apply_project_payload(self.tab_3d, self.probes_model, project, self.tab_2d)
+            apply_project_payload(
+                self.tab_3d,
+                self.probes_model,
+                project,
+                self.tab_2d,
+                self.tab_1d,
+            )
+            saved_output_options = project.get("gui_state", {}).get(
+                "output_file_options"
+            )
+            if isinstance(saved_output_options, dict):
+                self._output_file_options = output_file_options_from_dict(
+                    saved_output_options
+                )
+                self._apply_output_file_options(self._output_file_options)
             self.current_project_path = os.path.abspath(path)
             self.active_case_dir_3d = None
             self.active_case_initialized_3d = False
@@ -781,9 +808,12 @@ class BlastFoamApp(QMainWindow):
             selected = project.get("gui_state", {}).get(
                 "selected_primary_tab", "General 3D"
             )
-            self.tabs.setCurrentWidget(
-                self.tab_2d if selected == "Cylindrical – 2D" else self.tab_3d
-            )
+            selected_tabs = {
+                "Spherical – 1D": self.tab_1d,
+                "Cylindrical – 2D": self.tab_2d,
+                "General 3D": self.tab_3d,
+            }
+            self.tabs.setCurrentWidget(selected_tabs.get(selected, self.tab_3d))
             self.status_bar.set_status("Project loaded", "#2ecc71")
         except (ProjectFormatError, OSError, TypeError, ValueError) as exc:
             QMessageBox.critical(self, "Open Project Error", str(exc))
@@ -868,6 +898,14 @@ class BlastFoamApp(QMainWindow):
         self.tabs.setCurrentWidget(self.tab_3d)
         self.active_case_dir_3d = case_dir
         self.active_case_initialized_3d = os.path.isdir(os.path.join(case_dir, "0"))
+        loaded_inputs = self.tab_3d.get_case_inputs()
+        self.tab_3d.viewer.load_case(
+            case_dir,
+            charge_center=loaded_inputs.charge_center,
+            cell_size=loaded_inputs.cell_size,
+        )
+        selected_field = self.tab_3d.cmb_field.currentText().strip() or "p"
+        self.tab_3d.viewer.set_field(selected_field)
         self.current_project_path = None
         self._show_load_summary_dialog(case_dir, load_summary)
         return CaseDimension.GENERAL_3D.value
@@ -1186,7 +1224,7 @@ class BlastFoamApp(QMainWindow):
             setter(name)
 
     def _on_prep_log(self, line: str) -> None:
-        log_tab = getattr(self, "tab_log", None)
+        log_tab = getattr(self, "tab_jotter", None)
         if log_tab is not None and hasattr(log_tab, "append_line"):
             try:
                 log_tab.append_line(line)
@@ -1658,16 +1696,18 @@ class BlastFoamApp(QMainWindow):
 
     def _save_project_to(self, path: str) -> bool:
         try:
-            selected = (
-                "Cylindrical – 2D"
-                if self.tabs.currentWidget() == self.tab_2d
-                else "General 3D"
-            )
+            selected = {
+                self.tab_1d: "Spherical – 1D",
+                self.tab_2d: "Cylindrical – 2D",
+                self.tab_3d: "General 3D",
+            }.get(self.tabs.currentWidget(), "General 3D")
             payload = capture_project_payload(
                 self.tab_3d,
                 self.probes_model,
                 self.tab_2d,
+                self.tab_1d,
                 selected_primary_tab=selected,
+                output_file_options=self._output_file_options,
             )
             write_project_atomic(path, payload)
             self.status_bar.set_status("Project saved", "#2ecc71")
@@ -1675,88 +1715,6 @@ class BlastFoamApp(QMainWindow):
         except (OSError, TypeError, ValueError) as exc:
             QMessageBox.critical(self, "Save Project Error", f"Could not save project:\n{exc}")
             return False
-    
-    def _collect_output_file_options(self):
-        from output_options import (
-            Dim1DOutput,
-            Dim2DOutput,
-            Dim3DOutput,
-            GaugeFlags,
-            OutputFileOptions,
-        )
-
-        t1 = self.tab_1d
-        g1 = GaugeFlags(
-            overpressure="p" in getattr(t1, "_probe_fields", ("p",)),
-            impulse=bool(getattr(t1, "_enable_impulse", True)),
-            density="rho" in getattr(t1, "_probe_fields", ()),
-            velocity="U" in getattr(t1, "_probe_fields", ()),
-            mass_fractions="alpha.c4" in getattr(t1, "_probe_fields", ()),
-            temperature="T" in getattr(t1, "_probe_fields", ()),
-            energy="rhoE" in getattr(t1, "_probe_fields", ()),
-            dynamic_pressure=bool(getattr(t1, "_enable_dynamic_pressure", False)),
-        )
-        t2 = self.tab_2d
-        checks = getattr(t2, "output_checks", {})
-        def _on(name: str) -> bool:
-            box = checks.get(name)
-            return bool(box.isChecked()) if box is not None else False
-
-        vtk_by_time = t2.cmb_write_control.currentData() == "adjustableRunTime"
-        g2 = GaugeFlags(
-            pressure=_on("p"),
-            impulse=bool(getattr(t2, "_enable_impulse", True)),
-            density=_on("rho"),
-            velocity=_on("U"),
-            mass_fractions=_on("alpha.c4"),
-            temperature=_on("T"),
-            energy=False,
-            dynamic_pressure=bool(getattr(t2, "_enable_dynamic_pressure", False)),
-        )
-        v2 = GaugeFlags(
-            pressure=_on("p"),
-            impulse=False,
-            density=_on("rho"),
-            velocity=_on("U"),
-            mass_fractions=_on("alpha.c4"),
-            temperature=_on("T"),
-            energy=False,
-        )
-        t3 = self.tab_3d
-        fields3 = set(getattr(t3, "_probe_fields", ("p", "impulse")))
-        g3 = GaugeFlags(
-            pressure="p" in fields3,
-            impulse="impulse" in fields3,
-            density="rho" in fields3,
-            velocity="U" in fields3,
-            mass_fractions="alpha.c4" in fields3,
-            temperature="T" in fields3,
-            energy="rhoE" in fields3,
-            dynamic_pressure="dynamicPressure" in fields3,
-        )
-        return OutputFileOptions(
-            dim1d=Dim1DOutput(gauges=g1),
-            dim2d=Dim2DOutput(
-                vtk_by_time=bool(vtk_by_time),
-                vtk_time_s=float(t2.spin_write_time.value()),
-                vtk_steps=int(t2.spin_write_steps.value()),
-                gauges=g2,
-                vtk=v2,
-            ),
-            dim3d=Dim3DOutput(
-                write_surfaces=bool(getattr(t3, "_write_surfaces", True)),
-                surface_by_time=bool(getattr(t3, "_surface_by_time", True)),
-                surface_time_s=float(getattr(t3, "_surface_time_s", 0.001)),
-                surface_steps=int(getattr(t3, "_surface_steps", 25)),
-                write_volumes=bool(getattr(t3, "_write_volumes", True)),
-                vtk_by_time=t3.combo_write_control.currentText() == "adjustableRunTime",
-                vtk_time_s=float(t3.spin_write_time.value()),
-                vtk_steps=int(t3.spin_write.value()),
-                gauges=g3,
-                peak_overpressure=bool(getattr(t3, "_enable_post_processing", False)),
-                peak_impulse=bool(getattr(t3, "_enable_post_processing", False)),
-            ),
-        )
 
     def _apply_output_file_options(self, opts) -> None:
         g1 = opts.dim1d.gauges
@@ -1770,14 +1728,28 @@ class BlastFoamApp(QMainWindow):
 
     def _on_output_options(self):
         """Open Output File Options dialog"""
-        dialog = OutputFileOptionsDialog(self, self._collect_output_file_options())
+        dialog = OutputFileOptionsDialog(self, getattr(self, "_output_file_options", None) or OutputFileOptions())
         if dialog.exec_() != QDialog.Accepted:
             return
-        self._apply_output_file_options(dialog.get_options())
+        self._output_file_options = dialog.get_options()
+        self._apply_output_file_options(self._output_file_options)
     
     def _on_time_history_locations(self):
-        """Open Time History Locations dialog"""
-        QMessageBox.information(self, "Time History Locations", "Edit time history output locations: Still in progress...")
+        """Open Time History Locations dialog and apply gauges to 1D/2D/3D."""
+        dialog = TimeHistoryLocationsDialog(
+            self,
+            gauges_1d=getattr(self.tab_1d, "_gauge_locations", ()) or (),
+            probes_2d=self.tab_2d._probes(),
+            probes_3d=self.probes_model.probes(),
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        self.tab_1d.set_gauge_locations(dialog.gauges_1d())
+        self.tab_2d.replace_probes(dialog.probes_2d())
+        self.probes_model.replace_all(list(dialog.probes_3d()))
+        origin = dialog.remap_origin()
+        if origin is not None:
+            self.tab_3d.set_remap_origin(*origin)
     
     def _on_help(self):
         """Show help"""
@@ -2112,6 +2084,11 @@ class BlastFoamApp(QMainWindow):
 
     def run_2d_process_exact_end(self):
         """Initialize if needed, then continue the 2D case to configured endTime."""
+        if self.runner is not None and self.runner.isRunning():
+            QMessageBox.warning(
+                self, "exact END", "A solver process is already running."
+            )
+            return
         if getattr(self.tab_2d, "is_imported_mode", False):
             self.run_imported_2d_exact_end()
             return
@@ -2676,6 +2653,7 @@ class BlastFoamApp(QMainWindow):
             intent=intent,
         )
         self._active_run_mode = mode
+        self._run_user_interrupted = False
         # Queued delivery keeps status/viewport updates on the Qt GUI thread.
         self.runner.data_signal.connect(
             lambda p, t, s, dt: self.on_new_data(p, t, s, dt, mode),
@@ -2700,6 +2678,7 @@ class BlastFoamApp(QMainWindow):
             self._request_cancel_preparation()
             return
         if self.runner:
+            self._run_user_interrupted = True
             self.runner.stop()
             self.status_bar.stop_et_timing()
             self.status_bar.set_status("Interrupted", "#e67e22")
@@ -2772,10 +2751,12 @@ class BlastFoamApp(QMainWindow):
     def on_simulation_finished(self, success):
         """Handle simulation completion"""
         finished_mode = getattr(self, "_active_run_mode", None)
+        user_interrupted = bool(getattr(self, "_run_user_interrupted", False))
         self.view_timer.stop()
         self.tab_jotter.stop_monitoring()
         self.runner = None
         self._active_run_mode = None
+        self._run_user_interrupted = False
         self.status_bar.stop_et_timing()
         if finished_mode == "1D":
             self.tab_1d.end_live_graph()
@@ -2803,7 +2784,14 @@ class BlastFoamApp(QMainWindow):
                 else:
                     self.tab_2d.viewer.refresh_view()
         else:
-            if "Interrupted" not in self.status_bar.lbl_status.text():
+            if user_interrupted:
+                self.status_bar.set_status("Interrupted", "#e67e22")
+                if finished_mode == "2D":
+                    self.tab_2d.stop_live_follow_keep_time()
+                    if getattr(self.tab_2d, "is_imported_mode", False):
+                        self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_READY)
+                    self.tab_2d.set_simulation_state(SimulationState2D.INTERRUPTED)
+            else:
                 self.status_bar.set_status("Stopped/Failed", "#e74c3c")
                 if finished_mode == "2D":
                     self.tab_2d.stop_live_follow_keep_time()

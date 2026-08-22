@@ -22,7 +22,7 @@ from initialization_plan import (
 from mesh_domain import align_domain_to_cell_size
 from material_catalog import jwl_parameters
 from models import CaseInputs3D
-from output_options import extra_function_objects, section_plane_point, surfaces_vtk_block
+from output_options import extra_function_objects, obstacle_monitor_block, section_plane_point, surfaces_vtk_block
 from path_utils import get_latest_time_dir, win_to_wsl_path
 from startup_capture_guard import require_safe_capture
 
@@ -3610,7 +3610,7 @@ if __name__ == "__main__":
         extras = extra_function_objects(
             p_atm=float(inputs.p_atm),
             impulse=want_impulse or peaks,
-            overpressure=peaks,
+            overpressure=peaks or bool(getattr(inputs, "write_arrival", False)),
             dynamic_pressure=want_dyn,
             peaks=peaks,
         )
@@ -3645,14 +3645,40 @@ if __name__ == "__main__":
             patches = []
             if getattr(inputs, "obstacles", None):
                 patches = self._get_obstacle_patch_names(inputs)
-            surfaces_block = surfaces_vtk_block(
+            section_fields = tuple(getattr(inputs, "section_fields", ()) or ()) or ("p",)
+            obstacle_fields = tuple(getattr(inputs, "obstacle_fields", ()) or ())
+            write_oid = bool(getattr(inputs, "write_obstacle_id", False))
+            write_arrival = bool(getattr(inputs, "write_arrival", False))
+            if write_arrival and "overpressure" not in obstacle_fields:
+                obstacle_fields = obstacle_fields + ("overpressure",)
+            sections_part = surfaces_vtk_block(
+                name="sectionsVTK",
                 by_time=bool(getattr(inputs, "surface_write_by_time", True)),
                 interval_time=float(getattr(inputs, "surface_write_interval_time", 0.001)),
                 interval_steps=int(getattr(inputs, "surface_write_interval_steps", 25)),
-                fields=probe_fields,
+                fields=section_fields,
                 planes=planes,
-                patches=patches,
+                patches=(),
             )
+            obstacles_part = ""
+            if patches and (obstacle_fields or write_oid or write_arrival):
+                obstacles_part = surfaces_vtk_block(
+                    name="obstaclesVTK",
+                    by_time=bool(getattr(inputs, "surface_write_by_time", True)),
+                    interval_time=float(getattr(inputs, "surface_write_interval_time", 0.001)),
+                    interval_steps=int(getattr(inputs, "surface_write_interval_steps", 25)),
+                    fields=obstacle_fields or ("p",),
+                    planes=(),
+                    patches=patches,
+                )
+            arrival_part = obstacle_monitor_block(patches) if write_arrival and patches else ""
+            surfaces_block = sections_part + obstacles_part + arrival_part
+            if write_oid and patches:
+                id_lines = "\n".join(f"{name}    {i + 1};" for i, name in enumerate(patches))
+                self._write_text(
+                    os.path.join(case_dir, "obstacleIds"),
+                    self._foam_header("obstacleIds", "dictionary", "") + id_lines + "\n",
+                )
         if extras or probes_block or surfaces_block:
             cd_lines += [
                 "functions",
