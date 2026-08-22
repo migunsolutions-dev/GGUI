@@ -14,7 +14,7 @@ from typing import Iterable, Optional
 from ui_metrics import DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH
 
 
-TAB_CHOICES = ("1d", "2d", "3d")
+TAB_CHOICES = ("1d", "2d", "3d", "time_history")
 STATE_CHOICES = ("ready", "initialized", "running", "completed")
 
 # States applied only through public UI/status APIs. Never invent physics.
@@ -22,6 +22,7 @@ _TAB_STATES = {
     "1d": frozenset({"ready", "running"}),
     "2d": frozenset({"ready", "initialized", "running", "completed"}),
     "3d": frozenset({"ready", "running"}),
+    "time_history": frozenset({"ready"}),
 }
 
 
@@ -61,6 +62,7 @@ def select_tab(window, tab: str):
         "1d": getattr(window, "tab_1d", None),
         "2d": getattr(window, "tab_2d", None),
         "3d": getattr(window, "tab_3d", None),
+        "time_history": getattr(window, "tab_time_history", None),
     }
     widget = mapping.get(tab)
     if widget is None:
@@ -98,7 +100,7 @@ def apply_preview_state(window, tab: str, state: str) -> None:
         if status is not None:
             status.set_status(label, color)
         return
-    # 1D / 3D: status chrome only.
+    # 1D / 3D / Time History: status chrome only.
     if state == "ready" and status is not None:
         status.set_status("Ready", "#2ecc71")
     elif state == "running" and status is not None:

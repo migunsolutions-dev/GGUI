@@ -1,0 +1,276 @@
+"""Time History Viewer catalog, filters, Add/Clear, and probe-file plot."""
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import unittest
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
+
+from PyQt5.QtWidgets import QApplication
+
+from models_2d import ProbePoint2D
+from probes_model import ProbePoint
+from tab_time_history import (
+    TabTimeHistory,
+    catalog_rows,
+    latest_probe_field_file,
+    parse_probe_history,
+    wrap_legend_name,
+)
+
+
+def _app():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    return app
+
+
+class CatalogRowsTests(unittest.TestCase):
+    def test_maps_1d_2d_3d_and_ignores_regions(self):
+        rows = catalog_rows(
+            gauges_1d=((1.5, "G1"),),
+            probes_2d=(ProbePoint2D("P1", 2.0, 0.5),),
+            probes_3d=(ProbePoint("Q1", 1.0, 2.0, 3.0),),
+        )
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0].gauge_id, "1D-1")
+        self.assertEqual(rows[0].x, 1.5)
+        self.assertEqual(rows[0].y, 0.0)
+        self.assertEqual(rows[0].z, 0.0)
+        self.assertEqual(rows[1].gauge_id, "2D-1")
+        self.assertEqual(rows[1].x, 2.0)
+        self.assertEqual(rows[1].y, 0.5)
+        self.assertEqual(rows[2].gauge_id, "3D-1")
+        self.assertEqual((rows[2].x, rows[2].y, rows[2].z), (1.0, 2.0, 3.0))
+
+
+class ProbeHistoryReaderTests(unittest.TestCase):
+    def test_parse_and_latest_field_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            fo = os.path.join(td, "postProcessing", "gauges1d", "0")
+            os.makedirs(fo)
+            path = os.path.join(fo, "p")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("# Probe 0 (1 0 0)\n")
+                handle.write("0.0 101325\n")
+                handle.write("0.001 201325\n")
+            found = latest_probe_field_file(td, "gauges1d", "p")
+            self.assertEqual(os.path.normpath(found), os.path.normpath(path))
+            locs, times, columns = parse_probe_history(path)
+            self.assertEqual(locs[0], "1 0 0")
+            self.assertEqual(times, [0.0, 0.001])
+            self.assertEqual(columns[0], [101325.0, 201325.0])
+
+
+class TabTimeHistoryUiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _app()
+
+    def setUp(self):
+        self.tab = TabTimeHistory()
+        self.tab.set_source_provider(
+            gauges_1d=lambda: ((1.5, "G1"), (3.0, "G2")),
+            probes_2d=lambda: (ProbePoint2D("P1", 2.0, 0.5),),
+            probes_3d=lambda: (ProbePoint("Q1", 1.0, 2.0, 3.0),),
+            case_dir=lambda dim: "",
+            p_atm=lambda dim: 101325.0,
+        )
+        self.tab.refresh_catalog()
+
+    def test_layout_defaults(self):
+        self.assertEqual(self.tab.chk_3d.text(), "3D")
+        self.assertEqual(self.tab.chk_2d.text(), "2D")
+        self.assertEqual(self.tab.chk_1d.text(), "1D")
+        self.assertEqual(self.tab.chk_regions.text(), "Regions")
+        self.assertTrue(self.tab.chk_3d.isChecked())
+        self.assertTrue(self.tab.chk_2d.isChecked())
+        self.assertTrue(self.tab.chk_1d.isChecked())
+        self.assertFalse(self.tab.chk_regions.isChecked())
+        self.assertEqual(self.tab.btn_add.text(), "Add")
+        self.assertEqual(self.tab.btn_clear.text(), "Clear")
+        self.assertTrue(self.tab.chk_pressure.isChecked())
+        self.assertFalse(self.tab.chk_impulse.isChecked())
+        headers = [
+            self.tab.tbl_gauges.horizontalHeaderItem(i).text()
+            for i in range(self.tab.tbl_gauges.columnCount())
+        ]
+        self.assertEqual(headers, ["ID", "X", "Y", "Z", "Label"])
+
+    def test_regions_checkbox_sits_below_3d(self):
+        self.tab.show()
+        self.tab.resize(450, 700)
+        self.app.processEvents()
+        self.assertGreater(self.tab.chk_regions.y(), self.tab.chk_3d.y())
+        self.assertLessEqual(abs(self.tab.chk_regions.x() - self.tab.chk_3d.x()), 8)
+        self.assertGreaterEqual(
+            self.tab.chk_regions.width(), self.tab.chk_regions.sizeHint().width()
+        )
+
+    def test_wrap_legend_name_breaks_long_labels(self):
+        self.assertEqual(wrap_legend_name("G1", 20), "G1")
+        wrapped = wrap_legend_name("VeryLongGaugeNameWithoutSpaces", 12)
+        self.assertIn("\n", wrapped)
+        self.assertLessEqual(max(len(part) for part in wrapped.split("\n")), 12)
+
+    def test_catalog_and_dimension_filters(self):
+        self.assertEqual(self.tab.tbl_gauges.rowCount(), 4)
+        self.tab.chk_1d.setChecked(False)
+        self.tab.chk_2d.setChecked(False)
+        self.app.processEvents()
+        self.assertEqual(self.tab.tbl_gauges.rowCount(), 1)
+        self.assertEqual(self.tab.tbl_gauges.item(0, 0).text(), "3D-1")
+        self.tab.chk_regions.setChecked(True)
+        self.app.processEvents()
+        self.assertEqual(self.tab.tbl_gauges.rowCount(), 1)
+
+    def test_add_and_clear_series(self):
+        self.tab.tbl_gauges.selectRow(0)
+        self.tab.add_selected()
+        self.assertEqual(self.tab.added_keys(), [("1d", 0)])
+        self.assertTrue(self.tab.has_series())
+        self.tab.clear_series()
+        self.assertEqual(self.tab.added_keys(), [])
+        self.assertFalse(self.tab.has_series())
+        self.assertEqual(self.tab.tbl_gauges.rowCount(), 4)
+
+    def test_synthetic_gauges1d_file_plots_overpressure(self):
+        with tempfile.TemporaryDirectory() as td:
+            fo = os.path.join(td, "postProcessing", "gauges1d", "0")
+            os.makedirs(fo)
+            with open(os.path.join(fo, "p"), "w", encoding="utf-8") as handle:
+                handle.write("# Probe 0 (1.5 0 0)\n")
+                handle.write("0.0 101325\n")
+                handle.write("0.001 201325\n")
+            self.tab.set_source_provider(case_dir=lambda dim: td if dim == "1d" else "")
+            self.tab.tbl_gauges.selectRow(0)
+            self.tab.add_selected()
+            self.tab._redraw_plot()
+            lines = self.tab.canvas.axes.lines
+            self.assertEqual(len(lines), 1)
+            xdata = list(lines[0].get_xdata())
+            ydata = list(lines[0].get_ydata())
+            self.assertEqual(xdata, [0.0, 0.001])
+            self.assertAlmostEqual(ydata[0], 0.0)
+            self.assertAlmostEqual(ydata[1], 100000.0)
+            self.assertEqual(self.tab.canvas.axes.get_ylabel(), "Overpressure (Pa)")
+            self.assertEqual(self.tab.canvas.axes.get_xlabel(), "Time (s)")
+            legend = self.tab.canvas.axes.get_legend()
+            self.assertIsNotNone(legend)
+            self.assertEqual([text.get_text() for text in legend.get_texts()], ["G1"])
+
+    def test_added_gauges_have_distinct_colors_and_right_legend(self):
+        self.tab.tbl_gauges.selectRow(0)
+        self.tab.add_selected()
+        self.tab.tbl_gauges.selectRow(1)
+        self.tab.add_selected()
+        self.tab._redraw_plot()
+        lines = self.tab.canvas.axes.lines
+        self.assertEqual(len(lines), 2)
+        self.assertNotEqual(lines[0].get_color(), lines[1].get_color())
+        legend = self.tab.canvas.axes.get_legend()
+        self.assertIsNotNone(legend)
+        self.assertEqual([text.get_text() for text in legend.get_texts()], ["G1", "G2"])
+        self.tab.show()
+        self.tab.resize(1100, 700)
+        self.app.processEvents()
+        self.tab.canvas.draw_idle()
+        ax_box = self.tab.canvas.axes.get_window_extent()
+        legend_box = legend.get_window_extent()
+        self.assertGreaterEqual(legend_box.x0, ax_box.x1 - 20)
+
+    def test_canvas_fills_available_area_on_resize(self):
+        self.tab.resize(1100, 700)
+        self.tab.show()
+        self.app.processEvents()
+        canvas = self.tab.canvas
+        self.assertGreaterEqual(canvas.width(), 500)
+        self.assertGreaterEqual(canvas.height(), 400)
+        canvas.draw_idle()
+        pix = canvas.pixmap()
+        self.assertIsNotNone(pix)
+        self.assertFalse(pix.isNull())
+        self.assertGreaterEqual(pix.width(), int(canvas.contentsRect().width() * 0.85))
+        self.assertGreaterEqual(pix.height(), int(canvas.contentsRect().height() * 0.85))
+        self.tab.resize(800, 500)
+        self.app.processEvents()
+        canvas.draw_idle()
+        pix = canvas.pixmap()
+        self.assertGreaterEqual(pix.width(), int(canvas.contentsRect().width() * 0.85))
+        self.assertGreaterEqual(pix.height(), int(canvas.contentsRect().height() * 0.85))
+
+    def test_long_gauge_name_wraps_inside_canvas(self):
+        long_name = "VeryLongGaugeNameThatExceedsTheLegendColumnWidth"
+        self.tab.set_source_provider(gauges_1d=lambda: ((1.5, long_name),))
+        self.tab.refresh_catalog()
+        self.tab.show()
+        self.tab.resize(1100, 700)
+        self.app.processEvents()
+        self.tab.tbl_gauges.selectRow(0)
+        self.tab.add_selected()
+        self.tab._redraw_plot()
+        legend = self.tab.canvas.axes.get_legend()
+        self.assertIsNotNone(legend)
+        texts = [text.get_text() for text in legend.get_texts()]
+        self.assertEqual(len(texts), 1)
+        self.assertIn("\n", texts[0])
+        self.tab.canvas.draw_idle()
+        legend_box = legend.get_window_extent()
+        fig_w = self.tab.canvas.figure.get_figwidth() * self.tab.canvas.figure.dpi
+        self.assertLessEqual(legend_box.x1, fig_w + 8)
+
+    def test_impulse_matches_pressure_color_and_is_dashed(self):
+        with tempfile.TemporaryDirectory() as td:
+            fo = os.path.join(td, "postProcessing", "gauges1d", "0")
+            os.makedirs(fo)
+            with open(os.path.join(fo, "p"), "w", encoding="utf-8") as handle:
+                handle.write("# Probe 0 (1.5 0 0)\n")
+                handle.write("0.0 101325\n")
+                handle.write("0.001 201325\n")
+            with open(os.path.join(fo, "impulse"), "w", encoding="utf-8") as handle:
+                handle.write("# Probe 0 (1.5 0 0)\n")
+                handle.write("0.0 0.0\n")
+                handle.write("0.001 12.5\n")
+            self.tab.set_source_provider(case_dir=lambda dim: td if dim == "1d" else "")
+            self.tab.chk_impulse.setChecked(True)
+            self.tab.tbl_gauges.selectRow(0)
+            self.tab.add_selected()
+            self.tab._redraw_plot()
+            lines = self.tab.canvas.axes.lines
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(lines[0].get_color(), lines[1].get_color())
+            self.assertEqual(lines[0].get_linestyle(), "-")
+            self.assertEqual(lines[1].get_linestyle(), "--")
+            legend = self.tab.canvas.axes.get_legend()
+            self.assertEqual([text.get_text() for text in legend.get_texts()], ["G1"])
+
+
+class TabTimeHistoryAppWireTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _app()
+
+    def test_main_window_uses_real_tab_and_refreshes_from_1d_gauges(self):
+        from main_new import BlastFoamApp
+
+        win = BlastFoamApp()
+        try:
+            self.assertIsInstance(win.tab_time_history, TabTimeHistory)
+            win.tab_1d.set_gauge_locations(((4.0, "LiveG"),))
+            win.tab_time_history.refresh_catalog()
+            ids = [
+                win.tab_time_history.tbl_gauges.item(row, 0).text()
+                for row in range(win.tab_time_history.tbl_gauges.rowCount())
+            ]
+            self.assertIn("1D-1", ids)
+            labels = [
+                win.tab_time_history.tbl_gauges.item(row, 4).text()
+                for row in range(win.tab_time_history.tbl_gauges.rowCount())
+            ]
+            self.assertIn("LiveG", labels)
+        finally:
+            win.close()

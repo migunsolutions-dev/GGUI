@@ -17,7 +17,8 @@ from PyQt5.QtCore import Qt, QTimer, QSize
 from PyQt5.QtGui import QIcon, QFont, QFontMetrics
 
 from tab_1d import Tab1D
-from tab_2d import Tab2D
+from tab_2d import Tab2D, latest_case_1d_dir
+from tab_time_history import TabTimeHistory
 from dialogs import OutputFileOptionsDialog
 from time_history_dialog import TimeHistoryLocationsDialog
 from output_options import OutputFileOptions, output_file_options_from_dict
@@ -634,7 +635,16 @@ class BlastFoamApp(QMainWindow):
         self.tab_2d = Tab2D()
         self.tab_2d.set_source_cases_root(self.base_projects_path)
         self.tab_3d = TabGeneral3D(self.probes_model)
-        self.tab_time_history = self._create_placeholder_tab("Time History Viewer", "Time history viewing (not yet implemented)")
+        self.tab_time_history = TabTimeHistory()
+        self.tab_time_history.set_source_provider(
+            gauges_1d=lambda: getattr(self.tab_1d, "_gauge_locations", ()) or (),
+            probes_2d=self.tab_2d._probes,
+            probes_3d=self.probes_model.probes,
+            case_dir=self._time_history_case_dir,
+            p_atm=self._time_history_p_atm,
+            impulse_available=self._time_history_impulse_available,
+        )
+        self.probes_model.changed.connect(self.tab_time_history.refresh_catalog)
         self.tab_pi_curves = self._create_placeholder_tab("PI-Curves", "PI curve analysis (not yet implemented)")
         self.tab_monte_carlo = self._create_placeholder_tab("Monte-Carlo", "Monte Carlo batch analysis (not yet implemented)")
         self.tab_jotter = LogTab()  # Keep exact name "Jotter"
@@ -815,6 +825,7 @@ class BlastFoamApp(QMainWindow):
                 "General 3D": self.tab_3d,
             }
             self.tabs.setCurrentWidget(selected_tabs.get(selected, self.tab_3d))
+            self.tab_time_history.refresh_catalog()
             self.status_bar.set_status("Project loaded", "#2ecc71")
         except (ProjectFormatError, OSError, TypeError, ValueError) as exc:
             QMessageBox.critical(self, "Open Project Error", str(exc))
@@ -1726,6 +1737,8 @@ class BlastFoamApp(QMainWindow):
         )
         self.tab_2d.apply_output_file_options(opts.dim2d)
         self.tab_3d.apply_output_file_options(opts.dim3d)
+        if hasattr(self, "tab_time_history"):
+            self.tab_time_history.set_impulse_available()
 
     def _on_output_options(self):
         """Open Output File Options dialog"""
@@ -1751,6 +1764,7 @@ class BlastFoamApp(QMainWindow):
         origin = dialog.remap_origin()
         if origin is not None:
             self.tab_3d.set_remap_origin(*origin)
+        self.tab_time_history.refresh_catalog()
     
     def _on_help(self):
         """Show help"""
@@ -2719,10 +2733,51 @@ class BlastFoamApp(QMainWindow):
                     request()
         elif mode == "3D":
             self.status_bar.update_3d(step=step_n, tt=sim_time_s, dt=dt_val)
-    
+        if self.tab_time_history.has_series():
+            self.tab_time_history.refresh_plot()
+
+    def _time_history_case_dir(self, dim: str) -> str:
+        if dim == "1d":
+            return self.tab_2d._current_1d_remap_path() or latest_case_1d_dir(
+                self.base_projects_path
+            )
+        if dim == "2d":
+            return self.active_case_dir_2d or getattr(self.tab_2d, "_active_case_dir", "") or ""
+        if dim == "3d":
+            viewer = getattr(self.tab_3d, "viewer", None)
+            return self.active_case_dir_3d or getattr(viewer, "current_case_dir", "") or ""
+        return ""
+
+    def _time_history_p_atm(self, dim: str) -> float:
+        if dim == "1d":
+            return float(self.tab_1d.spin_press.value())
+        if dim == "2d":
+            return float(self.tab_2d.spin_pressure.value())
+        if dim == "3d":
+            spin = getattr(self.tab_3d, "p0", None)
+            if spin is not None:
+                return float(spin.value())
+        return 101325.0
+
+    def _time_history_impulse_available(self) -> bool:
+        opts = getattr(self, "_output_file_options", None)
+        if opts is None:
+            return True
+        if bool(getattr(opts.dim1d.gauges, "impulse", True)):
+            return True
+        if bool(getattr(opts.dim2d.gauges, "impulse", True)):
+            return True
+        dim3d = opts.dim3d
+        checked = getattr(dim3d, "checked", None)
+        if callable(checked):
+            return bool(checked("impulse", "gauges") or checked("peak_impulse", "gauges"))
+        return True
+
     def _on_main_tab_changed(self, index: int) -> None:
         """Activate only the visible VTK viewport; pause hidden ones."""
         current = self.tabs.widget(index)
+        if current is getattr(self, "tab_time_history", None):
+            self.tab_time_history.refresh_catalog()
         for tab in (getattr(self, "tab_2d", None), getattr(self, "tab_3d", None)):
             if tab is None or not hasattr(tab, "viewer"):
                 continue

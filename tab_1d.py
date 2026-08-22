@@ -4,7 +4,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QFormLayout, QComboBox, QDoubleSpinBox, QSpinBox, QLineEdit,
     QRadioButton, QSplitter, QScrollArea, QSizePolicy, QTabWidget
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QImage, QPixmap
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
@@ -70,6 +70,14 @@ class MplCanvas(QLabel):
         self.setMinimumHeight(120)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setAlignment(Qt.AlignCenter)
+        self.setScaledContents(False)
+        self.tight_layout_rect = None
+
+    def sizeHint(self):
+        return QSize(400, 300)
+
+    def minimumSizeHint(self):
+        return QSize(40, 120)
 
     def draw(self):
         self._render_to_label()
@@ -79,22 +87,25 @@ class MplCanvas(QLabel):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.axes.lines:
-            self.draw_idle()
+        self.draw_idle()
 
     def _render_to_label(self) -> None:
         if self._drawing:
             return
         self._drawing = True
         try:
-            w = max(int(self.width()), 1)
-            h = max(int(self.height()), 1)
+            area = self.contentsRect()
+            w = max(int(area.width()), 1)
+            h = max(int(area.height()), 1)
             if w < 40 or h < 40:
-                w, h = 640, 400
+                w, h = max(w, 40), max(h, 40)
             self.figure.set_size_inches(w / self._dpi, h / self._dpi, forward=False)
             if w >= 200 and h >= 200:
                 try:
-                    self.figure.tight_layout()
+                    if self.tight_layout_rect is not None:
+                        self.figure.tight_layout(rect=self.tight_layout_rect)
+                    else:
+                        self.figure.tight_layout()
                 except Exception:
                     pass
             self._agg.draw()
