@@ -6,7 +6,7 @@ import os
 from dataclasses import asdict, replace
 from typing import Dict, List
 
-from PyQt5.QtCore import QTimer, Qt, pyqtSignal
+from PyQt5.QtCore import QPoint, QTimer, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QStyle,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -78,7 +79,6 @@ from ui_metrics import (
     COMPUTATIONAL_LEFT_PANEL_WIDTH,
     CONTROL_MAX_WIDTH_DEFAULT,
     EXECUTION_AREA_MIN_HEIGHT,
-    EXECUTION_AREA_PREFERRED_HEIGHT_2D,
     FORM_ROW_SPACING,
     GROUP_MARGINS,
     INFO_ROW_STYLE,
@@ -199,6 +199,7 @@ class Tab2D(QWidget):
         self._preview_flush_timer = QTimer(self)
         self._preview_flush_timer.setSingleShot(True)
         self._preview_flush_timer.timeout.connect(self._flush_setup_preview)
+        self._execution_pane_opening_applied = False
         self._build_ui()
         self.viewer.cell_count_updated.connect(self._on_cell_count_updated)
         self.viewer.log_scale_rejected.connect(self._on_log_scale_rejected)
@@ -764,11 +765,20 @@ class Tab2D(QWidget):
         self.input_tabs = QTabWidget()
         self.input_tabs.setMinimumWidth(0)
         self.input_tabs.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
-        self.input_tabs.addTab(self._scroll_tab(self._build_setup_tab()), "Setup")
+        self._left_setup_scroll = self._scroll_tab(self._build_setup_tab())
+        self.input_tabs.addTab(self._left_setup_scroll, "Setup")
         self._build_mesh_amr_dialog()
-        self.input_tabs.addTab(self._scroll_tab(self._build_output_tab()), "Output & Probes")
+        self._left_output_scroll = self._scroll_tab(self._build_output_tab())
+        output_idx = self.input_tabs.addTab(self._left_output_scroll, "Output & Probes")
+        if hasattr(self.input_tabs, "setTabVisible"):
+            self.input_tabs.setTabVisible(output_idx, False)
+        else:
+            self.input_tabs.removeTab(output_idx)
+            self._left_output_scroll.setParent(self.input_tabs)
+            self._left_output_scroll.hide()
+        self.input_tabs.setCurrentIndex(0)
+        self.input_tabs.tabBar().hide()
         ll.addWidget(self.input_tabs, 1)
-        self._left_setup_scroll = self.input_tabs.widget(0)
         ll.addWidget(self._build_info_panel(), 0)
         self._main_splitter.addWidget(left)
 
@@ -789,7 +799,7 @@ class Tab2D(QWidget):
         self._right_v_splitter.addWidget(self.ctrl_tabs)
         self._right_v_splitter.setStretchFactor(0, 1)
         self._right_v_splitter.setStretchFactor(1, 0)
-        self._right_v_splitter.setSizes([600, EXECUTION_AREA_PREFERRED_HEIGHT_2D])
+        self._right_v_splitter.setSizes([600, self._execution_pane_preferred_height()])
         self._2d_exec_splitter_sizes = list(self._right_v_splitter.sizes())
         self._right_v_splitter.splitterMoved.connect(self._on_2d_exec_splitter_moved)
         rl.addWidget(self._right_v_splitter)
@@ -1014,6 +1024,8 @@ class Tab2D(QWidget):
                 label.hide()
             field.hide()
         self.lbl_mapping_note.hide()
+        form.setFormAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
         group, form = self._group("Atmosphere")
         self.spin_pressure = self._double(101325.0, 1.0, 1e10, 2)
@@ -1381,10 +1393,15 @@ class Tab2D(QWidget):
         grid.setContentsMargins(*GROUP_MARGINS)
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(FORM_ROW_SPACING)
+        grid.setAlignment(Qt.AlignTop)
         self.spin_max_co = self._double(0.5, 1e-6, 10.0, 3)
         self.spin_max_co.setFixedWidth(self.spin_max_co.minimumSizeHint().width() * 2)
         self.spin_end_time = self._double(1e-3, 1e-12, 1e6, 9)
         self.spin_delta_t = self._double(1e-8, 1e-15, 1.0, 12)
+        self.spin_delta_t.setFixedWidth(
+            max(self.spin_delta_t.sizeHint().width(), self.spin_delta_t.minimumSizeHint().width())
+            * 2
+        )
         self.chk_adjust = QCheckBox()
         self.chk_adjust.setChecked(True)
         self.cmb_write_control = QComboBox()
@@ -1470,7 +1487,7 @@ class Tab2D(QWidget):
         for button in (self.btn_initialize, self.btn_exact_end, self.btn_stop):
             button.setMinimumWidth(198)
         actions = QWidget()
-        actions.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        actions.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Maximum)
         v = QVBoxLayout(actions)
         v.setContentsMargins(0, 0, 0, 0)
         v.addWidget(self.btn_initialize)
@@ -1484,12 +1501,14 @@ class Tab2D(QWidget):
         self.chk_log_scale = QCheckBox("Log scale")
         v.addWidget(self.chk_log_scale)
         v.addStretch()
-        gl.addWidget(actions)
-        gl.addWidget(self._build_field_selector())
+        gl.addWidget(actions, 0, Qt.AlignTop)
+        gl.addWidget(self._build_field_selector(), 0, Qt.AlignTop)
+        self.grp_sim = group
         layout.addWidget(group)
         layout.addWidget(self._build_solver_controls())
         layout.addWidget(self._build_view_display_controls())
         layout.addStretch()
+        self._equalize_execution_group_heights()
         return page
 
     def _build_view_display_controls(self) -> QWidget:
@@ -1517,13 +1536,16 @@ class Tab2D(QWidget):
         layout.addWidget(self.cmb_view_mode)
         layout.addWidget(self.lbl_mirror_indicator)
         layout.addStretch()
+        self.grp_view = box
         return box
 
     def _build_field_selector(self) -> QWidget:
         box = QWidget()
+        box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         layout = QVBoxLayout(box)
         layout.setContentsMargins(12, 0, 0, 0)
         layout.setSpacing(2)
+        layout.setAlignment(Qt.AlignTop)
         self.cmb_field = QComboBox(box)
         self.cmb_field.addItems([field for field, _label in VIEW_FIELD_OPTIONS])
         self.cmb_field.hide()
@@ -2501,6 +2523,88 @@ class Tab2D(QWidget):
 
     def _prepare_transfer_requested(self) -> None:
         self.sig_request_prepare_transfer.emit()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._execution_pane_opening_applied:
+            return
+        QTimer.singleShot(0, self._apply_execution_pane_opening_height_once)
+
+    def _group_required_height(self, box: QWidget) -> int:
+        """Tight height that keeps every visible child unclipped."""
+        saved_min = box.minimumHeight()
+        box.setMinimumHeight(0)
+        box.ensurePolished()
+        if box.layout() is not None:
+            box.layout().activate()
+        hint = max(box.sizeHint().height(), box.minimumSizeHint().height())
+        bottom = 0
+        for child in box.findChildren(QWidget):
+            if not child.isVisibleTo(box) or child.size().isEmpty():
+                continue
+            if any(
+                grandchild.isVisibleTo(child)
+                for grandchild in child.findChildren(QWidget)
+            ):
+                continue
+            bottom = max(bottom, child.mapTo(box, QPoint(0, child.height())).y())
+        frame_bottom = 4
+        if box.height() > 0:
+            frame_bottom = max(frame_bottom, box.height() - box.contentsRect().bottom())
+        box.setMinimumHeight(saved_min)
+        if bottom <= 0:
+            return hint
+        return max(hint, bottom + frame_bottom)
+
+    def _equalize_execution_group_heights(self) -> int:
+        """Give Simulation / Solver / View the same content-driven height."""
+        groups = [
+            box
+            for box in (
+                getattr(self, "grp_sim", None),
+                getattr(self, "grp_solver", None),
+                getattr(self, "grp_view", None),
+            )
+            if box is not None
+        ]
+        if not groups:
+            return 0
+        height = max(self._group_required_height(box) for box in groups)
+        for box in groups:
+            box.setMinimumHeight(height)
+        return height
+
+    def _execution_pane_preferred_height(self) -> int:
+        """Compact Execution Controls tab: shared group height + tab chrome."""
+        self._equalize_execution_group_heights()
+        page = getattr(self, "_exec_scroll", None)
+        page = page.widget() if page is not None else None
+        if page is not None:
+            page.ensurePolished()
+            page_h = max(page.minimumSizeHint().height(), page.sizeHint().height())
+        else:
+            page_h = 0
+        tab_h = self.ctrl_tabs.tabBar().sizeHint().height()
+        style = self.ctrl_tabs.style()
+        frame = style.pixelMetric(QStyle.PM_DefaultFrameWidth, None, self.ctrl_tabs)
+        tab_base = style.pixelMetric(QStyle.PM_TabBarBaseHeight, None, self.ctrl_tabs)
+        return max(
+            EXECUTION_AREA_MIN_HEIGHT,
+            page_h + tab_h + (frame * 2) + tab_base + 24,
+        )
+
+    def _apply_execution_pane_opening_height_once(self) -> None:
+        if self._execution_pane_opening_applied:
+            return
+        self._execution_pane_opening_applied = True
+        self._apply_execution_pane_opening_height()
+
+    def _apply_execution_pane_opening_height(self) -> None:
+        height = self._execution_pane_preferred_height()
+        sizes = self._right_v_splitter.sizes()
+        total = sum(sizes) or (600 + height)
+        self._right_v_splitter.setSizes([max(50, total - height), height])
+        self._2d_exec_splitter_sizes = list(self._right_v_splitter.sizes())
 
     def _on_2d_exec_splitter_moved(self, _pos: int = 0, _index: int = 0) -> None:
         self._2d_exec_splitter_sizes = list(self._right_v_splitter.sizes())

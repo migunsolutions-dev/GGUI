@@ -22,6 +22,7 @@ from PyQt5.QtWidgets import (
 )
 
 from axisymmetric_2d import BOUNDARY_SLIP, DYNAMIC_MESH, FIXED_MESH
+from ui_metrics import FORM_ROW_SPACING
 from openfoam_times_2d import (
     LIVE_FOLLOW_LABEL,
     TIME_ZERO_LABEL,
@@ -481,7 +482,12 @@ class Tab2DFieldSelectorTests(unittest.TestCase):
         self.assertIsNotNone(solver)
         self.assertEqual(solver.title(), "Solver Controls")
         self.assertIsInstance(solver.layout(), QGridLayout)
+        self.assertEqual(solver.sizePolicy().verticalPolicy(), QSizePolicy.Preferred)
+        self.assertEqual(tab.grp_sim.minimumHeight(), tab.grp_solver.minimumHeight())
+        self.assertEqual(tab.grp_solver.minimumHeight(), tab.grp_view.minimumHeight())
+        self.assertGreater(tab.grp_sim.minimumHeight(), 0)
         grid = solver.layout()
+        self.assertEqual(grid.verticalSpacing(), FORM_ROW_SPACING)
         self.assertTrue(grid.itemAtPosition(0, 0).widget().isAncestorOf(tab.spin_end_time))
         time_row = grid.itemAtPosition(0, 0).widget()
         self.assertTrue(time_row.isAncestorOf(tab.spin_delta_t))
@@ -498,6 +504,11 @@ class Tab2DFieldSelectorTests(unittest.TestCase):
         self.assertIs(grid.itemAtPosition(1, 0).widget(), grid.itemAtPosition(1, 1).widget())
         self.assertEqual(tab.spin_max_co.minimumWidth(), tab.spin_max_co.maximumWidth())
         self.assertGreater(tab.spin_max_co.minimumWidth(), 72)
+        self.assertEqual(tab.spin_delta_t.minimumWidth(), tab.spin_delta_t.maximumWidth())
+        self.assertGreaterEqual(
+            tab.spin_delta_t.minimumWidth(),
+            max(tab.spin_delta_t.sizeHint().width(), tab.spin_delta_t.minimumSizeHint().width()),
+        )
         write_row = grid.itemAtPosition(2, 0).widget()
         write_layout = write_row.layout()
         self.assertTrue(write_row.isAncestorOf(tab.cmb_write_control))
@@ -588,9 +599,15 @@ class Tab2DMeshModeSelectorTests(unittest.TestCase):
             tab.cmb_source.maximumWidth(),
             max(355 // 2, tab.cmb_source.sizeHint().width()),
         )
-        self.assertEqual(tab.input_tabs.count(), 2)
         self.assertEqual(tab.input_tabs.tabText(0), "Setup")
-        self.assertEqual(tab.input_tabs.tabText(1), "Output & Probes")
+        self.assertTrue(tab.input_tabs.tabBar().isHidden())
+        self.assertIsNotNone(tab.tbl_probes)
+        if hasattr(tab.input_tabs, "isTabVisible"):
+            self.assertEqual(tab.input_tabs.count(), 2)
+            self.assertEqual(tab.input_tabs.tabText(1), "Output & Probes")
+            self.assertFalse(tab.input_tabs.isTabVisible(1))
+        else:
+            self.assertEqual(tab.input_tabs.count(), 1)
         self.assertEqual(tab._mesh_dialog.windowTitle(), "Mesh & AMR")
         self.assertIsNotNone(tab.grp_seed)
         self.assertIsNotNone(tab.grp_amr)

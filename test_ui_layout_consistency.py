@@ -19,7 +19,6 @@ from ui_metrics import (
     DEFAULT_WINDOW_WIDTH_TOLERANCE,
     DEFAULT_WINDOW_HEIGHT_TOLERANCE,
     EXECUTION_AREA_MIN_HEIGHT,
-    EXECUTION_AREA_PREFERRED_HEIGHT_2D,
     INFO_PANEL_HEIGHT_MIN,
     INFO_PANEL_HEIGHT_MAX,
     STATUS_FONT_MIN_POINT_SIZE,
@@ -184,10 +183,14 @@ class TestUILayoutConsistency(unittest.TestCase):
             self.assertGreaterEqual(tab.ctrl_tabs.height(), EXECUTION_AREA_MIN_HEIGHT)
             content_h = tab._exec_scroll.widget().minimumSizeHint().height()
             tab_bar_h = tab.ctrl_tabs.tabBar().sizeHint().height()
+            preferred = tab._execution_pane_preferred_height()
             self.assertGreaterEqual(
                 tab.ctrl_tabs.height(),
-                min(content_h + tab_bar_h, EXECUTION_AREA_PREFERRED_HEIGHT_2D) - 8,
+                min(content_h + tab_bar_h, preferred) - 8,
             )
+            self.assertLessEqual(tab.ctrl_tabs.height(), preferred + 24)
+            self.assertEqual(tab.grp_sim.height(), tab.grp_solver.height())
+            self.assertEqual(tab.grp_solver.height(), tab.grp_view.height())
             vp = tab._exec_scroll.viewport()
             for btn in (tab.btn_initialize, tab.btn_exact_end, tab.btn_stop):
                 br = btn.rect()

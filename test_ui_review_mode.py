@@ -294,16 +294,11 @@ class UIReviewProductionHookTests(unittest.TestCase):
             self.assertTrue(controller.enabled)
             self.assertGreater(len(controller.visible_region_map()), 0)
             controller.select_widget(win.tab_2d.btn_initialize)
-            bar = win.tab_2d.input_tabs.tabBar()
-            out_idx = 1
-            for i in range(win.tab_2d.input_tabs.count()):
-                if "Output" in win.tab_2d.input_tabs.tabText(i):
-                    out_idx = i
-                    break
-            pos = bar.mapToGlobal(bar.tabRect(out_idx).center())
+            bar = win.tab_2d.ctrl_tabs.tabBar()
+            pos = bar.mapToGlobal(bar.tabRect(0).center())
             record = controller.select_widget(bar, Qt.ControlModifier, pos)
             self.assertEqual(record["kind"], "tab")
-            self.assertIn("Output", record["tab_text"])
+            self.assertIn("Execution", record["tab_text"])
             status_record = controller.select_widget(win.status_bar, Qt.ControlModifier)
             self.assertEqual(status_record["class"], "SegmentedStatusBar")
             win.service.generate_case.assert_not_called()

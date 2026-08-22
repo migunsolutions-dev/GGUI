@@ -7,6 +7,7 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QLabel
 
 from axisymmetric_2d import DYNAMIC_MESH, FIXED_MESH, REMAP_SOURCE
@@ -117,6 +118,9 @@ class Tab2DWorkflowTests(unittest.TestCase):
         self.assertTrue(all(label.isHidden() for label in labels.values()))
         self.assertTrue(self.tab.cmb_source_time_mode.isHidden())
         self.assertTrue(self.tab.txt_source_time.isHidden())
+        form = self.tab.grp_mapping.layout()
+        self.assertTrue(form.formAlignment() & Qt.AlignVCenter)
+        self.assertEqual(self.tab.grp_mapping.minimumHeight(), 0)
 
         self.tab.set_case_inputs(
             {
