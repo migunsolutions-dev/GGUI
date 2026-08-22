@@ -342,7 +342,12 @@ class TabTimeHistory(QWidget):
         self.tbl_gauges.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl_gauges.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tbl_gauges.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.tbl_gauges.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        header = self.tbl_gauges.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(35)
+        header.setDefaultSectionSize(70)
+        header.resizeSection(4, 100)
         layout.addWidget(self.tbl_gauges, 1)
         return left
 

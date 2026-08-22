@@ -102,6 +102,16 @@ class TabTimeHistoryUiTests(unittest.TestCase):
         ]
         self.assertEqual(headers, ["ID", "X", "Y", "Z", "Label"])
 
+    def test_each_table_column_can_be_resized(self):
+        header = self.tab.tbl_gauges.horizontalHeader()
+        for column in range(self.tab.tbl_gauges.columnCount()):
+            self.assertEqual(
+                header.sectionResizeMode(column), header.Interactive
+            )
+        before = header.sectionSize(2)
+        header.resizeSection(2, before + 25)
+        self.assertEqual(header.sectionSize(2), before + 25)
+
     def test_regions_checkbox_sits_below_3d(self):
         self.tab.show()
         self.tab.resize(450, 700)
