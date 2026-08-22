@@ -283,6 +283,96 @@ class MappingTests(unittest.TestCase):
             self.assertIn("endTime", result.changed)
             self.assertEqual(float(result.readback["endTime"]), 1e-6)
 
+    def test_control_dict_writer_updates_root_only_not_nested_function_objects(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = _make_unmeshed_source(Path(td) / "src")
+            control_path = source / "system" / "controlDict"
+            original = control_path.read_text(encoding="utf-8")
+            control_path.write_text(
+                original
+                + """
+functions
+{
+    impulse
+    {
+        writeControl timeStep;
+        writeInterval 1;
+        nested
+        {
+            writeControl timeStep;
+            writeInterval 1;
+        }
+    }
+}
+""",
+                encoding="utf-8",
+            )
+            result = write_control_dict_entries(
+                str(source),
+                {
+                    "writeControl": "adjustableRunTime",
+                    "writeInterval": 0.001,
+                },
+            )
+            self.assertTrue(result.ok, result.reason)
+            updated = control_path.read_text(encoding="utf-8")
+            self.assertIn("writeControl adjustableRunTime;", updated)
+            self.assertIn("writeInterval 0.001;", updated)
+            self.assertEqual(updated.count("writeControl timeStep;"), 2)
+            self.assertEqual(updated.count("writeInterval 1;"), 2)
+
+    def test_native_2d_and_3d_prerun_updates_preserve_nested_integer_intervals(self):
+        nested = """
+functions
+{
+    impulse
+    {
+        writeControl timeStep;
+        writeInterval 1;
+    }
+    overpressure
+    {
+        writeControl timeStep;
+        writeInterval 1;
+    }
+    dynamicPressure
+    {
+        writeControl timeStep;
+        writeInterval 1;
+    }
+    probes
+    {
+        writeControl timeStep;
+        writeInterval 1;
+    }
+}
+"""
+        scenarios = (
+            ("2D-time", "adjustableRunTime", 0.001),
+            ("2D-step", "timeStep", 25),
+            ("3D-time", "adjustableRunTime", 0.001),
+            ("3D-step", "timeStep", 25),
+        )
+        for label, write_control, interval in scenarios:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as td:
+                case = Path(td)
+                control_path = case / "system" / "controlDict"
+                _write(
+                    control_path,
+                    "endTime 0.01;\n"
+                    "writeControl timeStep;\n"
+                    "writeInterval 10;\n"
+                    + nested,
+                )
+                BlastFoamApp._update_control_dict_end_time(
+                    object(), str(case), 0.02, interval, write_control
+                )
+                updated = control_path.read_text(encoding="utf-8")
+                self.assertIn(f"writeControl {write_control};", updated)
+                self.assertIn(f"writeInterval {interval};", updated)
+                self.assertEqual(updated.count("writeControl timeStep;"), 4 + (write_control == "timeStep"))
+                self.assertEqual(updated.count("writeInterval 1;"), 4)
+
     def test_unsupported_control_keys_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             source = _make_unmeshed_source(Path(td) / "src")

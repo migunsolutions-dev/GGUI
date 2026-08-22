@@ -29,6 +29,11 @@ from allrun_commands import (
     parse_allrun_preprocess_sequence,
 )
 from case_topology import CaseDimension, classify_case_topology
+from foam_dictionary import (
+    format_foam_scalar,
+    read_top_level_entries,
+    update_top_level_entries,
+)
 
 # Streaming SHA-256 chunk size for case inventory hashing (4 MiB).
 INVENTORY_HASH_CHUNK_SIZE = 4 * 1024 * 1024
@@ -1137,14 +1142,7 @@ def read_control_dict_entries(case_dir: str, keys: Iterable[str]) -> Dict[str, s
     if not path.is_file():
         return out
     text = path.read_text(encoding="utf-8", errors="ignore")
-    # Strip comments loosely for matching.
-    stripped = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-    stripped = re.sub(r"//.*?$", "", stripped, flags=re.MULTILINE)
-    for key in keys:
-        m = re.search(rf"\b{re.escape(key)}\s+([^;]+);", stripped)
-        if m:
-            out[key] = m.group(1).strip()
-    return out
+    return read_top_level_entries(text, keys)
 
 
 def write_control_dict_entries(
@@ -1163,46 +1161,17 @@ def write_control_dict_entries(
         return ControlDictWriteResult(ok=False, reason="controlDict missing")
 
     original = path.read_text(encoding="utf-8", errors="ignore")
-    lines = original.splitlines(keepends=True)
-    changed: List[str] = []
-    remaining = dict(updates)
-
-    def _fmt(value: object) -> str:
-        if isinstance(value, bool):
-            return "yes" if value else "no"
-        if isinstance(value, float):
-            return f"{value:.12g}"
-        if isinstance(value, int):
-            return str(value)
-        return str(value)
-
-    new_lines: List[str] = []
-    for line in lines:
-        stripped = line.lstrip()
-        matched = False
-        for key in list(remaining.keys()):
-            if stripped.startswith(key) and (
-                len(stripped) == len(key)
-                or stripped[len(key) : len(key) + 1].isspace()
-            ):
-                indent = line[: len(line) - len(line.lstrip())]
-                new_lines.append(f"{indent}{key} {_fmt(remaining.pop(key))};\n")
-                changed.append(key)
-                matched = True
-                break
-        if not matched:
-            new_lines.append(line)
-
-    if remaining:
+    try:
+        updated, changed = update_top_level_entries(original, updates)
+    except KeyError as exc:
         return ControlDictWriteResult(
             ok=False,
-            reason=f"Keys not found in controlDict: {sorted(remaining)}",
+            reason=str(exc),
         )
-
-    path.write_text("".join(new_lines), encoding="utf-8")
+    path.write_text(updated, encoding="utf-8")
     readback = read_control_dict_entries(case_dir, changed)
     for key in changed:
-        expected = _fmt(updates[key])
+        expected = format_foam_scalar(updates[key])
         got = readback.get(key, "")
         # Numeric compare when both parse as floats.
         try:

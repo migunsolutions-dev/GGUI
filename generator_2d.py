@@ -491,6 +491,11 @@ snGradSchemes { default corrected; }
         );
     }}
 """
+        retained_cycle = (
+            int(inputs.cycle_write)
+            if bool(getattr(inputs, "keep_openfoam_time_folders", False))
+            else 0
+        )
         control = self._foam_header("controlDict", "dictionary", "system") + f"""
 application blastFoam;
 startFrom startTime;
@@ -502,7 +507,7 @@ adjustTimeStep {'yes' if inputs.adjust_time_step else 'no'};
 maxCo {inputs.max_co:.12g};
 writeControl {write_control};
 writeInterval {write_interval};
-purgeWrite {inputs.cycle_write};
+purgeWrite {retained_cycle};
 writeFormat ascii;
 writePrecision 12;
 writeCompression off;

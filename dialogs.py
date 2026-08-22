@@ -365,11 +365,20 @@ class OutputFileOptionsDialog(QDialog):
     def _build_2d(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        vtk_box = QGroupBox("Whole domain VTK outputs and framerates")
-        vtk_lay = QVBoxLayout(vtk_box)
-        self.rate_2d = _TimeStepRate(self)
-        vtk_lay.addWidget(self.rate_2d)
-        layout.addWidget(vtk_box)
+        storage_box = QGroupBox("OpenFOAM results")
+        storage_form = QFormLayout(storage_box)
+        self.chk_keep_times_2d = QCheckBox("Keep OpenFOAM time folders")
+        self.chk_keep_times_2d.setObjectName("chk2dKeepOpenFOAMTimeFolders")
+        self.spin_cycle_write_2d = QSpinBox()
+        self.spin_cycle_write_2d.setObjectName("spin2dCycleWrite")
+        self.spin_cycle_write_2d.setRange(0, 1000)
+        self.spin_cycle_write_2d.setToolTip(
+            "0 keeps all retained time folders; values above 0 retain that cyclic number."
+        )
+        self.chk_keep_times_2d.toggled.connect(self.spin_cycle_write_2d.setEnabled)
+        storage_form.addRow(self.chk_keep_times_2d)
+        storage_form.addRow("    cycleWrite", self.spin_cycle_write_2d)
+        layout.addWidget(storage_box)
 
         title = QLabel("Output quantities")
         title.setStyleSheet("font-weight: bold;")
@@ -418,18 +427,29 @@ class OutputFileOptionsDialog(QDialog):
     def _build_3d(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        vtk_box = QGroupBox("VTKs and Framerates")
+        storage_box = QGroupBox("OpenFOAM results")
+        storage_form = QFormLayout(storage_box)
+        self.chk_keep_times_3d = QCheckBox("Keep OpenFOAM time folders")
+        self.chk_keep_times_3d.setObjectName("chk3dKeepOpenFOAMTimeFolders")
+        self.spin_cycle_write_3d = QSpinBox()
+        self.spin_cycle_write_3d.setObjectName("spin3dCycleWrite")
+        self.spin_cycle_write_3d.setRange(0, 1000)
+        self.spin_cycle_write_3d.setToolTip(
+            "0 keeps all retained time folders; values above 0 retain that cyclic number."
+        )
+        self.chk_keep_times_3d.toggled.connect(self.spin_cycle_write_3d.setEnabled)
+        storage_form.addRow(self.chk_keep_times_3d)
+        storage_form.addRow("    cycleWrite", self.spin_cycle_write_3d)
+        layout.addWidget(storage_box)
+
+        vtk_box = QGroupBox("VTKs")
         form = QFormLayout(vtk_box)
         self.chk_surfaces = QCheckBox("Cross-sections and surfaces")
         self.chk_surfaces.setObjectName("chk3dSurfaces")
-        self.rate_3d_surfaces = _TimeStepRate(self)
-        self.chk_surfaces.toggled.connect(self.rate_3d_surfaces.set_enabled_rate)
-        form.addRow(self._rate_row(self.chk_surfaces, self.rate_3d_surfaces))
+        form.addRow(self.chk_surfaces)
         self.chk_volumes = QCheckBox("Volumes")
         self.chk_volumes.setObjectName("chk3dVolumes")
-        self.rate_3d = _TimeStepRate(self)
-        self.chk_volumes.toggled.connect(self.rate_3d.set_enabled_rate)
-        form.addRow(self._rate_row(self.chk_volumes, self.rate_3d))
+        form.addRow(self.chk_volumes)
         layout.addWidget(vtk_box)
 
         title = QLabel("Output Quantities")
@@ -471,11 +491,9 @@ class OutputFileOptionsDialog(QDialog):
             box.setChecked(bool(mapping_1d.get(key, False)))
 
         d2 = opts.dim2d
-        self.rate_2d.rad_time.setChecked(d2.vtk_by_time)
-        self.rate_2d.rad_step.setChecked(not d2.vtk_by_time)
-        self.rate_2d.spin_time.setValue(d2.vtk_time_s)
-        self.rate_2d.spin_steps.setValue(d2.vtk_steps)
-        self.rate_2d._sync_enabled()
+        self.chk_keep_times_2d.setChecked(bool(d2.keep_openfoam_time_folders))
+        self.spin_cycle_write_2d.setValue(int(d2.cycle_write))
+        self.spin_cycle_write_2d.setEnabled(self.chk_keep_times_2d.isChecked())
         g2 = d2.gauges
         mapping_2d = {
             "pressure": g2.pressure,
@@ -504,18 +522,11 @@ class OutputFileOptionsDialog(QDialog):
         self.chk_remap_2d.setChecked(bool(d2.output_remap_data))
 
         d3 = opts.dim3d
+        self.chk_keep_times_3d.setChecked(bool(d3.keep_openfoam_time_folders))
+        self.spin_cycle_write_3d.setValue(int(d3.cycle_write))
+        self.spin_cycle_write_3d.setEnabled(self.chk_keep_times_3d.isChecked())
         self.chk_surfaces.setChecked(d3.write_surfaces)
-        self.rate_3d_surfaces.rad_time.setChecked(d3.surface_by_time)
-        self.rate_3d_surfaces.rad_step.setChecked(not d3.surface_by_time)
-        self.rate_3d_surfaces.spin_time.setValue(d3.surface_time_s)
-        self.rate_3d_surfaces.spin_steps.setValue(d3.surface_steps)
-        self.rate_3d_surfaces.set_enabled_rate(d3.write_surfaces)
         self.chk_volumes.setChecked(d3.write_volumes)
-        self.rate_3d.rad_time.setChecked(d3.vtk_by_time)
-        self.rate_3d.rad_step.setChecked(not d3.vtk_by_time)
-        self.rate_3d.spin_time.setValue(d3.vtk_time_s)
-        self.rate_3d.spin_steps.setValue(d3.vtk_steps)
-        self.rate_3d.set_enabled_rate(d3.write_volumes)
         table = d3.quantities or default_3d_quantities()
         for (key, column), box in self._qty_3d.items():
             box.setChecked(bool(table.get(key, {}).get(column, False)))
@@ -530,22 +541,17 @@ class OutputFileOptionsDialog(QDialog):
         return OutputFileOptions(
             dim1d=Dim1DOutput(gauges=g1),
             dim2d=Dim2DOutput(
-                vtk_by_time=self.rate_2d.by_time(),
-                vtk_time_s=self.rate_2d.time_s(),
-                vtk_steps=self.rate_2d.steps(),
+                keep_openfoam_time_folders=self.chk_keep_times_2d.isChecked(),
+                cycle_write=self.spin_cycle_write_2d.value(),
                 gauges=g2,
                 vtk=v2,
                 output_remap_data=self.chk_remap_2d.isChecked(),
             ),
             dim3d=Dim3DOutput(
+                keep_openfoam_time_folders=self.chk_keep_times_3d.isChecked(),
+                cycle_write=self.spin_cycle_write_3d.value(),
                 write_surfaces=self.chk_surfaces.isChecked(),
-                surface_by_time=self.rate_3d_surfaces.by_time(),
-                surface_time_s=self.rate_3d_surfaces.time_s(),
-                surface_steps=self.rate_3d_surfaces.steps(),
                 write_volumes=self.chk_volumes.isChecked(),
-                vtk_by_time=self.rate_3d.by_time(),
-                vtk_time_s=self.rate_3d.time_s(),
-                vtk_steps=self.rate_3d.steps(),
                 quantities=g3_table,
             ),
         )

@@ -22,6 +22,12 @@ from tab_time_history import TabTimeHistory
 from dialogs import OutputFileOptionsDialog
 from time_history_dialog import TimeHistoryLocationsDialog
 from output_options import OutputFileOptions, output_file_options_from_dict
+from foam_dictionary import read_top_level_entries, update_top_level_entries
+from result_storage import (
+    ResultStoragePolicy,
+    cleanup_native_time_folders,
+    run_reached_configured_end,
+)
 from tab_log import LogTab
 from tab_3d_general import TabGeneral3D
 from tab_probes import TabProbes
@@ -806,11 +812,23 @@ class BlastFoamApp(QMainWindow):
             saved_output_options = project.get("gui_state", {}).get(
                 "output_file_options"
             )
+            legacy_cycle_2d = int(getattr(self.tab_2d, "_cycle_write", 0))
+            legacy_cycle_3d = int(getattr(self.tab_3d, "_cycle_write", 0))
             if isinstance(saved_output_options, dict):
                 self._output_file_options = output_file_options_from_dict(
-                    saved_output_options
+                    saved_output_options,
+                    legacy_cycle_write_2d=legacy_cycle_2d,
+                    legacy_cycle_write_3d=legacy_cycle_3d,
                 )
-                self._apply_output_file_options(self._output_file_options)
+            else:
+                # Projects created before Output File Options were persisted
+                # retained native OpenFOAM history. Preserve that behavior.
+                self._output_file_options = OutputFileOptions()
+                self._output_file_options.dim2d.keep_openfoam_time_folders = True
+                self._output_file_options.dim2d.cycle_write = legacy_cycle_2d
+                self._output_file_options.dim3d.keep_openfoam_time_folders = True
+                self._output_file_options.dim3d.cycle_write = legacy_cycle_3d
+            self._apply_output_file_options(self._output_file_options)
             self.current_project_path = os.path.abspath(path)
             self.active_case_dir_3d = None
             self.active_case_initialized_3d = False
@@ -907,6 +925,11 @@ class BlastFoamApp(QMainWindow):
 
         load_summary = data.pop("_load_summary", None)
         self.tab_3d.set_case_inputs(data, load_summary=load_summary)
+        if bool(data.get("keep_openfoam_time_folders", False)):
+            self._output_file_options.dim3d.keep_openfoam_time_folders = True
+            self._output_file_options.dim3d.cycle_write = int(
+                data.get("cycle_write", 0)
+            )
         self.tabs.setCurrentWidget(self.tab_3d)
         self.active_case_dir_3d = case_dir
         self.active_case_initialized_3d = os.path.isdir(os.path.join(case_dir, "0"))
@@ -1400,6 +1423,13 @@ class BlastFoamApp(QMainWindow):
             state.mode = ImportMode2D.IMPORTED_2D_READY
 
             self.tab_2d.load_imported_case(state, apply_mapping=False)
+            # Imported cases predate the explicit storage policy. Never clean
+            # their native results unless the user later opts out explicitly.
+            self._output_file_options.dim2d.keep_openfoam_time_folders = True
+            self._output_file_options.dim2d.cycle_write = int(
+                getattr(self.tab_2d, "_cycle_write", 0)
+            )
+            self.tab_2d._keep_openfoam_time_folders = True
             self.active_case_dir_2d = case_dir
             self.active_case_initialized_2d = True
             selected_field = self.tab_2d.cmb_field.currentText().strip() or "p"
@@ -2562,22 +2592,24 @@ class BlastFoamApp(QMainWindow):
             QMessageBox.critical(self, "3D Run Error", str(e))
     
     def _update_control_dict_end_time(self, case_dir, new_end_time, write_int, write_control_type="timeStep"):
-        """Update controlDict with new end time and write interval"""
+        """Update only root controlDict run settings, never nested function objects."""
         cd_path = os.path.join(case_dir, "system", "controlDict")
         if not os.path.exists(cd_path):
             return
         try:
-            with open(cd_path, 'r') as f:
-                lines = f.readlines()
-            with open(cd_path, 'w') as f:
-                for line in lines:
-                    if line.strip().startswith("endTime"):
-                        f.write(f"endTime {new_end_time};\n")
-                    elif line.strip().startswith("writeInterval"):
-                        f.write(f"writeInterval {write_int};\n")
-                    else:
-                        f.write(line)
-        except OSError as exc:
+            with open(cd_path, "r", encoding="utf-8", errors="ignore") as stream:
+                text = stream.read()
+            updated, _changed = update_top_level_entries(
+                text,
+                {
+                    "endTime": new_end_time,
+                    "writeControl": write_control_type,
+                    "writeInterval": write_int,
+                },
+            )
+            with open(cd_path, "w", encoding="utf-8", newline="") as stream:
+                stream.write(updated)
+        except (OSError, KeyError) as exc:
             raise RuntimeError(f"Could not update {cd_path}: {exc}") from exc
 
     def _set_control_dict_one_step(self, case_dir):
@@ -2588,19 +2620,13 @@ class BlastFoamApp(QMainWindow):
         if not os.path.exists(cd_path):
             return False
         try:
-            delta_t = None
             with open(cd_path, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
-            for line in lines:
-                s = line.strip()
-                if s.startswith("deltaT"):
-                    tokens = s.replace(";", "").split()
-                    if len(tokens) >= 2:
-                        try:
-                            delta_t = float(tokens[1])
-                            break
-                        except ValueError:
-                            pass
+                text = f.read()
+            root_values = read_top_level_entries(text, ("deltaT",))
+            try:
+                delta_t = float(root_values.get("deltaT", ""))
+            except ValueError:
+                delta_t = None
             if delta_t is None or delta_t <= 0:
                 return False
             # Start from latest time directory so each 'exact 1' continues from the previous step
@@ -2611,17 +2637,14 @@ class BlastFoamApp(QMainWindow):
             )
             start_time = float(execution.latest_time or 0.0)
             one_step_end = start_time + delta_t
-            with open(cd_path, "w", encoding="utf-8") as f:
-                for line in lines:
-                    s = line.strip()
-                    if s.startswith("endTime"):
-                        f.write(f"endTime {one_step_end};\n")
-                    elif s.startswith("startFrom"):
-                        f.write("startFrom       latestTime;\n")
-                    else:
-                        f.write(line)
+            updated, _changed = update_top_level_entries(
+                text,
+                {"endTime": one_step_end, "startFrom": "latestTime"},
+            )
+            with open(cd_path, "w", encoding="utf-8", newline="") as f:
+                f.write(updated)
             return True
-        except (OSError, ValueError, ExecutionPreparationError) as exc:
+        except (OSError, ValueError, KeyError, ExecutionPreparationError) as exc:
             raise RuntimeError(f"Cannot prepare one-step resume: {exc}") from exc
 
     def run_3d_process_exact_1(self):
@@ -2668,6 +2691,36 @@ class BlastFoamApp(QMainWindow):
             self.view_timer.start(1000)
         elif mode == "2D":
             self.view_timer.start(1000)
+
+        terminal_run = intent in (
+            ExecutionIntent.INITIALIZED_SOLVER_RUN,
+            ExecutionIntent.RESUME,
+        )
+        policy = ResultStoragePolicy(
+            keep_openfoam_time_folders=True, terminal_run=terminal_run
+        )
+        opts = getattr(self, "_output_file_options", None)
+        if mode == "2D" and opts is not None:
+            policy = ResultStoragePolicy(
+                keep_openfoam_time_folders=bool(
+                    opts.dim2d.keep_openfoam_time_folders
+                ),
+                vtk_fields=tuple(getattr(self.tab_2d, "_vtk_fields", ())),
+                preserve_remap_data=bool(opts.dim2d.output_remap_data),
+                terminal_run=terminal_run,
+            )
+        elif mode == "3D" and opts is not None:
+            policy = ResultStoragePolicy(
+                keep_openfoam_time_folders=bool(
+                    opts.dim3d.keep_openfoam_time_folders
+                ),
+                vtk_fields=(
+                    tuple(getattr(self.tab_3d, "_volume_fields", ()))
+                    if opts.dim3d.write_volumes
+                    else ()
+                ),
+                terminal_run=terminal_run,
+            )
         
         self.runner = SolverRunner(
             case_dir,
@@ -2675,8 +2728,12 @@ class BlastFoamApp(QMainWindow):
             project_root=self.project_root,
             cores=cores,
             intent=intent,
+            result_storage_policy=policy,
         )
         self._active_run_mode = mode
+        self._active_run_case_dir = case_dir
+        self._active_run_intent = intent
+        self._active_result_storage_policy = policy
         self._run_user_interrupted = False
         self.tab_time_history.begin_run(mode, case_dir)
         # Queued delivery keeps status/viewport updates on the Qt GUI thread.
@@ -2809,22 +2866,46 @@ class BlastFoamApp(QMainWindow):
 
     def on_simulation_finished(self, success):
         """Handle simulation completion"""
-        finished_mode = getattr(self, "_active_run_mode", None)
+        state = self.__dict__
+        finished_mode = state.get("_active_run_mode")
+        finished_case_dir = state.get("_active_run_case_dir", "")
+        finished_intent = state.get("_active_run_intent")
+        storage_policy = state.get(
+            "_active_result_storage_policy"
+        ) or ResultStoragePolicy(
+            keep_openfoam_time_folders=True
+        )
         user_interrupted = bool(getattr(self, "_run_user_interrupted", False))
         self.view_timer.stop()
         self.tab_jotter.stop_monitoring()
         self.runner = None
         self._active_run_mode = None
+        self._active_run_case_dir = None
+        self._active_run_intent = None
+        self._active_result_storage_policy = None
         self._run_user_interrupted = False
         self.status_bar.stop_et_timing()
         if finished_mode == "1D":
             self.tab_1d.end_live_graph()
 
         if success:
+            cleanup_eligible = bool(
+                finished_mode in ("2D", "3D")
+                and finished_intent
+                in (
+                    ExecutionIntent.INITIALIZED_SOLVER_RUN,
+                    ExecutionIntent.RESUME,
+                )
+                and not storage_policy.keep_openfoam_time_folders
+                and run_reached_configured_end(finished_case_dir)
+            )
             self.status_bar.set_progress(100)
             self.status_bar.set_status("Done", "#2ecc71")
-            if self.tabs.currentWidget() == self.tab_3d:
-                self.tab_3d.viewer.refresh_view()
+            if finished_mode == "3D":
+                if cleanup_eligible:
+                    self.tab_3d.viewer.release_vtk()
+                else:
+                    self.tab_3d.viewer.refresh_view()
             if finished_mode == "2D":
                 self.tab_2d.stop_live_follow_keep_time()
                 if getattr(self.tab_2d, "is_imported_mode", False):
@@ -2837,11 +2918,18 @@ class BlastFoamApp(QMainWindow):
                             self.tab_2d._imported_case.cell_count = cells
                     self.tab_2d._refresh_info()
                 self.tab_2d.set_simulation_state(SimulationState2D.COMPLETED)
-                request = getattr(self.tab_2d.viewer, "request_refresh", None)
-                if callable(request):
-                    request()
+                if cleanup_eligible:
+                    self.tab_2d.viewer.release_vtk()
                 else:
                     self.tab_2d.viewer.refresh_view()
+            if cleanup_eligible:
+                report = cleanup_native_time_folders(
+                    finished_case_dir, storage_policy
+                )
+                if report.failures:
+                    self.status_bar.set_status(
+                        "Done — native-result cleanup incomplete", "#e67e22"
+                    )
         else:
             if user_interrupted:
                 self.status_bar.set_status("Interrupted", "#e67e22")

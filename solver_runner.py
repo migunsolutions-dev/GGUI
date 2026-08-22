@@ -15,6 +15,8 @@ from execution_plan import (  # noqa: F401 — re-export for existing imports
     ExecutionPreparationError,
     build_execution_plan,
 )
+from foam_dictionary import update_top_level_entries
+from result_storage import ResultStoragePolicy, ensure_remap_snapshot
 from wsl_runtime import (
     build_case_command_argv,
     popen_group_kwargs,
@@ -85,19 +87,14 @@ def request_solver_write_and_stop(case_dir: str) -> bool:
     try:
         with open(cd_path, "r", encoding="utf-8") as handle:
             text = handle.read()
-        new_text, n_sub = re.subn(
-            r"(?m)^stopAt\s+\S+\s*;",
-            "stopAt          writeNow;",
-            text,
-            count=1,
+        new_text, _changed = update_top_level_entries(
+            text, {"stopAt": "writeNow"}
         )
-        if n_sub:
-            with open(cd_path, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(new_text)
-            return True
-    except OSError:
+        with open(cd_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(new_text)
+        return True
+    except (OSError, KeyError):
         return False
-    return False
 
 
 def complete_probe_chunk(raw: bytes) -> Tuple[bytes, int]:
@@ -157,6 +154,7 @@ class SolverRunner(QThread):
         project_root: Optional[str] = None,
         cores: int = 1,
         intent: ExecutionIntent = ExecutionIntent.FRESH_FULL_PIPELINE,
+        result_storage_policy: Optional[ResultStoragePolicy] = None,
     ):
         super().__init__()
         self.win_case_dir = win_case_dir
@@ -164,6 +162,7 @@ class SolverRunner(QThread):
         self.project_root = project_root
         self.cores = max(1, int(cores))
         self.intent = ExecutionIntent(intent)
+        self.result_storage_policy = result_storage_policy or ResultStoragePolicy()
         self.keep_running = True
         self._stop_requested = False
         self._process_lock = threading.Lock()
@@ -244,6 +243,31 @@ class SolverRunner(QThread):
             subprocess.run(args, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
+
+    def _run_result_export(self) -> int:
+        if not self.result_storage_policy.terminal_run:
+            return 0
+        if self.result_storage_policy.preserve_remap_data:
+            self.status_signal.emit("Preserving selected 2D remap snapshot...")
+            if not ensure_remap_snapshot(self.win_case_dir):
+                return 1
+        command = self.result_storage_policy.foam_to_vtk_command()
+        if not command:
+            return 0
+        self.status_signal.emit("Writing selected whole-domain VTK output...")
+        try:
+            args = self._build_wsl_cmd(self._linux_case_dir, command)
+            completed = subprocess.run(
+                args,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if completed.returncode != 0:
+                return int(completed.returncode)
+            return 0 if os.path.isdir(os.path.join(self.win_case_dir, "VTK")) else 1
+        except Exception:
+            return 1
 
     def _find_control_dict_end_time(self) -> None:
         try:
@@ -450,8 +474,8 @@ class SolverRunner(QThread):
             self._reconstruct_proc = None
         return False
 
-    def _final_reconstruct_latest(self) -> int:
-        """Deterministic post-parallel reconstruct so the serial case has the latest result.
+    def _final_reconstruct_latest(self, *, all_new_times: bool = False) -> int:
+        """Deterministically reconstruct serial results needed by final outputs.
 
         Returns the subprocess exit code (0 on success). Does not launch a second
         reconstructPar while an earlier reconstruction is still active or after a
@@ -463,10 +487,16 @@ class SolverRunner(QThread):
                 "and was stopped after timeout. Check log.reconstructPar / debug_summary.txt."
             )
             return 1
-        self.status_signal.emit("Final reconstruction (reconstructPar -latestTime)...")
+        command = (
+            "reconstructPar -newTimes > log.reconstructFinal 2>&1"
+            if all_new_times
+            else FINAL_RECONSTRUCT_CMD
+        )
+        label = "-newTimes" if all_new_times else "-latestTime"
+        self.status_signal.emit(f"Final reconstruction (reconstructPar {label})...")
         proc = None
         try:
-            args = self._build_wsl_cmd(self._linux_case_dir, FINAL_RECONSTRUCT_CMD)
+            args = self._build_wsl_cmd(self._linux_case_dir, command)
             with self._process_lock:
                 if self._stop_requested or not self.keep_running:
                     return 1
@@ -676,8 +706,18 @@ class SolverRunner(QThread):
             return
 
         if rc == 0:
-            if self.cores > 1 and self.intent != ExecutionIntent.FRESH_FULL_PIPELINE:
-                recon_rc = self._final_reconstruct_latest()
+            needs_final_reconstruct = (
+                self.cores > 1
+                and (
+                    self.intent != ExecutionIntent.FRESH_FULL_PIPELINE
+                    or self.result_storage_policy.needs_serial_results
+                )
+            )
+            if needs_final_reconstruct:
+                if self.result_storage_policy.vtk_fields:
+                    recon_rc = self._final_reconstruct_latest(all_new_times=True)
+                else:
+                    recon_rc = self._final_reconstruct_latest()
                 if recon_rc != 0:
                     self._write_debug_summary(recon_rc)
                     self.status_signal.emit(
@@ -686,6 +726,14 @@ class SolverRunner(QThread):
                     )
                     self.finished_signal.emit(False)
                     return
+            export_rc = self._run_result_export()
+            if export_rc != 0:
+                self.status_signal.emit(
+                    f"Solver finished but selected-result export failed (rc={export_rc}). "
+                    "Native time folders were left in place. Check remap data and log.foamToVTK."
+                )
+                self.finished_signal.emit(False)
+                return
             self.progress_signal.emit(100)
             self.status_signal.emit("Finished.")
             self.finished_signal.emit(True)

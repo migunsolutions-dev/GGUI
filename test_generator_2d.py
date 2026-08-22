@@ -151,6 +151,59 @@ class Generator2DTests(unittest.TestCase):
             control = _read(case, "system/controlDict")
             self.assertIn("(0.2 0.7 0)", control)
 
+    def test_shared_write_frequency_and_retention_cycle(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, kept = self._generate(
+                td,
+                "kept",
+                write_control_type="timeStep",
+                write_interval_steps=37,
+                keep_openfoam_time_folders=True,
+                cycle_write=6,
+                probes=(ProbePoint2D("g1", 0.2, 0.4),),
+                enable_impulse=True,
+                enable_dynamic_pressure=True,
+            )
+            control = _read(kept, "system/controlDict")
+            self.assertIn("writeControl timeStep;", control)
+            self.assertIn("writeInterval 37;", control)
+            self.assertIn("purgeWrite 6;", control)
+            self.assertGreaterEqual(control.count("writeInterval   1;"), 2)
+            self.assertIn("writeInterval 1;", control)
+
+            _, normal = self._generate(
+                td,
+                "normal",
+                write_control_type="adjustableRunTime",
+                write_interval_time=0.00023,
+                keep_openfoam_time_folders=False,
+                cycle_write=6,
+                probes=(ProbePoint2D("g1", 0.2, 0.4),),
+                enable_impulse=True,
+                enable_dynamic_pressure=True,
+            )
+            normal_control = _read(normal, "system/controlDict")
+            self.assertIn("writeControl adjustableRunTime;", normal_control)
+            self.assertIn("writeInterval 0.00023;", normal_control)
+            self.assertIn("purgeWrite 0;", normal_control)
+            self.assertGreaterEqual(normal_control.count("writeInterval   1;"), 2)
+            self.assertIn("writeInterval 1;", normal_control)
+
+    def test_remap_and_gauges_are_independent_of_native_retention(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, case = self._generate(
+                td,
+                "selected_outputs",
+                keep_openfoam_time_folders=False,
+                output_remap_data=True,
+                probes=(ProbePoint2D("g1", 0.2, 0.4),),
+            )
+            control = _read(case, "system/controlDict")
+            self.assertIn("remapDump", control)
+            self.assertIn("writeControl    onEnd;", control)
+            self.assertIn("probes2d", control)
+            self.assertIn("writeInterval 1;", control)
+
     def test_mirroring_never_changes_mesh_or_cell_count(self):
         with tempfile.TemporaryDirectory() as td:
             _, mirrored = self._generate(td, "mirrored", mirrored_view=True)

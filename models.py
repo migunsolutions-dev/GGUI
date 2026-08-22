@@ -150,7 +150,8 @@ class CaseInputs3D:
     # --- controlDict write options ---
     write_control_type: str = "timeStep"  # "timeStep" | "adjustableRunTime"
     write_interval_time: float = 5e-5  # seconds; used when write_control_type == "adjustableRunTime"
-    cycle_write: int = 0  # cycleWrite in controlDict (0 = off)
+    cycle_write: int = 0  # retained-history cycleWrite (0 = keep all)
+    keep_openfoam_time_folders: bool = False
 
     # --- Remap from pre-cursor (radial remap, Autodyn-style) ---
     remap_enabled: bool = False

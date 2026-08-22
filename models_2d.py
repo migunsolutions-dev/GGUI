@@ -87,6 +87,7 @@ class CaseInputs2D:
     write_interval_time: float = 1.0e-5
     write_interval_steps: int = 100
     cycle_write: int = 0
+    keep_openfoam_time_folders: bool = False
     cores: int = 1
 
     # Mesh mode.
@@ -125,6 +126,7 @@ class CaseInputs2D:
     mapping: MappingSource2D = field(default_factory=MappingSource2D)
     probes: Tuple[ProbePoint2D, ...] = field(default_factory=tuple)
     output_fields: Tuple[str, ...] = ("p", "rho", "T", "U", "alpha.c4")
+    vtk_fields: Tuple[str, ...] = ("p",)
     enable_impulse: bool = False
     enable_dynamic_pressure: bool = False
     output_remap_data: bool = False

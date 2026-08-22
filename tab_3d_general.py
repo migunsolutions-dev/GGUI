@@ -842,6 +842,8 @@ class TabGeneral3D(QWidget):
         self._probe_fields = ("p", "impulse")
         self._write_volumes = False
         self._write_surfaces = True
+        self._keep_openfoam_time_folders = False
+        self._cycle_write = 0
         self._surface_by_time = True
         self._surface_time_s = 0.001
         self._surface_steps = 25
@@ -1631,11 +1633,6 @@ class TabGeneral3D(QWidget):
             "Write results every T seconds of simulation time (adjustableRunTime).\n"
             "Resolution down to 1e-10 s; values like 5e-7 are preserved."
         )
-        self.spin_cycle_write = QSpinBox()
-        self.spin_cycle_write.setRange(0, 1000)
-        self.spin_cycle_write.setValue(0)
-        self.spin_cycle_write.setMaximumWidth(80)
-        self.spin_cycle_write.setToolTip("cycleWrite in controlDict (0 = off).")
         self.lbl_write_interval = self._lbl("Write interval (steps)")
         self.lbl_write_time = self._lbl("Write interval [s]")
 
@@ -1684,7 +1681,6 @@ class TabGeneral3D(QWidget):
         h_time.addWidget(self.spin_write_time)
         f1.addRow(wrap_steps)
         f1.addRow(wrap_time)
-        f1.addRow(self._lbl("cycleWrite"), self.spin_cycle_write)
         self.lbl_initial_dt_display = QLabel("Initial Δt: — s")
         self.lbl_initial_dt_display.setObjectName("initialDtDisplay")
         self.lbl_initial_dt_display.setStyleSheet(SECONDARY_INFO_STYLE)
@@ -1971,14 +1967,13 @@ class TabGeneral3D(QWidget):
         self.wrap_write_time.setVisible(not is_time_step)
 
     def apply_output_file_options(self, dim3d) -> None:
-        """Apply Output File Options 3D tab: surface/volume VTK cadence and quantity matrix."""
+        """Apply selected 3D outputs without changing the shared write cadence."""
         from output_options import COL_GAUGES, COL_OBSTACLES, COL_SECTIONS, COL_VOLUMES
 
         self._write_volumes = bool(dim3d.write_volumes)
         self._write_surfaces = bool(dim3d.write_surfaces)
-        self._surface_by_time = bool(dim3d.surface_by_time)
-        self._surface_time_s = float(dim3d.surface_time_s)
-        self._surface_steps = int(dim3d.surface_steps)
+        self._keep_openfoam_time_folders = bool(dim3d.keep_openfoam_time_folders)
+        self._cycle_write = int(dim3d.cycle_write)
         self._quantities_3d = dict(dim3d.quantities or {})
         self._enable_post_processing = bool(dim3d.any_peaks())
         self._probe_fields = dim3d.fields_for(COL_GAUGES) or ("p",)
@@ -1992,17 +1987,6 @@ class TabGeneral3D(QWidget):
             or dim3d.checked("arrival_peak", COL_OBSTACLES)
         )
         self._write_obstacle_id = bool(dim3d.checked("obstacle_id", COL_OBSTACLES))
-        if dim3d.write_volumes:
-            if dim3d.vtk_by_time:
-                idx = self.combo_write_control.findText("adjustableRunTime")
-                if idx >= 0:
-                    self.combo_write_control.setCurrentIndex(idx)
-                self.spin_write_time.setValue(float(dim3d.vtk_time_s))
-            else:
-                idx = self.combo_write_control.findText("timeStep")
-                if idx >= 0:
-                    self.combo_write_control.setCurrentIndex(idx)
-                self.spin_write.setValue(int(dim3d.vtk_steps))
         self._on_write_control_changed(self.combo_write_control.currentText())
 
     def _surface_planes_for_case(self):
@@ -3396,7 +3380,7 @@ class TabGeneral3D(QWidget):
         elif key == "write_interval_steps":
             self.spin_write.setValue(100)
         elif key == "cycle_write":
-            self.spin_cycle_write.setValue(0)
+            self._cycle_write = 0
         elif key == "material_name":
             idx = self.c_mat.findText("C4")
             if idx >= 0:
@@ -4031,7 +4015,11 @@ class TabGeneral3D(QWidget):
             if "write_interval_time" in data:
                 self.spin_write_time.setValue(data["write_interval_time"])
             if "cycle_write" in data:
-                self.spin_cycle_write.setValue(data["cycle_write"])
+                self._cycle_write = int(data["cycle_write"])
+            if "keep_openfoam_time_folders" in data:
+                self._keep_openfoam_time_folders = bool(
+                    data["keep_openfoam_time_folders"]
+                )
             self._on_write_control_changed(self.combo_write_control.currentText())
             if "probe_fields" in data:
                 self._probe_fields = tuple(data.get("probe_fields") or ("p",))
@@ -4151,7 +4139,8 @@ class TabGeneral3D(QWidget):
             write_interval_steps=self.spin_write.value(),
             write_interval_time=self.spin_write_time.value(),
             write_control_type=self.combo_write_control.currentText(),
-            cycle_write=self.spin_cycle_write.value(),
+            cycle_write=self._cycle_write,
+            keep_openfoam_time_folders=self._keep_openfoam_time_folders,
             cores=self.spin_cores.value(),
             cfl_value=self.spin_cfl.value(),
             obstacles=obs_data,

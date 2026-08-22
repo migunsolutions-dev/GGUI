@@ -3574,18 +3574,18 @@ if __name__ == "__main__":
             "",
         ]
         wc_type = getattr(inputs, "write_control_type", "timeStep")
-        write_volumes = bool(getattr(inputs, "write_volumes", True))
-        if not write_volumes:
-            cd_lines.append("writeControl    adjustableRunTime;")
-            cd_lines.append(f"writeInterval   {float(inputs.end_time_s):.10g};")
-        elif wc_type == "adjustableRunTime":
+        if wc_type == "adjustableRunTime":
             w_interval = getattr(inputs, "write_interval_time", 5e-5)
             cd_lines.append("writeControl    adjustableRunTime;")
             cd_lines.append(f"writeInterval   {w_interval};")
         else:
             cd_lines.append("writeControl    timeStep;")
             cd_lines.append(f"writeInterval   {inputs.write_interval_steps};")
-        cycle_w = getattr(inputs, "cycle_write", 0)
+        cycle_w = (
+            int(getattr(inputs, "cycle_write", 0))
+            if bool(getattr(inputs, "keep_openfoam_time_folders", False))
+            else 0
+        )
         cd_lines += [
             f"cycleWrite      {cycle_w};",
             "purgeWrite      0;",  # Keep all time directories (0 = unlimited)
@@ -3653,9 +3653,9 @@ if __name__ == "__main__":
                 obstacle_fields = obstacle_fields + ("overpressure",)
             sections_part = surfaces_vtk_block(
                 name="sectionsVTK",
-                by_time=bool(getattr(inputs, "surface_write_by_time", True)),
-                interval_time=float(getattr(inputs, "surface_write_interval_time", 0.001)),
-                interval_steps=int(getattr(inputs, "surface_write_interval_steps", 25)),
+                by_time=wc_type == "adjustableRunTime",
+                interval_time=float(getattr(inputs, "write_interval_time", 5e-5)),
+                interval_steps=int(getattr(inputs, "write_interval_steps", 100)),
                 fields=section_fields,
                 planes=planes,
                 patches=(),
@@ -3664,9 +3664,9 @@ if __name__ == "__main__":
             if patches and (obstacle_fields or write_oid or write_arrival):
                 obstacles_part = surfaces_vtk_block(
                     name="obstaclesVTK",
-                    by_time=bool(getattr(inputs, "surface_write_by_time", True)),
-                    interval_time=float(getattr(inputs, "surface_write_interval_time", 0.001)),
-                    interval_steps=int(getattr(inputs, "surface_write_interval_steps", 25)),
+                    by_time=wc_type == "adjustableRunTime",
+                    interval_time=float(getattr(inputs, "write_interval_time", 5e-5)),
+                    interval_steps=int(getattr(inputs, "write_interval_steps", 100)),
                     fields=obstacle_fields or ("p",),
                     planes=(),
                     patches=patches,

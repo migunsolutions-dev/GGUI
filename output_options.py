@@ -61,6 +61,7 @@ VTK_TO_OUTPUT_CHECK: Dict[str, str] = {
     "temperature": "T",
     "velocity": "U",
     "mass_fractions": "alpha.c4",
+    "energy": "rhoE",
 }
 
 COL_GAUGES = "gauges"
@@ -196,6 +197,8 @@ class Dim1DOutput:
 
 @dataclass
 class Dim2DOutput:
+    keep_openfoam_time_folders: bool = False
+    cycle_write: int = 0
     vtk_by_time: bool = True
     vtk_time_s: float = 0.001
     vtk_steps: int = 25
@@ -217,6 +220,8 @@ class Dim2DOutput:
 
 @dataclass
 class Dim3DOutput:
+    keep_openfoam_time_folders: bool = False
+    cycle_write: int = 0
     write_surfaces: bool = True
     surface_by_time: bool = True
     surface_time_s: float = 0.001
@@ -254,27 +259,47 @@ def _known_values(cls, data: Any) -> Dict[str, Any]:
     return {key: value for key, value in data.items() if key in names}
 
 
-def output_file_options_from_dict(data: Any) -> OutputFileOptions:
-    """Restore persisted dialog state while tolerating missing legacy keys."""
+def output_file_options_from_dict(
+    data: Any,
+    *,
+    legacy_cycle_write_2d: int = 0,
+    legacy_cycle_write_3d: int = 0,
+) -> OutputFileOptions:
+    """Restore persisted dialog state while tolerating missing legacy keys.
+
+    Output-options payloads written before native-time retention was explicit
+    are migrated to ``keep_openfoam_time_folders=True``.  That preserves the
+    old behavior; new ``OutputFileOptions`` instances still default to False.
+    """
     if not isinstance(data, dict):
         return OutputFileOptions()
     raw_1d = data.get("dim1d") if isinstance(data.get("dim1d"), dict) else {}
     raw_2d = data.get("dim2d") if isinstance(data.get("dim2d"), dict) else {}
     raw_3d = data.get("dim3d") if isinstance(data.get("dim3d"), dict) else {}
+    values_2d = _known_values(Dim2DOutput, raw_2d)
+    values_3d = _known_values(Dim3DOutput, raw_3d)
+    if "keep_openfoam_time_folders" not in raw_2d:
+        values_2d["keep_openfoam_time_folders"] = True
+    if "keep_openfoam_time_folders" not in raw_3d:
+        values_3d["keep_openfoam_time_folders"] = True
+    if "cycle_write" not in raw_2d:
+        values_2d["cycle_write"] = int(legacy_cycle_write_2d)
+    if "cycle_write" not in raw_3d:
+        values_3d["cycle_write"] = int(legacy_cycle_write_3d)
     return OutputFileOptions(
         dim1d=Dim1DOutput(
             gauges=GaugeFlags(**_known_values(GaugeFlags, raw_1d.get("gauges")))
         ),
         dim2d=Dim2DOutput(
             **{
-                **_known_values(Dim2DOutput, raw_2d),
+                **values_2d,
                 "gauges": GaugeFlags(
                     **_known_values(GaugeFlags, raw_2d.get("gauges"))
                 ),
                 "vtk": GaugeFlags(**_known_values(GaugeFlags, raw_2d.get("vtk"))),
             }
         ),
-        dim3d=Dim3DOutput(**_known_values(Dim3DOutput, raw_3d)),
+        dim3d=Dim3DOutput(**values_3d),
     )
 
 

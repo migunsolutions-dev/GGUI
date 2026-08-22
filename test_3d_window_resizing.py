@@ -228,7 +228,7 @@ class Test3DWindowResizing(unittest.TestCase):
             self.assertTrue(self.tab.ctrl_tabs.isVisible())
             self.assertTrue(self.tab.btn_exact_1.isVisible())
             self.assertTrue(self.tab.btn_exact_end.isVisible())
-            self.assertTrue(self.tab.spin_cycle_write.isVisible())
+            self.assertFalse(hasattr(self.tab, "spin_cycle_write"))
             self._assert_status_labels_readable()
             self.assertIn("Running", self.status.lbl_status.text())
         finally:

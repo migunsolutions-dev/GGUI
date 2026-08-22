@@ -196,6 +196,10 @@ class Tab2D(QWidget):
         self._enable_impulse = True
         self._enable_dynamic_pressure = False
         self._output_remap_data = False
+        self._keep_openfoam_time_folders = False
+        self._cycle_write = 0
+        self._vtk_fields = ("p",)
+        self._output_option_fields = ("p",)
         self._preview_flush_timer = QTimer(self)
         self._preview_flush_timer.setSingleShot(True)
         self._preview_flush_timer.timeout.connect(self._flush_setup_preview)
@@ -1411,7 +1415,6 @@ class Tab2D(QWidget):
         self.cmb_write_control.setMaximumWidth(self.cmb_write_control.sizeHint().width())
         self.spin_write_time = self._double(0.001, 1e-12, 1e6, 9)
         self.spin_write_steps = self._int(100, 1)
-        self.spin_cycle_write = self._int(0, 0)
         self.spin_cores = self._int(1, 1, 1024)
         time_row = QWidget()
         time_layout = QHBoxLayout(time_row)
@@ -1463,7 +1466,6 @@ class Tab2D(QWidget):
         interval_layout.addWidget(self.lbl_write_interval_unit, 0)
         interval_layout.addStretch(1)
         grid.addWidget(interval_row, 3, 0)
-        grid.addWidget(self._solver_field("cycleWrite:", self.spin_cycle_write), 3, 1)
         grid.addWidget(self._solver_field("Processor cores:", self.spin_cores), 4, 0)
         self._sync_write_interval_display()
         self.grp_solver = group
@@ -2219,23 +2221,28 @@ class Tab2D(QWidget):
         return tuple(probes)
 
     def apply_output_file_options(self, dim2d) -> None:
-        """Apply Output File Options 2D tab: VTK cadence, gauges, VTK field checks."""
-        if dim2d.vtk_by_time:
-            idx = self.cmb_write_control.findData("adjustableRunTime")
-            self.cmb_write_control.setCurrentIndex(idx if idx >= 0 else 0)
-            self.spin_write_time.setValue(float(dim2d.vtk_time_s))
-        else:
-            idx = self.cmb_write_control.findData("timeStep")
-            self.cmb_write_control.setCurrentIndex(idx if idx >= 0 else 1)
-            self.spin_write_steps.setValue(int(dim2d.vtk_steps))
+        """Apply selected 2D outputs without changing the shared write cadence."""
+        self._keep_openfoam_time_folders = bool(dim2d.keep_openfoam_time_folders)
+        self._cycle_write = int(dim2d.cycle_write)
         g, v = dim2d.gauges, dim2d.vtk
+        vtk_pairs = (
+            ("p", v.pressure),
+            ("rho", v.density),
+            ("T", v.temperature),
+            ("U", v.velocity),
+            ("alpha.c4", v.mass_fractions),
+            ("rhoE", v.energy),
+        )
+        self._vtk_fields = tuple(field for field, on in vtk_pairs if on)
         pairs = (
             ("p", g.pressure or v.pressure),
             ("rho", g.density or v.density),
             ("T", g.temperature or v.temperature),
             ("U", g.velocity or v.velocity),
             ("alpha.c4", g.mass_fractions or v.mass_fractions),
+            ("rhoE", g.energy or v.energy),
         )
+        self._output_option_fields = tuple(field for field, on in pairs if on)
         for field, on in pairs:
             if field in self.output_checks:
                 self.output_checks[field].setChecked(bool(on))
@@ -2314,7 +2321,8 @@ class Tab2D(QWidget):
             write_control_type=self._combo_stored_value(self.cmb_write_control),
             write_interval_time=self.spin_write_time.value(),
             write_interval_steps=self.spin_write_steps.value(),
-            cycle_write=self.spin_cycle_write.value(),
+            cycle_write=self._cycle_write,
+            keep_openfoam_time_folders=self._keep_openfoam_time_folders,
             cores=self.spin_cores.value(),
             mesh_mode=self.cmb_mesh_mode.currentText(),
             charge_seed_mode=self.cmb_seed_mode.currentText(),
@@ -2347,8 +2355,16 @@ class Tab2D(QWidget):
             mapping=mapping,
             probes=self._probes(),
             output_fields=tuple(
-                field for field, check in self.output_checks.items() if check.isChecked()
+                dict.fromkeys(
+                    [
+                        field
+                        for field, check in self.output_checks.items()
+                        if check.isChecked()
+                    ]
+                    + list(self._output_option_fields)
+                )
             ),
+            vtk_fields=tuple(self._vtk_fields),
             enable_impulse=bool(getattr(self, "_enable_impulse", True)),
             enable_dynamic_pressure=bool(getattr(self, "_enable_dynamic_pressure", False)),
             output_remap_data=bool(getattr(self, "_output_remap_data", False)),
@@ -2390,7 +2406,6 @@ class Tab2D(QWidget):
                 (self.spin_delta_t, "delta_t"),
                 (self.spin_write_time, "write_interval_time"),
                 (self.spin_write_steps, "write_interval_steps"),
-                (self.spin_cycle_write, "cycle_write"),
                 (self.spin_cores, "cores"),
                 (self.spin_seed_level, "charge_refinement_level"),
                 (self.spin_seed_target, "charge_seed_target_cells"),
@@ -2485,6 +2500,17 @@ class Tab2D(QWidget):
                 selected = set(values.get("output_fields", ()))
                 for field, check in self.output_checks.items():
                     check.setChecked(field in selected)
+                self._output_option_fields = tuple(
+                    field for field in selected if field not in self.output_checks
+                )
+            if "vtk_fields" in values:
+                self._vtk_fields = tuple(values.get("vtk_fields") or ())
+            if "cycle_write" in values:
+                self._cycle_write = int(values["cycle_write"])
+            if "keep_openfoam_time_folders" in values:
+                self._keep_openfoam_time_folders = bool(
+                    values["keep_openfoam_time_folders"]
+                )
             if "enable_impulse" in values:
                 self._enable_impulse = bool(values["enable_impulse"])
             if "enable_dynamic_pressure" in values:

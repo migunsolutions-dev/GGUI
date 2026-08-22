@@ -236,6 +236,9 @@ class ProjectRoundTripHealthTests(unittest.TestCase):
     def test_3d_output_generation_fields_restore_from_case_inputs(self):
         probes = ProbesModel()
         source = TabGeneral3D(probes)
+        source.combo_write_control.setCurrentText("timeStep")
+        source.spin_write.setValue(73)
+        source.spin_write_time.setValue(0.00041)
         quantities = {
             "pressure": {
                 "gauges": True,
@@ -248,6 +251,8 @@ class ProjectRoundTripHealthTests(unittest.TestCase):
         }
         source.apply_output_file_options(
             Dim3DOutput(
+                keep_openfoam_time_folders=True,
+                cycle_write=5,
                 write_surfaces=False,
                 write_volumes=True,
                 surface_by_time=False,
@@ -255,6 +260,9 @@ class ProjectRoundTripHealthTests(unittest.TestCase):
                 quantities=quantities,
             )
         )
+        self.assertEqual(source.combo_write_control.currentText(), "timeStep")
+        self.assertEqual(source.spin_write.value(), 73)
+        self.assertAlmostEqual(source.spin_write_time.value(), 0.00041)
         expected = source.get_case_inputs()
 
         target = TabGeneral3D(probes)
@@ -267,6 +275,8 @@ class ProjectRoundTripHealthTests(unittest.TestCase):
             "write_volumes",
             "surface_write_by_time",
             "surface_write_interval_steps",
+            "keep_openfoam_time_folders",
+            "cycle_write",
             "section_fields",
             "obstacle_fields",
             "volume_fields",

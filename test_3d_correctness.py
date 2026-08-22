@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 from generator_3d import Generator3D
 from initialization_plan import (
@@ -13,6 +13,7 @@ from initialization_plan import (
     outer_band_will_be_applied,
 )
 from models import CaseInputs3D, ObstacleData
+from output_options import OutputFileOptions, output_file_options_from_dict
 from project_io import (
     ProjectFormatError,
     build_project,
@@ -696,11 +697,17 @@ class ProjectPersistenceTests(unittest.TestCase):
             write_control_type="adjustableRunTime",
             write_interval_time=2e-5,
         )
+        output_options = OutputFileOptions()
+        output_options.dim2d.keep_openfoam_time_folders = True
+        output_options.dim2d.cycle_write = 3
+        output_options.dim3d.keep_openfoam_time_folders = False
+        output_options.dim3d.cycle_write = 7
         payload = build_project(
             original,
             probes={"probes": [{"name": "P1", "x": 1, "y": 2, "z": 3}]},
             gui_state={
                 "sections": [{"name": "cut"}],
+                "output_file_options": asdict(output_options),
                 "obstacles": [
                     {
                         "enabled": False,
@@ -720,6 +727,13 @@ class ProjectPersistenceTests(unittest.TestCase):
         self.assertEqual(loaded["inputs"], original)
         self.assertEqual(loaded["probes"], payload["probes"])
         self.assertEqual(loaded["gui_state"], payload["gui_state"])
+        restored_options = output_file_options_from_dict(
+            loaded["gui_state"]["output_file_options"]
+        )
+        self.assertTrue(restored_options.dim2d.keep_openfoam_time_folders)
+        self.assertEqual(restored_options.dim2d.cycle_write, 3)
+        self.assertFalse(restored_options.dim3d.keep_openfoam_time_folders)
+        self.assertEqual(restored_options.dim3d.cycle_write, 7)
 
     def test_loaded_project_regenerates_solver_dictionaries(self):
         with tempfile.TemporaryDirectory() as td:

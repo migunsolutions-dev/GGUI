@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import asdict
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -13,8 +14,15 @@ from PyQt5.QtWidgets import QApplication, QLabel
 from dialogs import OutputFileOptionsDialog
 from generator_1d import Generator1D
 from models import BOUNDARY_1D_TRANSMIT, CaseInputs1D, RecommendedParams1D
-from output_options import OutputFileOptions, extra_function_objects, surfaces_vtk_block
+from output_options import (
+    OutputFileOptions,
+    Dim2DOutput,
+    extra_function_objects,
+    output_file_options_from_dict,
+    surfaces_vtk_block,
+)
 from tab_1d import Tab1D
+from tab_2d import Tab2D
 
 
 def _app():
@@ -117,6 +125,74 @@ class OutputFileOptionsDialogTests(unittest.TestCase):
         self.assertTrue(opts.dim3d.write_surfaces)
         self.assertFalse(opts.dim2d.output_remap_data)
         dialog.close()
+
+    def test_native_time_retention_defaults_off_and_controls_cycle_write(self):
+        dialog = OutputFileOptionsDialog(None, OutputFileOptions())
+        self.assertFalse(dialog.chk_keep_times_2d.isChecked())
+        self.assertFalse(dialog.spin_cycle_write_2d.isEnabled())
+        self.assertFalse(dialog.chk_keep_times_3d.isChecked())
+        self.assertFalse(dialog.spin_cycle_write_3d.isEnabled())
+        self.assertFalse(hasattr(dialog, "rate_2d"))
+        self.assertFalse(hasattr(dialog, "rate_3d"))
+
+        dialog.chk_keep_times_2d.setChecked(True)
+        dialog.chk_keep_times_3d.setChecked(True)
+        dialog.spin_cycle_write_2d.setValue(4)
+        dialog.spin_cycle_write_3d.setValue(7)
+        self.assertTrue(dialog.spin_cycle_write_2d.isEnabled())
+        self.assertTrue(dialog.spin_cycle_write_3d.isEnabled())
+        options = dialog.get_options()
+        self.assertTrue(options.dim2d.keep_openfoam_time_folders)
+        self.assertEqual(options.dim2d.cycle_write, 4)
+        self.assertTrue(options.dim3d.keep_openfoam_time_folders)
+        self.assertEqual(options.dim3d.cycle_write, 7)
+        dialog.close()
+
+    def test_retention_round_trip_and_legacy_migration(self):
+        options = OutputFileOptions()
+        options.dim2d.keep_openfoam_time_folders = True
+        options.dim2d.cycle_write = 3
+        restored = output_file_options_from_dict(asdict(options))
+        self.assertTrue(restored.dim2d.keep_openfoam_time_folders)
+        self.assertEqual(restored.dim2d.cycle_write, 3)
+        self.assertFalse(restored.dim3d.keep_openfoam_time_folders)
+
+        legacy = asdict(options)
+        legacy["dim2d"].pop("keep_openfoam_time_folders")
+        legacy["dim2d"].pop("cycle_write")
+        legacy["dim3d"].pop("keep_openfoam_time_folders")
+        legacy["dim3d"].pop("cycle_write")
+        migrated = output_file_options_from_dict(
+            legacy, legacy_cycle_write_2d=5, legacy_cycle_write_3d=9
+        )
+        self.assertTrue(migrated.dim2d.keep_openfoam_time_folders)
+        self.assertEqual(migrated.dim2d.cycle_write, 5)
+        self.assertTrue(migrated.dim3d.keep_openfoam_time_folders)
+        self.assertEqual(migrated.dim3d.cycle_write, 9)
+
+    def test_2d_output_options_do_not_move_or_overwrite_shared_write_controls(self):
+        tab = Tab2D()
+        index = tab.cmb_write_control.findData("timeStep")
+        tab.cmb_write_control.setCurrentIndex(index)
+        tab.spin_write_time.setValue(0.00041)
+        tab.spin_write_steps.setValue(73)
+        selected = Dim2DOutput(
+            vtk_by_time=True,
+            vtk_time_s=9.0,
+            vtk_steps=999,
+            keep_openfoam_time_folders=True,
+            cycle_write=5,
+        )
+        selected.vtk.energy = True
+        tab.apply_output_file_options(
+            selected
+        )
+        self.assertEqual(tab.cmb_write_control.currentData(), "timeStep")
+        self.assertAlmostEqual(tab.spin_write_time.value(), 0.00041)
+        self.assertEqual(tab.spin_write_steps.value(), 73)
+        self.assertEqual(tab._cycle_write, 5)
+        self.assertIn("rhoE", tab.get_case_inputs().vtk_fields)
+        self.assertIn("rhoE", tab.get_case_inputs().output_fields)
 
 
 class SurfaceVtkBlockTests(unittest.TestCase):

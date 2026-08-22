@@ -234,6 +234,7 @@ class GeneratedCaseRoundTripTests(unittest.TestCase):
                 buffer_layers=3,
                 dyn_refine_max=3,
                 cycle_write=4,
+                keep_openfoam_time_folders=True,
                 cores=3,
                 probes=(ProbePoint2D("near", 0.5, 4.0),),
                 output_fields=("p", "alpha.c4"),
