@@ -145,6 +145,14 @@ class Tab2DInfoPanelTests(unittest.TestCase):
             self.tab.info_frame.objectName(), "cylindrical2dInfoPanel"
         )
         self.assertEqual(self.tab.info_body.objectName(), "cylindrical2dInfoBody")
+        header = self.tab.lbl_info_header
+        self.assertIn("palette(window)", header.styleSheet())
+        self.assertIn("font-weight:bold", header.styleSheet().replace(" ", ""))
+        sample = next(iter(self.tab._info_row_widgets.values()))[0]
+        row_h = max(sample.sizeHint().height(), sample.fontMetrics().height() + 4)
+        self.assertGreaterEqual(self.tab.info_body.height(), 5 * row_h)
+        for label, _value in self.tab._info_row_widgets.values():
+            self.assertIn("font-weight: bold", label.styleSheet())
 
     def test_initialized_charge_count_reads_only_initial_alpha_field(self):
         with tempfile.TemporaryDirectory() as root:

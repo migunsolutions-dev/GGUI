@@ -81,7 +81,6 @@ from ui_metrics import (
     EXECUTION_AREA_PREFERRED_HEIGHT_2D,
     FORM_ROW_SPACING,
     GROUP_MARGINS,
-    INFO_PANEL_HEIGHT,
     INFO_ROW_STYLE,
     INFO_TITLE_STYLE,
     SECONDARY_INFO_STYLE,
@@ -1234,7 +1233,6 @@ class Tab2D(QWidget):
     def _build_info_panel(self) -> QFrame:
         frame = QFrame()
         frame.setObjectName("cylindrical2dInfoPanel")
-        frame.setFixedHeight(INFO_PANEL_HEIGHT + 25)
         frame.setStyleSheet(
             "QFrame#cylindrical2dInfoPanel { background:transparent; border:none; }"
         )
@@ -1243,13 +1241,15 @@ class Tab2D(QWidget):
         layout.setSpacing(0)
         title = QLabel("Info")
         title.setObjectName("cylindrical2dInfoHeader")
+        # Match native QGroupBox title chrome used by Direct Charge / Setup groups.
         title.setStyleSheet(
             "QLabel#cylindrical2dInfoHeader {"
-            " background:#eef2f6; border:1px solid #c7d0da;"
+            " background:palette(window); border:1px solid #c7d0da;"
             " padding:3px 7px; font-weight:bold; font-size:9pt; color:#333;"
             "}"
         )
         layout.addWidget(title)
+        self.lbl_info_header = title
 
         body = QFrame()
         body.setObjectName("cylindrical2dInfoBody")
@@ -1266,6 +1266,7 @@ class Tab2D(QWidget):
         rows.setContentsMargins(0, 0, 0, 0)
         rows.setHorizontalSpacing(10)
         rows.setVerticalSpacing(2)
+        label_style = INFO_ROW_STYLE.replace("font-size: 9pt;", "font-size: 9pt; font-weight: bold;")
         self._info_row_widgets = {}
         for key, caption in (
             ("radius_cells", "Radius Cells"),
@@ -1282,7 +1283,7 @@ class Tab2D(QWidget):
             value = QLabel("—")
             label.setObjectName(f"info2d_{key}_label")
             value.setObjectName(f"info2d_{key}_value")
-            label.setStyleSheet(INFO_ROW_STYLE)
+            label.setStyleSheet(label_style)
             value.setStyleSheet(INFO_ROW_STYLE)
             value.setTextInteractionFlags(Qt.TextSelectableByMouse)
             rows.addRow(label, value)
@@ -1296,6 +1297,23 @@ class Tab2D(QWidget):
         body_layout.addWidget(self.lbl_info_warning)
         body_layout.addStretch()
         layout.addWidget(body, 1)
+        sample_label = next(iter(self._info_row_widgets.values()))[0]
+        sample_label.ensurePolished()
+        title.ensurePolished()
+        row_h = max(
+            24,
+            sample_label.sizeHint().height(),
+            sample_label.fontMetrics().height() + 8,
+        )
+        margins = body_layout.contentsMargins()
+        body_h = (
+            margins.top()
+            + margins.bottom()
+            + 5 * row_h
+            + 4 * rows.verticalSpacing()
+        )
+        header_h = max(title.sizeHint().height(), title.fontMetrics().height() + 10)
+        frame.setFixedHeight(header_h + body_h)
 
         # Compatibility names retained for callers while rows are state-driven.
         self.lbl_radial_cells_title, self.lbl_radial_cells = self._info_row_widgets[
