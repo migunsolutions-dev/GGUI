@@ -14,10 +14,12 @@ from PyQt5.QtWidgets import QApplication
 from models_2d import ProbePoint2D
 from probes_model import ProbePoint
 from tab_time_history import (
+    ImportedSeries,
     TabTimeHistory,
     catalog_rows,
     latest_probe_field_file,
     padded_axis_limits,
+    parse_external_timeseries,
     parse_probe_history,
     wrap_legend_name,
 )
@@ -66,6 +68,17 @@ class ProbeHistoryReaderTests(unittest.TestCase):
             self.assertEqual(times, [0.0, 0.001])
             self.assertEqual(columns[0], [101325.0, 201325.0])
 
+    def test_parse_named_column_csv_timeseries(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "gauges.csv")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("Time,G1,G2\n")
+                handle.write("0.0,1,2\n")
+                handle.write("0.1,3,4\n")
+            times, series = parse_external_timeseries(path)
+            self.assertEqual(times, [0.0, 0.1])
+            self.assertEqual(series, {"G1": [1.0, 3.0], "G2": [2.0, 4.0]})
+
 
 class TabTimeHistoryUiTests(unittest.TestCase):
     @classmethod
@@ -84,6 +97,15 @@ class TabTimeHistoryUiTests(unittest.TestCase):
         self.tab.refresh_catalog()
 
     def test_layout_defaults(self):
+        self.assertEqual(
+            [
+                self.tab.workspace_tabs.tabText(index)
+                for index in range(self.tab.workspace_tabs.count())
+            ],
+            ["Gauges", "Add Data", "Appearance"],
+        )
+        self.assertIs(self.tab._plot_splitter.widget(0), self.tab.workspace_tabs)
+        self.assertIs(self.tab._plot_splitter.widget(1), self.tab.canvas)
         self.assertEqual(self.tab.chk_3d.text(), "3D")
         self.assertEqual(self.tab.chk_2d.text(), "2D")
         self.assertEqual(self.tab.chk_1d.text(), "1D")
@@ -101,6 +123,10 @@ class TabTimeHistoryUiTests(unittest.TestCase):
             for i in range(self.tab.tbl_gauges.columnCount())
         ]
         self.assertEqual(headers, ["ID", "X", "Y", "Z", "Label"])
+        all_text = " ".join(
+            widget.text() for widget in self.tab.findChildren(type(self.tab.btn_add))
+        )
+        self.assertNotIn("VIPER", all_text.upper())
 
     def test_each_table_column_can_be_resized(self):
         header = self.tab.tbl_gauges.horizontalHeader()
@@ -111,6 +137,16 @@ class TabTimeHistoryUiTests(unittest.TestCase):
         before = header.sectionSize(2)
         header.resizeSection(2, before + 25)
         self.assertEqual(header.sectionSize(2), before + 25)
+
+    def test_workspace_tab_switch_keeps_graph_geometry(self):
+        self.tab.resize(1685, 900)
+        self.tab.show()
+        self.app.processEvents()
+        initial = self.tab.canvas.geometry()
+        for index in range(self.tab.workspace_tabs.count()):
+            self.tab.workspace_tabs.setCurrentIndex(index)
+            self.app.processEvents()
+            self.assertEqual(self.tab.canvas.geometry(), initial)
 
     def test_regions_checkbox_sits_below_3d(self):
         self.tab.show()
@@ -218,6 +254,89 @@ class TabTimeHistoryUiTests(unittest.TestCase):
             line = self.tab.canvas.axes.lines[0]
             self.assertEqual(list(line.get_xdata()), [0.002])
             self.assertEqual(list(line.get_ydata()), [200000.0])
+
+    def test_load_completed_case_discovers_gauges_and_extrema(self):
+        with tempfile.TemporaryDirectory() as td:
+            fo = os.path.join(td, "postProcessing", "gauges1d", "0")
+            os.makedirs(fo)
+            with open(os.path.join(fo, "p"), "w", encoding="utf-8") as handle:
+                handle.write("# Probe 0 (1.5 0 0)\n")
+                handle.write("0.0 101325\n")
+                handle.write("0.1 201325\n")
+            loaded = self.tab.load_completed_case(td)
+            self.assertEqual(loaded, 1)
+            self.assertEqual(len(self.tab._imported), 1)
+            series = self.tab._imported[0]
+            self.assertEqual(series.dim, "1d")
+            self.assertEqual(series.field, "p")
+            self.assertEqual(series.values, [0.0, 100000.0])
+            self.assertEqual(series.extrema(), (0.0, 0.0, 100000.0, 0.1))
+            self.assertEqual(self.tab.tbl_imported.rowCount(), 1)
+
+    def test_csv_import_plots_on_right_axis_with_live_series(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "external.csv")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("Time,Imported Gauge\n")
+                handle.write("0.0,0\n")
+                handle.write("0.1,25\n")
+            self.assertEqual(self.tab.load_external_file(path), 1)
+            self.tab.tbl_imported.selectRow(0)
+            self.tab._plot_import_selection("right")
+            self.tab.tbl_gauges.selectRow(0)
+            self.tab.add_selected()
+            self.tab._redraw_plot()
+            self.assertIsNotNone(self.tab._right_axes)
+            self.assertEqual(len(self.tab._right_axes.lines), 1)
+            self.assertEqual(
+                list(self.tab._right_axes.lines[0].get_ydata()), [0.0, 25.0]
+            )
+            self.assertEqual(len(self.tab.canvas.axes.lines), 1)
+
+    def test_impulse_import_uses_dashed_line(self):
+        self.tab._imported.append(
+            ImportedSeries(
+                uid="impulse",
+                source="CompletedCase",
+                dim="1d",
+                field="impulse",
+                label="G1",
+                times=[0.0, 0.1],
+                values=[0.0, 10.0],
+                plotted=True,
+                color="#123456",
+            )
+        )
+        self.tab._redraw_plot()
+        self.assertEqual(self.tab.canvas.axes.lines[0].get_linestyle(), "--")
+        self.assertEqual(self.tab.canvas.axes.lines[0].get_color(), "#123456")
+
+    def test_appearance_controls_apply_to_all_series(self):
+        self.tab._imported.append(
+            ImportedSeries(
+                uid="external",
+                source="CSV",
+                dim="1d",
+                field="p",
+                label="Loaded",
+                times=[0.0, 0.1],
+                values=[1.0, 2.0],
+                plotted=True,
+                color="#123456",
+            )
+        )
+        self.tab.edit_plot_title.setText("Combined Histories")
+        self.tab.cmb_legend_position.setCurrentText("Top")
+        controls = self.tab._appearance_controls["x"]
+        controls["title"].setText("Elapsed Time (s)")
+        controls["minimum"].setText("-1")
+        controls["maximum"].setText("2")
+        self.tab._redraw_plot()
+        axes = self.tab.canvas.axes
+        self.assertEqual(axes.get_title(), "Combined Histories")
+        self.assertEqual(axes.get_xlabel(), "Elapsed Time (s)")
+        self.assertEqual(tuple(round(value, 6) for value in axes.get_xlim()), (-1.0, 2.0))
+        self.assertIsNotNone(axes.get_legend())
 
     def test_added_gauges_have_distinct_colors_and_right_legend(self):
         self.tab.tbl_gauges.selectRow(0)
