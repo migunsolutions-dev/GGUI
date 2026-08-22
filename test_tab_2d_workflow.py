@@ -7,7 +7,7 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QLabel
 
 from axisymmetric_2d import DYNAMIC_MESH, FIXED_MESH, REMAP_SOURCE
 from axisymmetric_viewer import AxisymmetricViewerWidget
@@ -96,6 +96,41 @@ class Tab2DWorkflowTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(self.tab.btn_edit_remap.isEnabled())
 
+    def test_advanced_remap_rows_are_hidden_and_time_is_always_latest(self):
+        hidden_labels = {
+            "Source time:",
+            "Specific time:",
+            "Mapped radius:",
+            "Source resolution:",
+            (
+                "rotateFields mapping is not conservative; normal mapping uses "
+                "source-volume weighting and fallback/extension uses nearest cells."
+            ),
+        }
+        labels = {
+            label.text(): label
+            for label in self.tab.grp_mapping.findChildren(QLabel)
+            if label.text() in hidden_labels
+        }
+        self.assertEqual(set(labels), hidden_labels)
+        self.assertTrue(all(label.isHidden() for label in labels.values()))
+        self.assertTrue(self.tab.cmb_source_time_mode.isHidden())
+        self.assertTrue(self.tab.txt_source_time.isHidden())
+
+        self.tab.set_case_inputs(
+            {
+                "initialization_source": REMAP_SOURCE,
+                "mapping": {
+                    "case_path": "source-case",
+                    "time_mode": "specific",
+                    "specific_time": "0.25",
+                },
+            }
+        )
+        mapping = self.tab.get_case_inputs().mapping
+        self.assertEqual(mapping.time_mode, "latest")
+        self.assertEqual(mapping.specific_time, "")
+
     def test_remap_from_dialog_matches_requested_choices(self):
         dialog = RemapFromDialog(None, current_kind=RemapFromDialog.CURRENT_1D, has_current_1d=True)
         self.assertEqual(dialog.rad_current_1d.text(), "Current 1D model")
@@ -148,6 +183,29 @@ class Tab2DWorkflowTests(unittest.TestCase):
                 os.path.normpath(self.tab.get_case_inputs().mapping.case_path),
                 os.path.normpath(picked),
             )
+
+    def test_selecting_from_1d_uses_latest_case_from_current_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            imported = os.path.join(td, "Case_1D_imported")
+            current = os.path.join(td, "Case_1D_current_session")
+            os.mkdir(imported)
+            os.mkdir(current)
+            self.tab._set_remap_case_path(imported, from_last_1d=False)
+            self.tab.set_last_1d_case(current)
+            self.assertEqual(
+                os.path.normpath(self.tab.get_case_inputs().mapping.case_path),
+                os.path.normpath(imported),
+            )
+
+            self.tab.cmb_source.setCurrentText(REMAP_SOURCE)
+            self.app.processEvents()
+
+            self.assertEqual(
+                os.path.normpath(self.tab.get_case_inputs().mapping.case_path),
+                os.path.normpath(current),
+            )
+            self.assertEqual(self.tab.cmb_source_time_mode.currentText(), "latest")
+            self.assertEqual(self.tab.txt_source_case.text(), "Current 1D model")
 
     def test_edit_remap_imports_2d_results_file(self):
         with tempfile.TemporaryDirectory() as td:

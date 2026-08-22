@@ -992,9 +992,24 @@ class Tab2D(QWidget):
         form.addRow("Remap from:", source_row)
         form.addRow("Source time:", self.cmb_source_time_mode)
         form.addRow("Specific time:", self.txt_source_time)
-        form.addRow("Mapped radius:", self._with_unit(self.spin_mapped_radius, "m"))
-        form.addRow("Source resolution:", self._with_unit(self.spin_source_resolution, "m"))
+        mapped_radius_row = self._with_unit(self.spin_mapped_radius, "m")
+        source_resolution_row = self._with_unit(self.spin_source_resolution, "m")
+        form.addRow("Mapped radius:", mapped_radius_row)
+        form.addRow("Source resolution:", source_resolution_row)
         form.addRow(self.lbl_mapping_note)
+        # Mapping always uses the latest available source time. Keep the hidden
+        # controls alive for project compatibility and generator inputs.
+        for field in (
+            self.cmb_source_time_mode,
+            self.txt_source_time,
+            mapped_radius_row,
+            source_resolution_row,
+        ):
+            label = form.labelForField(field)
+            if label is not None:
+                label.hide()
+            field.hide()
+        self.lbl_mapping_note.hide()
 
         group, form = self._group("Atmosphere")
         self.spin_pressure = self._double(101325.0, 1.0, 1e10, 2)
@@ -1501,7 +1516,7 @@ class Tab2D(QWidget):
         radio.blockSignals(False)
 
     def _connect_signals(self) -> None:
-        self.cmb_source.currentTextChanged.connect(self._apply_enablement)
+        self.cmb_source.currentTextChanged.connect(self._on_source_changed)
         self.btn_edit_remap.clicked.connect(self._open_remap_from_dialog)
         self.cmb_shape.currentTextChanged.connect(self._apply_enablement)
         self.cmb_mesh_mode.currentTextChanged.connect(self._apply_enablement)
@@ -1607,6 +1622,20 @@ class Tab2D(QWidget):
         self._refresh_derived()
         if not self._defer_viewer_preview:
             self._apply_info_mode_visibility()
+
+    def _on_source_changed(self, source: str) -> None:
+        """Use this session's latest 1D run when the user selects From 1D."""
+        self.cmb_source_time_mode.setCurrentText("latest")
+        self.txt_source_time.setEditText("")
+        if (
+            source == REMAP_SOURCE
+            and not self._loading
+            and self._last_1d_case_dir
+            and os.path.isdir(self._last_1d_case_dir)
+        ):
+            self._remap_from_last_1d = True
+            self.apply_last_1d_remap_default()
+        self._apply_enablement()
 
     def set_source_cases_root(self, path: str) -> None:
         """Work folder that the From-1D browse dialog opens in."""
@@ -2122,8 +2151,8 @@ class Tab2D(QWidget):
 
         mapping = MappingSource2D(
             case_path=self._remap_case_path or self.txt_source_case.text().strip(),
-            time_mode=self.cmb_source_time_mode.currentText(),
-            specific_time=self.txt_source_time.currentText().strip(),
+            time_mode="latest",
+            specific_time="",
             mapped_radius=self.spin_mapped_radius.value(),
             source_resolution=self.spin_source_resolution.value(),
         )
@@ -2303,8 +2332,8 @@ class Tab2D(QWidget):
                 if loaded_case:
                     self._remap_kind = RemapFromDialog.FILE_1D
                     self._set_remap_case_path(loaded_case, from_last_1d=False)
-                self.cmb_source_time_mode.setCurrentText(str(mapping.get("time_mode", "latest")))
-                self.txt_source_time.setEditText(str(mapping.get("specific_time", "")))
+                self.cmb_source_time_mode.setCurrentText("latest")
+                self.txt_source_time.setEditText("")
                 if mapping.get("mapped_radius") is not None:
                     self.spin_mapped_radius.setValue(float(mapping.get("mapped_radius", 0.5)))
                 if mapping.get("source_resolution") is not None:
