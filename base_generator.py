@@ -487,8 +487,10 @@ stage_check "5_after_changeDictionary"
 
             script_body += init_fields_block
             script_body += """
-# 7. Run Solver
+# 7. Run Solver (preserve blastFoam status; tee otherwise exits 0 on FOAM abort)
 """ + solver_app + " 2>&1 | tee log." + solver_app + """
+solver_rc=${PIPESTATUS[0]}
+exit "$solver_rc"
 """
 
         # Safe cleanup only: artifacts and mesh; preserve 0.orig, system/, constant/*.dict, constant/triSurface/*.stl

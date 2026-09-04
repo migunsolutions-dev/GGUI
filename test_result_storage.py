@@ -10,6 +10,7 @@ from result_storage import (
     cleanup_native_time_folders,
     ensure_remap_snapshot,
     run_reached_configured_end,
+    solver_run_succeeded,
 )
 
 
@@ -115,6 +116,36 @@ class ResultStorageTests(unittest.TestCase):
             self.assertFalse(run_reached_configured_end(case))
             _mkdir(case, "0.2")
             self.assertTrue(run_reached_configured_end(case))
+
+    def test_1d_success_requires_end_time_and_rejects_fatal_or_interrupt(self):
+        with tempfile.TemporaryDirectory() as case:
+            _mkdir(case, "system")
+            with open(
+                os.path.join(case, "system", "controlDict"), "w", encoding="utf-8"
+            ) as stream:
+                stream.write(
+                    "endTime         0.03;\n"
+                    "functions\n{\n    probes1d { writeInterval 25; }\n}\n"
+                )
+            with open(os.path.join(case, ".watchdog_target_radius"), "w") as stream:
+                stream.write("1.0\n")
+            with open(os.path.join(case, "log.blastFoam"), "w", encoding="utf-8") as stream:
+                stream.write("Time = 0.005776\nEnd\n")
+            self.assertFalse(solver_run_succeeded(case, 0))
+            with open(os.path.join(case, "log.blastFoam"), "w", encoding="utf-8") as stream:
+                stream.write("Time = 0.0299999\nEnd\n")
+            self.assertTrue(solver_run_succeeded(case, 0))
+            with open(os.path.join(case, "log.blastFoam"), "w", encoding="utf-8") as stream:
+                stream.write("Time = 0.03\nEnd\n")
+            self.assertTrue(solver_run_succeeded(case, 0))
+            self.assertFalse(solver_run_succeeded(case, 0, user_stopped=True))
+            with open(os.path.join(case, "log.blastFoam"), "w", encoding="utf-8") as stream:
+                stream.write(
+                    "--> FOAM FATAL ERROR: \n"
+                    "No cells will be activated using the detonation point (0.0105 0 0)\n"
+                )
+            self.assertFalse(solver_run_succeeded(case, 0))
+            self.assertFalse(solver_run_succeeded(case, 1))
 
     def test_vtk_export_must_materialize_durable_directory(self):
         from solver_runner import SolverRunner

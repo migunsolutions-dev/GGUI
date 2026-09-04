@@ -228,6 +228,7 @@ class OutputFileOptionsGenerateTests(unittest.TestCase):
             text = handle.read()
         self.assertIn("fields          (p impulse rho);", text)
         self.assertIn("type            impulse;", text)
+        self.assertIn("writeControl    writeTime;", text)
         self.assertNotIn("dynamicPressure", text)
 
     def test_impulse_helper_emits_pRef(self):
@@ -239,6 +240,9 @@ class OutputFileOptionsGenerateTests(unittest.TestCase):
             peaks=False,
         )
         self.assertIn("pRef            101325", block)
+        self.assertIn("executeControl  timeStep;", block)
+        self.assertIn("writeControl    writeTime;", block)
+        self.assertNotIn("writeInterval   1;", block)
 
     def test_tab_1d_apply_gauges_reaches_get_case_inputs(self):
         _app()

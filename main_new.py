@@ -19,6 +19,8 @@ from PyQt5.QtGui import QIcon, QFont, QFontMetrics
 from tab_1d import Tab1D
 from tab_2d import Tab2D
 from tab_time_history import TabTimeHistory
+from tab_validation import TabValidation
+from validation.current_run import RunSnapshot, SOURCE_CURRENT
 from dialogs import OutputFileOptionsDialog
 from time_history_dialog import TimeHistoryLocationsDialog
 from output_options import OutputFileOptions, output_file_options_from_dict
@@ -651,6 +653,14 @@ class BlastFoamApp(QMainWindow):
             impulse_available=self._time_history_impulse_available,
         )
         self.probes_model.changed.connect(self.tab_time_history.refresh_catalog)
+        self.tab_validation = TabValidation()
+        self.tab_validation.set_source_provider(
+            context=self._validation_context,
+            gauges_1d=lambda: getattr(self.tab_1d, "_gauge_locations", ()) or (),
+            probes_2d=self.tab_2d._probes,
+            probes_3d=self.probes_model.probes,
+        )
+        self.probes_model.changed.connect(self.tab_validation.refresh_catalog)
         self.tab_pi_curves = self._create_placeholder_tab("PI-Curves", "PI curve analysis (not yet implemented)")
         self.tab_monte_carlo = self._create_placeholder_tab("Monte-Carlo", "Monte Carlo batch analysis (not yet implemented)")
         self.tab_jotter = LogTab()  # Keep exact name "Jotter"
@@ -664,6 +674,7 @@ class BlastFoamApp(QMainWindow):
         self.tabs.addTab(self.tab_2d, "Cylindrical – 2D")
         self.tabs.addTab(self.tab_3d, "General 3D")
         self.tabs.addTab(self.tab_time_history, "Time History Viewer")
+        self.tabs.addTab(self.tab_validation, "Validation & Verification")
         self.tabs.addTab(self.tab_pi_curves, "PI-Curves")
         self.tabs.addTab(self.tab_monte_carlo, "Monte-Carlo")
         self.tabs.addTab(self.tab_jotter, "Jotter")
@@ -844,6 +855,8 @@ class BlastFoamApp(QMainWindow):
             }
             self.tabs.setCurrentWidget(selected_tabs.get(selected, self.tab_3d))
             self.tab_time_history.refresh_catalog()
+            if hasattr(self, "tab_validation"):
+                self.tab_validation.refresh_current_run(reset_manual=True)
             self.status_bar.set_status("Project loaded", "#2ecc71")
         except (ProjectFormatError, OSError, TypeError, ValueError) as exc:
             QMessageBox.critical(self, "Open Project Error", str(exc))
@@ -943,6 +956,7 @@ class BlastFoamApp(QMainWindow):
         self.tab_3d.viewer.set_field(selected_field)
         self.current_project_path = None
         self._show_load_summary_dialog(case_dir, load_summary)
+        self._refresh_validation()
         return CaseDimension.GENERAL_3D.value
 
     @staticmethod
@@ -1432,6 +1446,7 @@ class BlastFoamApp(QMainWindow):
             self.tab_2d._keep_openfoam_time_folders = True
             self.active_case_dir_2d = case_dir
             self.active_case_initialized_2d = True
+            self._refresh_validation()
             selected_field = self.tab_2d.cmb_field.currentText().strip() or "p"
             self.tab_2d.viewer.set_axisymmetric_domain(inputs.radius, inputs.height)
             self.tab_2d.viewer.load_case(
@@ -1795,7 +1810,9 @@ class BlastFoamApp(QMainWindow):
         if origin is not None:
             self.tab_3d.set_remap_origin(*origin)
         self.tab_time_history.refresh_catalog()
-    
+        if hasattr(self, "tab_validation"):
+            self.tab_validation.refresh_catalog()
+
     def _on_help(self):
         """Show help"""
         help_text = """
@@ -2021,6 +2038,7 @@ class BlastFoamApp(QMainWindow):
         try:
             self.active_case_dir_2d = case_dir
             self.active_case_initialized_2d = True
+            self._refresh_validation()
             actual_cells = self._count_poly_mesh_cells(case_dir)
             if (
                 actual_cells is None
@@ -2523,6 +2541,7 @@ class BlastFoamApp(QMainWindow):
                 )
                 self.status_bar.set_status("3D Initialized", "#2ecc71")
                 self.active_case_initialized_3d = True
+                self._refresh_validation()
                 
             except Exception as e:
                 self.status_bar.set_status("Error", "#e74c3c")
@@ -2683,6 +2702,9 @@ class BlastFoamApp(QMainWindow):
         self.status_bar.set_status("Solver Running...", "#3498db")
         self.status_bar.set_progress(0)
         self.status_bar.start_et_timing()
+        if mode == "1D":
+            self.status_bar.update_1d(step=0, tt=0.0, dt=0.0)
+            self.tab_1d.begin_run_graph()
         
         log_path = os.path.join(case_dir, "log.blastFoam")
         self.tab_jotter.start_monitoring(log_path)
@@ -2736,6 +2758,7 @@ class BlastFoamApp(QMainWindow):
         self._active_result_storage_policy = policy
         self._run_user_interrupted = False
         self.tab_time_history.begin_run(mode, case_dir)
+        self._refresh_validation()
         # Queued delivery keeps status/viewport updates on the Qt GUI thread.
         self.runner.data_signal.connect(
             lambda p, t, s, dt: self.on_new_data(p, t, s, dt, mode),
@@ -2824,11 +2847,157 @@ class BlastFoamApp(QMainWindow):
             return bool(checked("impulse", "gauges") or checked("peak_impulse", "gauges"))
         return True
 
+    def _refresh_validation(self, *, reset_manual: bool = False) -> None:
+        try:
+            tab = self.__dict__.get("tab_validation")
+        except Exception:
+            return
+        if tab is None:
+            return
+        refresh = getattr(tab, "refresh_current_run", None)
+        if callable(refresh):
+            refresh(reset_manual=reset_manual)
+
+    def _validation_context(self) -> RunSnapshot:
+        """Build the current-run snapshot. Never scans disk for an arbitrary case."""
+        run_cases = {}
+        tab_th = getattr(self, "tab_time_history", None)
+        if tab_th is not None:
+            run_cases = dict(getattr(tab_th, "_run_cases", {}) or {})
+        tab_2d = getattr(self, "tab_2d", None)
+        tab_3d = getattr(self, "tab_3d", None)
+        tab_1d = getattr(self, "tab_1d", None)
+        last_1d = ""
+        if tab_2d is not None:
+            last_1d = str(getattr(tab_2d, "_last_1d_case_dir", "") or "")
+        mass_kg = None
+        material_name = ""
+        hob_m = None
+        charge_center = (0.0, 0.0, 0.0)
+        p_atm = 101325.0
+        mapping_source_2d = None
+        mapping_time_2d = None
+        mapped_radius = None
+        remap_3d_source = None
+        remap_3d_source_type = None
+        prepare_3d_transfer = None
+        inputs_1d = inputs_2d = inputs_3d = None
+        if tab_1d is not None:
+            try:
+                inputs_1d = tab_1d.get_case_inputs()
+            except Exception:
+                inputs_1d = None
+        if tab_2d is not None:
+            try:
+                inputs_2d = tab_2d.get_case_inputs()
+            except Exception:
+                inputs_2d = None
+        if tab_3d is not None:
+            try:
+                inputs_3d = tab_3d.get_case_inputs()
+            except Exception:
+                inputs_3d = None
+        if inputs_2d is not None:
+            mapping = getattr(inputs_2d, "mapping", None)
+            if mapping is not None:
+                mapping_source_2d = str(getattr(mapping, "case_path", "") or "") or None
+                specific = str(getattr(mapping, "specific_time", "") or "").strip()
+                time_mode = str(getattr(mapping, "time_mode", "") or "").strip()
+                mapping_time_2d = specific or time_mode or None
+                mapped = getattr(mapping, "mapped_radius", None)
+                if mapped is not None:
+                    mapped_radius = float(mapped)
+            hob_m = float(inputs_2d.height_of_burst)
+        if inputs_3d is not None:
+            remap_3d_source = str(getattr(inputs_3d, "remap_case_path", "") or "") or None
+            remap_3d_source_type = str(getattr(inputs_3d, "remap_source_type", "") or "") or None
+            try:
+                charge_center_3d = tuple(float(v) for v in inputs_3d.charge_center)
+            except Exception:
+                charge_center_3d = (0.0, 0.0, 0.0)
+        else:
+            charge_center_3d = (0.0, 0.0, 0.0)
+        case_2d = getattr(self, "active_case_dir_2d", None) or None
+        case_3d = getattr(self, "active_case_dir_3d", None) or None
+        live_mode = getattr(self, "_active_run_mode", None)
+        live_dim = str(live_mode or "").strip().lower()
+        if live_dim not in ("1d", "2d", "3d"):
+            if case_2d:
+                live_dim = "2d"
+            elif case_3d:
+                live_dim = "3d"
+            elif run_cases.get("1d") or last_1d:
+                live_dim = "1d"
+            else:
+                live_dim = "2d"
+        charge_src = {
+            "1d": inputs_1d,
+            "2d": inputs_2d,
+            "3d": inputs_3d,
+        }.get(live_dim) or inputs_2d or inputs_3d or inputs_1d
+        if charge_src is not None:
+            raw_mass = getattr(charge_src, "mass_kg", None)
+            if raw_mass is not None:
+                mass_kg = float(raw_mass)
+            material_name = str(getattr(charge_src, "material_name", "") or "")
+            p_atm = float(getattr(charge_src, "p_atm", p_atm) or p_atm)
+            if live_dim == "3d":
+                charge_center = tuple(float(v) for v in charge_src.charge_center)
+            elif live_dim == "2d":
+                hob_m = float(charge_src.height_of_burst)
+                charge_center = (0.0, hob_m, 0.0)
+        if case_2d:
+            candidate = os.path.join(str(case_2d), "prepare_3d_transfer.json")
+            if os.path.isfile(candidate):
+                prepare_3d_transfer = candidate
+        opts = getattr(self, "_output_file_options", None)
+        case_1d = run_cases.get("1d") or last_1d or None
+        keep_2d = bool(getattr(getattr(opts, "dim2d", None), "keep_openfoam_time_folders", False)) if opts else False
+        keep_3d = bool(getattr(getattr(opts, "dim3d", None), "keep_openfoam_time_folders", False)) if opts else False
+        return RunSnapshot(
+            source=SOURCE_CURRENT,
+            live_mode=live_dim,
+            live_case_dir=getattr(self, "_active_run_case_dir", None),
+            case_1d=case_1d,
+            case_2d=case_2d,
+            case_3d=case_3d,
+            last_run_1d=run_cases.get("1d") or last_1d or None,
+            last_run_2d=run_cases.get("2d") or None,
+            last_run_3d=run_cases.get("3d") or None,
+            mass_kg=mass_kg,
+            material_name=material_name,
+            hob_m=hob_m,
+            charge_center=charge_center,
+            p_atm=p_atm,
+            keep_openfoam_2d=keep_2d,
+            keep_openfoam_3d=keep_3d,
+            output_options=opts,
+            mapping_source_2d=mapping_source_2d,
+            mapping_time_2d=mapping_time_2d,
+            mapped_radius=mapped_radius,
+            remap_3d_source=remap_3d_source,
+            remap_3d_source_type=remap_3d_source_type,
+            prepare_3d_transfer=prepare_3d_transfer,
+            domain_radius_1d=float(inputs_1d.radius) if inputs_1d is not None else None,
+            domain_radius_2d=float(inputs_2d.radius) if inputs_2d is not None else None,
+            domain_height_2d=float(inputs_2d.height) if inputs_2d is not None else None,
+            domain_cell_1d=float(inputs_1d.cell_size) if inputs_1d is not None else None,
+            domain_cell_2d=(
+                float(inputs_2d.cell_size)
+                if inputs_2d is not None and inputs_2d.cell_size is not None
+                else None
+            ),
+            charge_center_3d=charge_center_3d,
+        )
+
     def _on_main_tab_changed(self, index: int) -> None:
         """Activate only the visible VTK viewport; pause hidden ones."""
         current = self.tabs.widget(index)
         if current is getattr(self, "tab_time_history", None):
             self.tab_time_history.refresh_catalog()
+        if current is getattr(self, "tab_validation", None):
+            self.tab_validation.refresh_catalog()
+            self.tab_validation.refresh_current_run()
         for tab in (getattr(self, "tab_2d", None), getattr(self, "tab_3d", None)):
             if tab is None or not hasattr(tab, "viewer"):
                 continue
@@ -2945,6 +3114,7 @@ class BlastFoamApp(QMainWindow):
                     if getattr(self.tab_2d, "is_imported_mode", False):
                         self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_FAILED)
                     self.tab_2d.set_simulation_state(SimulationState2D.FAILED)
+        self._refresh_validation()
 
     def _on_3d_initial_dt_changed(self, dt_val):
         """Initial Δt is shown in General 3D Simulation Control (not the status bar)."""

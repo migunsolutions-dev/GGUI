@@ -22,6 +22,8 @@ from material_validation import validate_required_values
 from models_2d import CaseInputs2D
 from output_options import REMAP_2D_FILENAME, extra_function_objects
 from path_utils import win_to_wsl_path
+from validation.auto_points import FO_2D_VALIDATION, plan_2d, runtime_logical_dpi_x
+from validation.sampling_io import write_sampling_plan
 
 
 WEDGE_HALF_ANGLE_DEG = 5.0  # exact blastFoam 6.2.0 axisymmetricCharge convention
@@ -458,9 +460,22 @@ snGradSchemes { default corrected; }
             probe_fields.append("impulse")
         if bool(getattr(inputs, "enable_dynamic_pressure", False)) and "dynamicPressure" not in probe_fields:
             probe_fields.append("dynamicPressure")
+        val_plan = plan_2d(
+            mass_kg=float(inputs.mass_kg or 0.0),
+            domain_radius_m=float(inputs.radius),
+            domain_height_m=float(inputs.height),
+            hob_m=float(inputs.height_of_burst),
+            cell_size=inputs.cell_size,
+            logical_dpi_x=runtime_logical_dpi_x(),
+        )
+        write_impulse = (
+            bool(getattr(inputs, "enable_impulse", False))
+            or "impulse" in probe_fields
+            or bool(val_plan.points)
+        )
         extras = extra_function_objects(
             p_atm=float(inputs.p_atm),
-            impulse=bool(getattr(inputs, "enable_impulse", False)) or "impulse" in probe_fields,
+            impulse=write_impulse,
             overpressure=False,
             dynamic_pressure=bool(getattr(inputs, "enable_dynamic_pressure", False)),
             peaks=False,
@@ -491,6 +506,25 @@ snGradSchemes { default corrected; }
         );
     }}
 """
+        validation_block = ""
+        if val_plan.points:
+            val_pts = [
+                f"            ({pt.x:.12g} {pt.y:.12g} {pt.z:.12g})" for pt in val_plan.points
+            ]
+            validation_block = f"""
+    {FO_2D_VALIDATION}
+    {{
+        type probes;
+        libs ("libfieldFunctionObjects.so");
+        fields (p impulse);
+        writeControl timeStep;
+        writeInterval 1;
+        probeLocations
+        (
+{os.linesep.join(val_pts)}
+        );
+    }}
+"""
         retained_cycle = (
             int(inputs.cycle_write)
             if bool(getattr(inputs, "keep_openfoam_time_folders", False))
@@ -516,9 +550,11 @@ timePrecision 10;
 runTimeModifiable true;
 functions
 {{
-{extras}{probes_block}{remap_block}}}
+{extras}{probes_block}{validation_block}{remap_block}}}
 """
         self._write_text(os.path.join(system, "controlDict"), control)
+        if val_plan.points:
+            write_sampling_plan(case_dir, val_plan)
         decompose = (
             self._foam_header("decomposeParDict", "dictionary", "system")
             + f"numberOfSubdomains {inputs.cores};\nmethod scotch;\n"

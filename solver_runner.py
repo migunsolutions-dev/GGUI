@@ -16,7 +16,7 @@ from execution_plan import (  # noqa: F401 — re-export for existing imports
     build_execution_plan,
 )
 from foam_dictionary import update_top_level_entries
-from result_storage import ResultStoragePolicy, ensure_remap_snapshot
+from result_storage import ResultStoragePolicy, ensure_remap_snapshot, solver_run_succeeded
 from wsl_runtime import (
     build_case_command_argv,
     popen_group_kwargs,
@@ -661,8 +661,8 @@ class SolverRunner(QThread):
         _re_courant = re.compile(r"^Courant Number.*$", re.MULTILINE)
         while self.keep_running and self._proc.poll() is None:
             self._maybe_reconstruct_new_times()
-            self._check_watchdog_trigger(self.win_case_dir)
-            self._maybe_stop_after_watchdog()
+            # 1D used to stop at shock arrival via stopAt writeNow. That exits 0
+            # and the GUI labelled the run Done far below the requested endTime.
             if self._probe_file is None:
                 self._probe_file = self._discover_probe_file()
                 if self._probe_file:
@@ -700,12 +700,15 @@ class SolverRunner(QThread):
             time.sleep(0.10)
 
         rc = self._proc.poll() if self._proc else 1
-        if not self.keep_running:
+        user_stopped = bool(self._stop_requested or not self.keep_running)
+        if user_stopped:
             self.status_signal.emit("Stopped.")
             self.finished_signal.emit(False)
             return
 
-        if rc == 0:
+        if solver_run_succeeded(
+            self.win_case_dir, rc, user_stopped=False
+        ):
             needs_final_reconstruct = (
                 self.cores > 1
                 and (
@@ -738,9 +741,16 @@ class SolverRunner(QThread):
             self.status_signal.emit("Finished.")
             self.finished_signal.emit(True)
         else:
-            self._write_debug_summary(rc)
-            self.status_signal.emit(
-                f"Failed command `{execution.command}` (rc={rc}). "
-                f"Logs: {execution.log_name}, debug_summary.txt."
-            )
+            self._write_debug_summary(rc if rc else 1)
+            if rc == 0:
+                self.status_signal.emit(
+                    "Solver exited before the configured endTime "
+                    f"(not a successful completion). Logs: {execution.log_name}, "
+                    "debug_summary.txt."
+                )
+            else:
+                self.status_signal.emit(
+                    f"Failed command `{execution.command}` (rc={rc}). "
+                    f"Logs: {execution.log_name}, debug_summary.txt."
+                )
             self.finished_signal.emit(False)

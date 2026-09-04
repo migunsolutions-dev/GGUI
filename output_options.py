@@ -319,8 +319,9 @@ def extra_function_objects(
     {{
         type            impulse;
         libs            ("libfieldFunctionObjects.so");
-        writeControl    timeStep;
-        writeInterval   1;
+        executeControl  timeStep;
+        executeInterval 1;
+        writeControl    writeTime;
         pRef            {float(p_atm):.10g};
     }}"""
         )
@@ -330,8 +331,9 @@ def extra_function_objects(
     {{
         type            overpressure;
         libs            ("libfieldFunctionObjects.so");
-        writeControl    timeStep;
-        writeInterval   1;
+        executeControl  timeStep;
+        executeInterval 1;
+        writeControl    writeTime;
         store           yes;
         pRef            {float(p_atm):.10g};
     }}"""
@@ -344,8 +346,9 @@ def extra_function_objects(
         libs            ("libfieldFunctionObjects.so");
         mode            dynamic;
         result          dynamicPressure;
-        writeControl    timeStep;
-        writeInterval   1;
+        executeControl  timeStep;
+        executeInterval 1;
+        writeControl    writeTime;
     }"""
         )
     if peaks:

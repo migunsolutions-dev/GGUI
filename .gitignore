@@ -79,3 +79,6 @@ _tail_*.py
 
 # UI Review overlay output (never commit)
 _ui_review/
+
+# Local UFC / DPlot extracts (zip, GRF, inspection scripts). Runtime uses validation/data/*.json.
+_ref_src/

@@ -49,6 +49,8 @@ _SOURCE_ATTRS = (
     ("tab_1d", "tab_1d.py"),
     ("tab_2d", "tab_2d.py"),
     ("tab_3d", "tab_3d_general.py"),
+    ("tab_time_history", "tab_time_history.py"),
+    ("tab_validation", "tab_validation.py"),
     ("tab_probes", "tab_probes.py"),
     ("tab_jotter", "tab_log.py"),
     ("status_bar", "main_new.py"),

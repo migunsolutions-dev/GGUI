@@ -69,7 +69,8 @@ class Generator3DWriteTests(unittest.TestCase):
         self.assertIn("cycleWrite      6;", control)
         self.assertIn("type            surfaces;", control)
         self.assertGreaterEqual(control.count("writeInterval   37;"), 2)
-        self.assertGreaterEqual(control.count("writeInterval   1;"), 4)
+        self.assertIn("executeControl  timeStep;", control)
+        self.assertIn("writeControl    writeTime;", control)
 
     def test_retention_off_disables_cycle_without_changing_requested_rate(self) -> None:
         inp = _minimal(
@@ -90,7 +91,8 @@ class Generator3DWriteTests(unittest.TestCase):
         self.assertIn("writeControl    adjustableRunTime;", control)
         self.assertIn("writeInterval   0.00023;", control)
         self.assertIn("cycleWrite      0;", control)
-        self.assertGreaterEqual(control.count("writeInterval   1;"), 4)
+        self.assertIn("executeControl  timeStep;", control)
+        self.assertIn("writeControl    writeTime;", control)
 
     def test_cylinder_outer_snappy_is_searchable_cylinder(self) -> None:
         inp = _minimal(

@@ -168,8 +168,8 @@ class Generator2DTests(unittest.TestCase):
             self.assertIn("writeControl timeStep;", control)
             self.assertIn("writeInterval 37;", control)
             self.assertIn("purgeWrite 6;", control)
-            self.assertGreaterEqual(control.count("writeInterval   1;"), 2)
-            self.assertIn("writeInterval 1;", control)
+            self.assertIn("executeControl  timeStep;", control)
+            self.assertIn("writeControl    writeTime;", control)
 
             _, normal = self._generate(
                 td,
@@ -186,8 +186,8 @@ class Generator2DTests(unittest.TestCase):
             self.assertIn("writeControl adjustableRunTime;", normal_control)
             self.assertIn("writeInterval 0.00023;", normal_control)
             self.assertIn("purgeWrite 0;", normal_control)
-            self.assertGreaterEqual(normal_control.count("writeInterval   1;"), 2)
-            self.assertIn("writeInterval 1;", normal_control)
+            self.assertIn("executeControl  timeStep;", normal_control)
+            self.assertIn("writeControl    writeTime;", normal_control)
 
     def test_remap_and_gauges_are_independent_of_native_retention(self):
         with tempfile.TemporaryDirectory() as td:

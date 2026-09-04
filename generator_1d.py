@@ -11,6 +11,9 @@ from models import (
     RecommendedParams1D,
 )
 from output_options import extra_function_objects
+from validation.auto_points import plan_1d, runtime_logical_dpi_x
+from validation.map_1d import merge_radii
+from validation.sampling_io import write_sampling_plan
 
 class Generator1D(BaseGenerator):
     """
@@ -35,14 +38,32 @@ class Generator1D(BaseGenerator):
             inputs.material_props, 
             inputs.energy_j_per_kg, 
             charge_radius, 
-            rec.ignition_point, 
+            self.ignition_point_in_wedge(inputs, rec),
             rec.ignition_radius
         )
 
-        self.write_system_files(case_dir, inputs, rec, charge_radius)
+        val_plan = None
+        try:
+            val_plan = plan_1d(
+                mass_kg=float(inputs.mass_kg),
+                domain_radius_m=float(inputs.radius),
+                cell_size=float(inputs.cell_size),
+                logical_dpi_x=runtime_logical_dpi_x(),
+            )
+        except (TypeError, ValueError):
+            val_plan = None
+
+        val_radii = tuple(pt.range_m for pt in val_plan.points) if val_plan is not None else ()
+        self.write_system_files(case_dir, inputs, rec, charge_radius, validation_radii=val_radii)
         
         # --- FIX: Write Scripts ---
         self.write_scripts(case_dir, self.openfoam_bashrc)
+
+        try:
+            if val_plan is not None and val_plan.points:
+                write_sampling_plan(case_dir, val_plan)
+        except (OSError, TypeError, ValueError):
+            pass
         
         # Create case.foam for ParaView compatibility
         import pathlib
@@ -54,6 +75,39 @@ class Generator1D(BaseGenerator):
     def _right_boundary(inputs: CaseInputs1D) -> str:
         kind = str(getattr(inputs, "right_boundary", BOUNDARY_1D_TRANSMIT) or BOUNDARY_1D_TRANSMIT)
         return kind if kind in BOUNDARY_1D_RIGHT_OPTIONS else BOUNDARY_1D_TRANSMIT
+
+    @staticmethod
+    def _vtx_spherical(r: float, theta: float, phi: float) -> Tuple[float, float, float]:
+        st, ct = math.sin(theta), math.cos(theta)
+        sp, cp = math.sin(phi), math.cos(phi)
+        return (r * ct, r * st * cp, r * st * sp)
+
+    @staticmethod
+    def wedge_angles(inputs: CaseInputs1D) -> Tuple[float, float, float]:
+        """Return (axis_eps, cone_half, wedge_half) in radians, matching blockMesh."""
+        wedge_half = math.radians(inputs.wedge_angle_deg) / 2.0
+        cone_half = math.radians(inputs.cone_half_angle_deg)
+        requested_eps = max(1e-9, float(inputs.axis_epsilon))
+        min_axis_eps = min(0.10, cone_half * 0.45)
+        axis_eps = min(max(requested_eps, min_axis_eps), cone_half * 0.5)
+        return axis_eps, cone_half, wedge_half
+
+    def ignition_point_in_wedge(
+        self, inputs: CaseInputs1D, rec: RecommendedParams1D
+    ) -> Tuple[float, float, float]:
+        """Place the detonation point inside a real wedge cell, not on the Cartesian axis.
+
+        ``profiles.compute_recommended_1d`` returns ``(r_ign, 0, 0)``. That coordinate
+        is outside the spherical-wedge mesh (cells start at ``axis_eps``), so blastFoam
+        raises ``No cells will be activated using the detonation point`` on fine
+        meshes where ``findCell`` cannot snap the on-axis point into a cell.
+        """
+        axis_eps, cone_half, _wedge_half = self.wedge_angles(inputs)
+        theta_mid = 0.5 * (axis_eps + cone_half)
+        r = math.sqrt(sum(float(c) * float(c) for c in rec.ignition_point))
+        if r <= 0.0:
+            r = max(float(rec.r_min), 1.0e-6)
+        return self._vtx_spherical(r, theta_mid, 0.0)
 
     def write_initial_conditions(self, case_dir: str, inputs: CaseInputs1D) -> None:
         # Write to 0.orig so Allrun's "cp -r 0.orig 0" restores initial conditions (same as 3D flow).
@@ -165,7 +219,14 @@ air
         self._write_text(os.path.join(const_dir, "dynamicMeshDict"), 
                          self._foam_header("dynamicMeshDict", "dictionary", "constant") + "dynamicFvMesh staticFvMesh;\n")
 
-    def write_system_files(self, case_dir: str, inputs: CaseInputs1D, rec: RecommendedParams1D, charge_radius: float) -> None:
+    def write_system_files(
+        self,
+        case_dir: str,
+        inputs: CaseInputs1D,
+        rec: RecommendedParams1D,
+        charge_radius: float,
+        validation_radii: Tuple[float, ...] = (),
+    ) -> None:
         sys_dir = os.path.join(case_dir, "system")
         # User's target radius (for mapping); domain is buffered so shock can be detected before boundary
         target_radius = float(inputs.radius)
@@ -177,19 +238,9 @@ air
             r_max_val = r_min + 10.0 * dx
         n_r = max(20, int((r_max_val - r_min) / dx))
 
-        wedge_half = math.radians(inputs.wedge_angle_deg) / 2.0
-        cone_half = math.radians(inputs.cone_half_angle_deg)
         # Axis face length is r*sin(θ)*Δφ. Thin wedges + tiny θ freeze CFL at the origin.
-        requested_eps = max(1e-9, float(inputs.axis_epsilon))
-        min_axis_eps = min(0.10, cone_half * 0.45)
-        axis_eps = min(max(requested_eps, min_axis_eps), cone_half * 0.5)
-
-        # Spherical wedge: vertices on spheres r=const so rotateFields produces a sphere (not a cylinder).
-        # x = r*cos(theta), y = r*sin(theta)*cos(phi), z = r*sin(theta)*sin(phi); axis = x, theta from axis.
-        def vtx_spherical(r, theta, phi):
-            st, ct = math.sin(theta), math.cos(theta)
-            sp, cp = math.sin(phi), math.cos(phi)
-            return (r * ct, r * st * cp, r * st * sp)
+        axis_eps, cone_half, wedge_half = self.wedge_angles(inputs)
+        vtx_spherical = self._vtx_spherical
 
         # blockMesh: hex (0 3 2 1 4 7 6 5). All face normals must point outward.
         # Outlet (0 1 2 3): (0->1)x(1->2)=+r => 0->1=+theta, 1->2=+phi => 0=(ae,-w), 1=(ch,-w), 2=(ch,w), 3=(ae,w).
@@ -221,7 +272,7 @@ air
         mesh.append(");\nmergePatchPairs\n(\n);\n")
         self._write_text(os.path.join(sys_dir, "blockMeshDict"), "\n".join(mesh))
 
-        # Visualization probes: spherical radius r_min to target_radius; place at mid-wedge (theta=cone/2, phi=0)
+        # Visualization probes plus exact automatic Validation radii.
         probe_points = []
         p_r_start, p_r_end = r_min, min(target_radius, r_max_val - 1e-7)
         if p_r_end <= p_r_start:
@@ -229,12 +280,21 @@ air
         n_probe_cells = max(2, int((p_r_end - r_min) / dx)) if dx > 0 else 20
         actual_probes = max(2, min(int(inputs.n_probes), n_probe_cells))
         theta_mid = 0.5 * (axis_eps + cone_half)
+        linear_radii = []
         for i in range(actual_probes):
             frac = i / (actual_probes - 1) if actual_probes > 1 else 0.5
             r_i = p_r_start + frac * (p_r_end - p_r_start)
             r_i = max(r_min + 1e-7, min(p_r_end - 1e-7, r_i))
+            linear_radii.append(r_i)
+        merged = merge_radii(
+            linear_radii,
+            validation_radii or (),
+            r_lo=r_min + 1e-7,
+            r_hi=p_r_end - 1e-7,
+        )
+        for r_i in merged:
             v = vtx_spherical(r_i, theta_mid, 0.0)
-            probe_points.append(f"            ({v[0]:.6g} {v[1]:.6g} {v[2]:.6g})")
+            probe_points.append(f"            ({v[0]:.12g} {v[1]:.12g} {v[2]:.12g})")
 
         fv_sol = self._foam_header("fvSolution", "dictionary", "system") + r"""
 solvers { "(rho|rhoU|rhoE|alpha|.*)" { solver diagonal; } p { solver PCG; preconditioner DIC; tolerance 1e-5; relTol 0.05; } }

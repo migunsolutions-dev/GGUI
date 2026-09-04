@@ -141,6 +141,49 @@ class Recommended1DInnerMeshTests(unittest.TestCase):
         self.assertGreaterEqual(min(thetas), 0.08)
 
 
+class Generator1DIgnitionInWedgeTests(unittest.TestCase):
+    def test_detonation_point_is_off_axis_inside_the_wedge(self):
+        import math
+        import re
+
+        from profiles import compute_recommended_1d, get_profile
+
+        root = tempfile.mkdtemp(prefix="ggui_1d_ign_")
+        gen = Generator1D(root)
+        inputs = replace(_inputs(BOUNDARY_1D_TRANSMIT), cell_size=0.001, end_time_s=0.03)
+        rec = compute_recommended_1d(
+            radius=inputs.radius,
+            cell_size=inputs.cell_size,
+            charge_radius=gen.calculate_charge_radius(inputs.mass_kg, inputs.rho_charge),
+            profile=get_profile("Balanced"),
+            max_cfl_from_ui=inputs.max_cfl,
+        )
+        case_dir = gen.generate("case_ign", inputs, rec)
+        with open(
+            os.path.join(case_dir, "constant", "phaseProperties"), encoding="utf-8"
+        ) as handle:
+            text = handle.read()
+        match = re.search(r"points\s+\(\(([^)]+)\)\)", text)
+        self.assertIsNotNone(match)
+        x, y, z = (float(v) for v in match.group(1).split())
+        self.assertGreater(abs(y), 1.0e-9)
+        r = math.sqrt(x * x + y * y + z * z)
+        theta = math.acos(max(-1.0, min(1.0, x / r)))
+        axis_eps, cone_half, _ = Generator1D.wedge_angles(inputs)
+        self.assertGreaterEqual(theta, axis_eps - 1e-9)
+        self.assertLessEqual(theta, cone_half + 1e-9)
+        with open(os.path.join(case_dir, "Allrun"), encoding="utf-8") as handle:
+            allrun = handle.read()
+        self.assertIn("PIPESTATUS[0]", allrun)
+
+    def test_impulse_function_object_does_not_write_every_timestep(self):
+        text = Generator1DSparseOutputTests()._read_control(enable_impulse=True)
+        impulse_block = text.split("impulse", 1)[1].split("probes1d", 1)[0]
+        self.assertIn("executeControl  timeStep;", impulse_block)
+        self.assertIn("writeControl    writeTime;", impulse_block)
+        self.assertNotIn("writeInterval   1;", impulse_block)
+
+
 class Generator1DSparseOutputTests(unittest.TestCase):
     def _read_control(self, **kwargs) -> str:
         root = tempfile.mkdtemp(prefix="ggui_1d_write_")

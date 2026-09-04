@@ -62,7 +62,9 @@ class RefineProbesAndIntervalPolicyTests(unittest.TestCase):
 
             locs = _probe_locations(control)
             self.assertEqual(len(locs), 3)
-            self.assertEqual(control.count("probeLocations"), 1)
+            self.assertEqual(control.count("probes2d"), 1)
+            self.assertIn("validationGauges2d", control)
+            self.assertEqual(control.count("probeLocations"), 2)
             self.assertIn("0.15", locs[0])
             self.assertIn("0.5", locs[0])
             self.assertIn("0.25", locs[1])
@@ -173,8 +175,9 @@ class RefineProbesAndIntervalPolicyTests(unittest.TestCase):
                 ),
             )
             control = _read(os.path.join(td, "nodup"), "system/controlDict")
-            self.assertEqual(control.count("type probes;"), 1)
+            self.assertEqual(control.count("type probes;"), 2)
             self.assertEqual(control.count("probes2d"), 1)
+            self.assertIn("validationGauges2d", control)
             self.assertEqual(len(_probe_locations(control)), 2)
 
 

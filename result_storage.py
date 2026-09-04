@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import os
 import re
 import shutil
-from typing import Iterable, Tuple
+from typing import Iterable, Optional, Tuple
 
 from output_options import REMAP_2D_FILENAME
 
@@ -93,17 +93,108 @@ def _numeric_time_entries(root: str) -> list[tuple[float, str, str]]:
     return sorted(entries)
 
 
+_RE_TIME_EQ = re.compile(r"(?m)^Time\s*=\s*([0-9.eE+-]+)")
+_RE_ROOT_END_TIME = re.compile(r"(?m)^\s*endTime\s+([0-9.eE+-]+)\s*;")
+
+
+def control_dict_root_text(case_dir: str) -> str:
+    """controlDict text before the ``functions`` block (root keys only)."""
+    control_path = os.path.join(case_dir, "system", "controlDict")
+    with open(control_path, encoding="utf-8", errors="ignore") as stream:
+        text = stream.read()
+    idx = text.find("\nfunctions")
+    if idx < 0:
+        idx = text.find("functions")
+    return text if idx < 0 else text[:idx]
+
+
+def control_dict_root_end_time(case_dir: str) -> Optional[float]:
+    """Root ``endTime``; never a nested function-object value."""
+    try:
+        match = _RE_ROOT_END_TIME.search(control_dict_root_text(case_dir))
+    except OSError:
+        return None
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def last_blastfoam_logged_time(
+    case_dir: str, log_text: Optional[str] = None
+) -> Optional[float]:
+    """Last ``Time =`` value from log.blastFoam."""
+    if log_text is None:
+        log_path = os.path.join(case_dir, "log.blastFoam")
+        try:
+            with open(log_path, encoding="utf-8", errors="ignore") as stream:
+                log_text = stream.read()
+        except OSError:
+            return None
+    times = _RE_TIME_EQ.findall(log_text)
+    if not times:
+        return None
+    try:
+        return float(times[-1])
+    except ValueError:
+        return None
+
+
+def is_generated_1d_case(case_dir: str) -> bool:
+    if os.path.isfile(os.path.join(case_dir, ".watchdog_target_radius")):
+        return True
+    try:
+        with open(
+            os.path.join(case_dir, "system", "controlDict"),
+            encoding="utf-8",
+            errors="ignore",
+        ) as stream:
+            return "probes1d" in stream.read()
+    except OSError:
+        return False
+
+
+def solver_run_succeeded(
+    case_dir: str,
+    return_code: Optional[int],
+    *,
+    user_stopped: bool = False,
+) -> bool:
+    """True only for a normal solver finish that honours configured endTime on 1D.
+
+    A process exiting 0 is not enough: ``blastFoam | tee`` used to hide FOAM
+    abort, and 1D ``stopAt writeNow`` (watchdog) also exits 0 before endTime.
+    """
+    if user_stopped:
+        return False
+    if return_code != 0:
+        return False
+    log_path = os.path.join(case_dir, "log.blastFoam")
+    try:
+        with open(log_path, encoding="utf-8", errors="ignore") as stream:
+            log_text = stream.read()
+    except OSError:
+        log_text = ""
+    if "FOAM FATAL" in log_text:
+        return False
+    if not is_generated_1d_case(case_dir):
+        return True
+    end_time = control_dict_root_end_time(case_dir)
+    last_t = last_blastfoam_logged_time(case_dir, log_text)
+    if last_t is None:
+        entries = [entry for entry in _numeric_time_entries(case_dir) if entry[0] > 0]
+        last_t = entries[-1][0] if entries else None
+    if end_time is None or last_t is None:
+        return False
+    tolerance = max(1.0e-9, abs(end_time) * 1.0e-4)
+    return last_t >= end_time - tolerance
+
+
 def run_reached_configured_end(case_dir: str) -> bool:
     """Confirm that a successful terminal run materialized its configured end."""
-    control_path = os.path.join(case_dir, "system", "controlDict")
-    try:
-        with open(control_path, encoding="utf-8", errors="ignore") as stream:
-            match = re.search(
-                r"(?m)^\s*endTime\s+([0-9.eE+-]+)\s*;", stream.read()
-            )
-        end_time = float(match.group(1)) if match else None
-    except (OSError, ValueError):
-        return False
+    end_time = control_dict_root_end_time(case_dir)
     entries = [entry for entry in _numeric_time_entries(case_dir) if entry[0] > 0]
     if end_time is None or not entries:
         return False

@@ -169,6 +169,7 @@ class Tab1D(QWidget):
         self.last_r_min = None
         self.last_r_max = None
         self._live_graph = False
+        self._has_run_profile = False
         self._pending_pressures = None
         self._pending_time_s = 0.0
         self._graph_timer = QTimer(self)
@@ -578,7 +579,9 @@ class Tab1D(QWidget):
 
     def plot_initial_condition(self) -> None:
         """Show the entered charge as a step in overpressure vs radius, before a run."""
-        if self._live_graph or not hasattr(self, "canvas"):
+        if self._live_graph or getattr(self, "_has_run_profile", False):
+            return
+        if not hasattr(self, "canvas"):
             return
         radii, overpressures = self.initial_overpressure_profile()
         self.canvas.axes.clear()
@@ -586,9 +589,23 @@ class Tab1D(QWidget):
         self._style_overpressure_axes()
         self._redraw_canvas()
 
-    def end_live_graph(self) -> None:
-        """Allow input edits to refresh the initial-condition sketch after a run."""
+    def begin_run_graph(self) -> None:
+        """Clear stale post-run freeze so the next live profile can replace it."""
+        self._has_run_profile = False
         self._live_graph = False
+        self._pending_pressures = None
+        self._pending_time_s = 0.0
+
+    def end_live_graph(self) -> None:
+        """Freeze the last live profile after a run; do not reset to the t=0 sketch."""
+        self._live_graph = False
+        if self._pending_pressures:
+            self._has_run_profile = True
+            self._apply_live_profile(self._pending_pressures, self._pending_time_s)
+            try:
+                self.canvas.draw_idle()
+            except Exception:
+                pass
 
     def _on_1d_exec_splitter_moved(self, _pos: int = 0, _index: int = 0) -> None:
         """Remember the user's graph/execution split for this session."""
@@ -675,6 +692,8 @@ class Tab1D(QWidget):
             self.lbl_charge_cells.setText(f"{cells_charge}")
             self.lbl_adj_density.setText(f"{rho_input:.1f}")
             self._live_graph = False
+            self._has_run_profile = False
+            self._pending_pressures = None
             self.plot_initial_condition()
 
         except Exception:

@@ -14,7 +14,7 @@ from typing import Iterable, Optional
 from ui_metrics import DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH
 
 
-TAB_CHOICES = ("1d", "2d", "3d", "time_history")
+TAB_CHOICES = ("1d", "2d", "3d", "time_history", "validation")
 STATE_CHOICES = ("ready", "initialized", "running", "completed")
 
 # States applied only through public UI/status APIs. Never invent physics.
@@ -23,6 +23,7 @@ _TAB_STATES = {
     "2d": frozenset({"ready", "initialized", "running", "completed"}),
     "3d": frozenset({"ready", "running"}),
     "time_history": frozenset({"ready"}),
+    "validation": frozenset({"ready"}),
 }
 
 
@@ -63,6 +64,7 @@ def select_tab(window, tab: str):
         "2d": getattr(window, "tab_2d", None),
         "3d": getattr(window, "tab_3d", None),
         "time_history": getattr(window, "tab_time_history", None),
+        "validation": getattr(window, "tab_validation", None),
     }
     widget = mapping.get(tab)
     if widget is None:
