@@ -86,6 +86,20 @@ def mirror_meridional(surface: "pv.PolyData") -> "pv.PolyData":
     return surface.merge(mirrored, merge_points=True, tolerance=1e-12)
 
 
+def preview_charge_markers(charge: dict) -> list:
+    """Authoritative charge-centre markers drawn on the setup preview.
+
+    Remap mode shows only the target HOB. Direct-charge mode shows the
+    ignition point; the charge body is the separate outline, not a second
+    charge centre.
+    """
+    zc = float(charge.get("height", 0.0) or 0.0)
+    if charge.get("remap"):
+        return [(0.0, zc)]
+    det_y = float(charge.get("detonation_height", zc) or zc)
+    return [(0.0, det_y)]
+
+
 def preview_charge_outline_points(
     *,
     shape: str,
@@ -372,6 +386,7 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         self._cell_size = cell_size if cell_size is not None and cell_size > 0 else 0.1
         self._scalar_bar_actor = None
         self._dynamic_actors.clear()
+        self._last_preview_data = None
         # Opening always resets to time 0. Do not list other saved times here.
         self._live_follow = False
         self._times_catalog_loaded = False
@@ -618,25 +633,26 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
             )
 
             zc = float(charge.get("height", 0.0))
-            cr = float(charge.get("radius", 0.0))
-            points = preview_charge_outline_points(
-                shape=str(charge.get("shape", "Sphere")),
-                height=zc,
-                radius=cr,
-                length=float(charge.get("length", 0.0)),
-                mirrored=self.mirrored_view,
-                reflecting_ground=bool(charge.get("reflecting_ground", False)),
-            )
-            outline = pv.lines_from_points(points, close=True)
-            self._plotter.add_mesh(outline, color="#e74c3c", line_width=3)
+            remap_preview = bool(charge.get("remap"))
+            if not remap_preview:
+                cr = float(charge.get("radius", 0.0))
+                points = preview_charge_outline_points(
+                    shape=str(charge.get("shape", "Sphere")),
+                    height=zc,
+                    radius=cr,
+                    length=float(charge.get("length", 0.0)),
+                    mirrored=self.mirrored_view,
+                    reflecting_ground=bool(charge.get("reflecting_ground", False)),
+                )
+                outline = pv.lines_from_points(points, close=True)
+                self._plotter.add_mesh(outline, color="#e74c3c", line_width=3)
 
-            # Detonation point (on axis). Prefer explicit detonation height.
-            det_y = float(charge.get("detonation_height", zc))
             det_r = max(0.004, min(radius, height) * 0.012)
-            self._plotter.add_mesh(
-                pv.Sphere(radius=det_r, center=(0.0, det_y, 0.0)),
-                color="#e67e22",
-            )
+            for marker_r, marker_z in preview_charge_markers(charge):
+                self._plotter.add_mesh(
+                    pv.Sphere(radius=det_r, center=(marker_r, marker_z, 0.0)),
+                    color="#e67e22",
+                )
 
             for r, z in probes:
                 marker = pv.Sphere(
@@ -940,6 +956,15 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
                 reset_camera=False,
             )
             self._dynamic_actors.append(axis_actor)
+            if self._charge_center:
+                cx, cy, _cz = self._charge_center
+                marker_r = max(0.004, min(radius, height) * 0.012)
+                charge_actor = self._plotter.add_mesh(
+                    pv.Sphere(radius=marker_r, center=(float(cx), float(cy), 0.0)),
+                    color="#e67e22",
+                    reset_camera=False,
+                )
+                self._dynamic_actors.append(charge_actor)
             self._add_meridional_bounds(r0, radius, 0.0, height)
 
             self._add_time_annotation(float(matched))

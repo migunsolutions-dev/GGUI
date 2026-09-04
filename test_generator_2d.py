@@ -135,11 +135,77 @@ class Generator2DTests(unittest.TestCase):
                     mesh_mode=mode,
                 )
                 command = Generator2D(td).initialization_command(inputs)
-                self.assertIn("rotateFields", command)
+                self.assertNotIn("rotateFields", command)
+                self.assertIn("postProcess -func writeCellCentres", command)
+                self.assertIn("python3 remap_2d.py", command)
                 self.assertEqual(" -refine" in command, expects_refine)
                 self.assertNotIn("setRefinedFields", command)
                 self.assertNotIn("setFields &&", command)
                 self.assertIn("regions ();", _read(case, "system/setFieldsDict"))
+                self.assertIn("from remap_fields_2d import run_case_remap", _read(case, "remap_2d.py"))
+                self.assertIn("hob=0.5,\n", _read(case, "remap_2d.py"))
+                self.assertTrue(os.path.isfile(os.path.join(case, "remap_fields_2d.py")))
+                self.assertTrue(os.path.isfile(os.path.join(case, "remap_snapshot_1d.py")))
+
+    def test_remap_metadata_and_validation_plan_use_user_hob(self):
+        from models_2d import HOB_SOURCE_USER_TARGET
+        from validation.sampling_io import read_sampling_plan
+        from validation.ufc_airblast import BURST_HEMISPHERICAL, BURST_SPHERICAL
+
+        mapping = MappingSource2D(
+            case_path="/tmp/source",
+            time_mode="latest",
+            mapped_radius=0.4,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            _, elevated = self._generate(
+                td,
+                "remap_elevated",
+                initialization_source=REMAP_SOURCE,
+                mapping=mapping,
+                height_of_burst=1.25,
+                mass_kg=1.0,
+                radius=2.0,
+                height=2.0,
+            )
+            meta = json.loads(_read(elevated, "case_2d.json"))
+            self.assertEqual(meta["hob_source"], HOB_SOURCE_USER_TARGET)
+            self.assertAlmostEqual(meta["height_of_burst_m"], 1.25)
+            self.assertEqual(meta["charge_center"], [0.0, 1.25, 0.0])
+            self.assertEqual(meta["remap_region"]["center"], [0.0, 1.25, 0.0])
+            self.assertEqual(meta["remap_region"]["mapping_method"], "radial_from_target_charge_center")
+            self.assertEqual(meta["remap_region"]["ground_clip"], "domain_z_ge_0_no_mirror")
+            self.assertEqual(meta["remap_timing"]["target_time_label"], "0")
+            self.assertIn("hob=1.25,\n", _read(elevated, "remap_2d.py"))
+            self.assertIn("points ((0 1.25 0));", _read(elevated, "constant/phaseProperties"))
+            plan = read_sampling_plan(elevated)
+            self.assertIsNotNone(plan)
+            self.assertEqual(plan.burst_master, BURST_SPHERICAL)
+            self.assertAlmostEqual(plan.line_z, 1.25)
+            self.assertEqual(list(plan.charge_center), [0.0, 1.25, 0.0])
+            self.assertTrue(all(abs(p.y - 1.25) < 1e-12 for p in plan.points))
+
+            _, surface = self._generate(
+                td,
+                "remap_surface",
+                initialization_source=REMAP_SOURCE,
+                mapping=mapping,
+                height_of_burst=0.0,
+                mass_kg=1.0,
+                radius=2.0,
+                height=1.5,
+            )
+            surface_meta = json.loads(_read(surface, "case_2d.json"))
+            self.assertAlmostEqual(surface_meta["height_of_burst_m"], 0.0)
+            self.assertEqual(surface_meta["hob_source"], HOB_SOURCE_USER_TARGET)
+            self.assertEqual(surface_meta["charge_center"], [0.0, 0.0, 0.0])
+            self.assertEqual(surface_meta["remap_region"]["center"], [0.0, 0.0, 0.0])
+            self.assertIn("hob=0,\n", _read(surface, "remap_2d.py"))
+            surface_plan = read_sampling_plan(surface)
+            self.assertIsNotNone(surface_plan)
+            self.assertEqual(surface_plan.burst_master, BURST_HEMISPHERICAL)
+            self.assertEqual(surface_plan.figure, "2-15")
+            self.assertAlmostEqual(surface_plan.line_z, 0.0)
 
     def test_probe_maps_radius_height_to_wedge_centre_plane(self):
         with tempfile.TemporaryDirectory() as td:

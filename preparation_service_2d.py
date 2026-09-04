@@ -164,6 +164,8 @@ def prepare_native_2d_case(
             progress("Running setRefinedFields")
         elif "setFields" in command:
             progress("Running setFields")
+        if "remap_2d.py" in command:
+            progress("Remapping 1D field about target HOB")
         if "checkMesh" in command:
             progress("Running checkMesh")
 
@@ -371,6 +373,8 @@ def prepare_imported_model_generation(
             progress("Running setRefinedFields")
         elif "setFields" in command:
             progress("Running setFields")
+        if "remap_2d.py" in command:
+            progress("Remapping 1D field about target HOB")
         if "checkMesh" in command:
             progress("Running checkMesh")
 

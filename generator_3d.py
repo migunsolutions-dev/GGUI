@@ -23,7 +23,8 @@ from mesh_domain import align_domain_to_cell_size
 from material_catalog import jwl_parameters
 from models import CaseInputs3D
 from output_options import extra_function_objects, obstacle_monitor_block, section_plane_point, surfaces_vtk_block
-from path_utils import get_latest_time_dir, win_to_wsl_path
+from path_utils import win_to_wsl_path
+from remap_snapshot_1d import resolve_remap_source
 from startup_capture_guard import require_safe_capture
 
 
@@ -666,47 +667,62 @@ def fast_write(path, name, dim, arr, bc, is_vector=False):
         f.write(bc + "\n")
 
 def main():
-    # Robust time directory resolution
-    time_dir, diag = _resolve_time_dir(SOURCE_1D_CASE, SOURCE_TIME)
-    
-    if not time_dir:
-        print("remap_radial: FATAL - 1D time directory not found", file=sys.stderr)
-        print("=" * 70, file=sys.stderr)
-        print("  SOURCE_1D_CASE:     %s" % SOURCE_1D_CASE, file=sys.stderr)
-        print("  SOURCE_TIME (raw):  %s" % repr(SOURCE_TIME), file=sys.stderr)
-        print("  Case exists:        %s" % os.path.isdir(SOURCE_1D_CASE), file=sys.stderr)
-        if diag.get("candidates"):
-            print("  Available times:    %s" % diag["candidates"], file=sys.stderr)
-        else:
-            print("  Available times:    (none found)", file=sys.stderr)
-        if diag.get("error"):
-            print("  Error:              %s" % diag["error"], file=sys.stderr)
-        print("=" * 70, file=sys.stderr)
-        print("", file=sys.stderr)
-        print("RESOLUTION HINTS:", file=sys.stderr)
-        print("  1. Ensure the 1D case has been run and time directories exist.", file=sys.stderr)
-        print("  2. Check SOURCE_1D_CASE path is accessible (WSL: use /mnt/c/... or /home/...).", file=sys.stderr)
-        if diag.get("candidates"):
-            print("  3. Try SOURCE_TIME='latest' or one of: %s" % diag["candidates"][:5], file=sys.stderr)
-        print("", file=sys.stderr)
+    snap = None
+    snap_err = None
+    try:
+        from remap_snapshot_1d import load_profile_for_remap
+        snap, snap_err = load_profile_for_remap(SOURCE_1D_CASE)
+    except Exception:
+        snap = None
+        snap_err = None
+    if snap_err:
+        print("remap_radial: %s" % snap_err, file=sys.stderr)
         sys.exit(1)
-    
-    # Success: print resolution info
-    if diag["method"] == "exact_string":
-        print("remap_radial: Resolved SOURCE_TIME '%s' -> '%s' (exact string match)" % (SOURCE_TIME, time_dir), file=sys.stderr)
-    elif diag["method"] == "exact_numeric":
-        print("remap_radial: Resolved SOURCE_TIME '%s' (%.6g) -> '%s' (%.6g) [exact numeric]" % (
-            SOURCE_TIME, diag["requested_val"], time_dir, diag["resolved_val"]), file=sys.stderr)
-    elif diag["method"] == "closest":
-        print("remap_radial: WARNING - No exact match for SOURCE_TIME '%s' (%.6g)" % (SOURCE_TIME, diag["requested_val"]), file=sys.stderr)
-        print("remap_radial: Using closest time: '%s' (%.6g) [diff=%.3g]" % (
-            time_dir, diag["resolved_val"], abs(diag["resolved_val"] - diag["requested_val"])), file=sys.stderr)
-    elif diag["method"] == "latest":
-        print("remap_radial: Resolved SOURCE_TIME 'latest' -> '%s'" % time_dir, file=sys.stderr)
-    data_1d = _read_1d_data(SOURCE_1D_CASE, time_dir)
-    if not data_1d:
-        print("remap_radial: failed to read 1D data", file=sys.stderr)
-        sys.exit(1)
+    if snap is not None:
+        data_1d = snap
+        print("remap_radial: using dedicated 1D remap snapshot", file=sys.stderr)
+    else:
+        # Robust time directory resolution
+        time_dir, diag = _resolve_time_dir(SOURCE_1D_CASE, SOURCE_TIME)
+        
+        if not time_dir:
+            print("remap_radial: FATAL - 1D time directory not found", file=sys.stderr)
+            print("=" * 70, file=sys.stderr)
+            print("  SOURCE_1D_CASE:     %s" % SOURCE_1D_CASE, file=sys.stderr)
+            print("  SOURCE_TIME (raw):  %s" % repr(SOURCE_TIME), file=sys.stderr)
+            print("  Case exists:        %s" % os.path.isdir(SOURCE_1D_CASE), file=sys.stderr)
+            if diag.get("candidates"):
+                print("  Available times:    %s" % diag["candidates"], file=sys.stderr)
+            else:
+                print("  Available times:    (none found)", file=sys.stderr)
+            if diag.get("error"):
+                print("  Error:              %s" % diag["error"], file=sys.stderr)
+            print("=" * 70, file=sys.stderr)
+            print("", file=sys.stderr)
+            print("RESOLUTION HINTS:", file=sys.stderr)
+            print("  1. Ensure the 1D case has been run and time directories exist.", file=sys.stderr)
+            print("  2. Check SOURCE_1D_CASE path is accessible (WSL: use /mnt/c/... or /home/...).", file=sys.stderr)
+            if diag.get("candidates"):
+                print("  3. Try SOURCE_TIME='latest' or one of: %s" % diag["candidates"][:5], file=sys.stderr)
+            print("", file=sys.stderr)
+            sys.exit(1)
+        
+        # Success: print resolution info
+        if diag["method"] == "exact_string":
+            print("remap_radial: Resolved SOURCE_TIME '%s' -> '%s' (exact string match)" % (SOURCE_TIME, time_dir), file=sys.stderr)
+        elif diag["method"] == "exact_numeric":
+            print("remap_radial: Resolved SOURCE_TIME '%s' (%.6g) -> '%s' (%.6g) [exact numeric]" % (
+                SOURCE_TIME, diag["requested_val"], time_dir, diag["resolved_val"]), file=sys.stderr)
+        elif diag["method"] == "closest":
+            print("remap_radial: WARNING - No exact match for SOURCE_TIME '%s' (%.6g)" % (SOURCE_TIME, diag["requested_val"]), file=sys.stderr)
+            print("remap_radial: Using closest time: '%s' (%.6g) [diff=%.3g]" % (
+                time_dir, diag["resolved_val"], abs(diag["resolved_val"] - diag["requested_val"])), file=sys.stderr)
+        elif diag["method"] == "latest":
+            print("remap_radial: Resolved SOURCE_TIME 'latest' -> '%s'" % time_dir, file=sys.stderr)
+        data_1d = _read_1d_data(SOURCE_1D_CASE, time_dir)
+        if not data_1d:
+            print("remap_radial: failed to read 1D data", file=sys.stderr)
+            sys.exit(1)
     r_1d = data_1d["r"]
     C = _read_3d_cell_centres()
     if C is None or len(C) == 0:
@@ -887,17 +903,29 @@ class Generator3D(BaseGenerator):
             init_plan = build_initialization_plan(inputs)
             mapped_source_dir_linux = None
             mapped_source_time = None
+            remap_resolved = None
             remap_case_path = getattr(inputs, "remap_case_path", "") or ""
             if remap_enabled and remap_case_path.strip():
                 source_case_dir_win, source_time_from_path = _split_source_case_and_time(remap_case_path)
                 if source_case_dir_win:
                     mapped_source_dir_linux = win_to_wsl_path(source_case_dir_win)
                     remap_time_mode = getattr(inputs, "remap_time_mode", "latest") or "latest"
-                    if remap_time_mode == "latest":
-                        latest = get_latest_time_dir(source_case_dir_win)
-                        mapped_source_time = latest or source_time_from_path or getattr(inputs, "remap_specific_time", None) or "1e-4"
+                    remap_resolved = resolve_remap_source(source_case_dir_win)
+                    if remap_resolved.blocked:
+                        raise ValueError(remap_resolved.message)
+                    if remap_resolved.ok:
+                        mapped_source_time = remap_resolved.time_label
+                    elif remap_time_mode != "latest":
+                        mapped_source_time = (
+                            getattr(inputs, "remap_specific_time", None)
+                            or source_time_from_path
+                        )
+                        if not mapped_source_time:
+                            raise ValueError("Specific remap time is empty.")
                     else:
-                        mapped_source_time = getattr(inputs, "remap_specific_time", None) or source_time_from_path or "1e-4"
+                        raise ValueError(
+                            remap_resolved.message or "Remap source is unavailable."
+                        )
 
             has_obstacles = bool(getattr(inputs, "obstacles", None))
             if has_obstacles:
@@ -919,6 +947,20 @@ class Generator3D(BaseGenerator):
             if remap_enabled and mapped_source_dir_linux and mapped_source_time:
                 remap_origin = getattr(inputs, "remap_origin", (0.0, 0.0, 0.0))
                 self._write_remap_radial_script(case_dir, mapped_source_dir_linux, mapped_source_time, remap_origin)
+                import json
+                source_meta = {
+                    "remap_source_type": (
+                        remap_resolved.source_type if remap_resolved is not None else ""
+                    ),
+                    "source_physical_time": (
+                        remap_resolved.physical_time if remap_resolved is not None else None
+                    ),
+                    "source_time_label": mapped_source_time,
+                }
+                self._write_text(
+                    os.path.join(case_dir, "ggui_remap_source.json"),
+                    json.dumps(source_meta, indent=2, sort_keys=True) + "\n",
+                )
 
             solver_app = "blastFoam"
             if not remap_enabled:
@@ -1107,6 +1149,9 @@ class Generator3D(BaseGenerator):
     ) -> None:
         """Write remap_radial.py into the case root for Autodyn-style radial remap from 1D."""
         ox, oy, oz = float(origin[0]), float(origin[1]), float(origin[2])
+        snap_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "remap_snapshot_1d.py")
+        if os.path.isfile(snap_src):
+            shutil.copyfile(snap_src, os.path.join(case_dir, "remap_snapshot_1d.py"))
         script = _REMAP_RADIAL_SCRIPT.format(
             source_case=repr(source_case_linux),
             source_time=repr(source_time),

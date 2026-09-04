@@ -158,6 +158,79 @@ class AutoPointsEngineTests(unittest.TestCase):
         z_lo, z_hi = z_interval(BURST_HEMISPHERICAL)
         self.assertAlmostEqual(plan.r_min, z_lo * cube_root_units(1.0))
 
+    def test_remap_points_are_outside_receiving_region(self):
+        from validation.auto_points import REMAP_NO_VALID_DOMAIN
+
+        plan = plan_2d(
+            mass_kg=1.0,
+            domain_radius_m=2.0,
+            domain_height_m=1.5,
+            hob_m=0.5,
+            cell_size=0.05,
+            remap_receive_r_max=0.8,
+        )
+        self.assertTrue(plan.ok)
+        self.assertTrue(plan.points)
+        self.assertTrue(all(p.range_m > 0.8 for p in plan.points))
+        self.assertEqual(plan.extra["remap_region"]["center"], [0.0, 0.5, 0.0])
+        self.assertTrue(
+            all(
+                math.hypot(p.x - plan.charge_center[0], p.y - plan.charge_center[1]) > 0.8
+                for p in plan.points
+            )
+        )
+        empty = plan_2d(
+            mass_kg=1.0,
+            domain_radius_m=0.85,
+            domain_height_m=1.5,
+            hob_m=0.5,
+            cell_size=0.05,
+            remap_receive_r_max=0.84,
+        )
+        self.assertFalse(empty.ok)
+        self.assertEqual(empty.points, ())
+        self.assertTrue(any(REMAP_NO_VALID_DOMAIN in n for n in empty.notes))
+
+    def test_remap_keeps_user_hob_burst_classification(self):
+        from validation.ufc_airblast import BURST_HEMISPHERICAL, BURST_SPHERICAL
+
+        elevated = plan_2d(
+            mass_kg=1.0,
+            domain_radius_m=2.0,
+            domain_height_m=1.5,
+            hob_m=0.8,
+            cell_size=0.05,
+            remap_receive_r_max=0.3,
+        )
+        self.assertEqual(elevated.burst_master, BURST_SPHERICAL)
+        self.assertAlmostEqual(elevated.line_z, 0.8)
+        self.assertEqual(elevated.charge_center[1], 0.8)
+        self.assertTrue(all(abs(p.y - 0.8) < 1e-12 for p in elevated.points))
+        self.assertEqual(elevated.extra["remap_region"]["center"], [0.0, 0.8, 0.0])
+        # Exclusion is spherical distance from [0, HOB, 0], not from the origin.
+        self.assertTrue(
+            all(
+                math.hypot(p.x, p.y - 0.8) > 0.3
+                for p in elevated.points
+            )
+        )
+        inside_if_origin_centred = [
+            p for p in elevated.points if math.hypot(p.x, p.y) <= 0.3
+        ]
+        self.assertEqual(inside_if_origin_centred, [])
+
+        surface = plan_2d(
+            mass_kg=1.0,
+            domain_radius_m=2.0,
+            domain_height_m=1.5,
+            hob_m=0.0,
+            cell_size=0.05,
+            remap_receive_r_max=0.3,
+        )
+        self.assertEqual(surface.burst_master, BURST_HEMISPHERICAL)
+        self.assertEqual(surface.figure, "2-15")
+        self.assertAlmostEqual(surface.line_z, 0.0)
+
     def test_higher_dpi_reduces_point_count(self):
         n96 = point_count(DEFAULT_PLOT_WIDTH_PX, 96.0)
         n192 = point_count(DEFAULT_PLOT_WIDTH_PX, 192.0)

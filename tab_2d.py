@@ -1002,8 +1002,8 @@ class Tab2D(QWidget):
         self.spin_mapped_radius = self._double(0.5, 1e-9)
         self.spin_source_resolution = self._double(0.01, 1e-9)
         self.lbl_mapping_note = QLabel(
-            "rotateFields mapping is not conservative; normal mapping uses source-volume "
-            "weighting and fallback/extension uses nearest cells."
+            "Radial mapping about the target charge centre [0, HOB, 0] is not conservative; "
+            "cells sample the 1D spherical profile by distance from that centre."
         )
         self.lbl_mapping_note.setWordWrap(True)
         self.lbl_mapping_note.setStyleSheet(WARNING_STYLE)
@@ -1014,6 +1014,10 @@ class Tab2D(QWidget):
         source_resolution_row = self._with_unit(self.spin_source_resolution, "m")
         form.addRow("Mapped radius:", mapped_radius_row)
         form.addRow("Source resolution:", source_resolution_row)
+        self.lbl_remap_status = QLabel("")
+        self.lbl_remap_status.setWordWrap(True)
+        self.lbl_remap_status.setStyleSheet(SECONDARY_INFO_STYLE)
+        form.addRow(self.lbl_remap_status)
         form.addRow(self.lbl_mapping_note)
         # Mapping always uses the latest available source time. Keep the hidden
         # controls alive for project compatibility and generator inputs.
@@ -1671,8 +1675,28 @@ class Tab2D(QWidget):
         direct = self.cmb_source.currentText() == DIRECT_SOURCE
         dynamic = self.cmb_mesh_mode.currentText() == DYNAMIC_MESH
         cylinder = self.cmb_shape.currentText() == "Cylinder"
-        self.grp_charge.setEnabled(direct)
+        # Remap imports initial fields only. Target HOB remains user-controlled
+        # geometry/metadata (charge centre, burst class, UFC/KB, validation).
+        self.grp_charge.setEnabled(True)
         self.grp_mapping.setEnabled(not direct)
+        for widget in (
+            self.cmb_material,
+            self.cmb_shape,
+            self.spin_density,
+            self.spin_energy,
+            self.spin_ld,
+            self.spin_det_height,
+            self.spin_mass,
+        ):
+            widget.setEnabled(direct)
+        self.spin_hob.setEnabled(True)
+        self.spin_hob.setToolTip(
+            "2D charge-centre height (HOB). Remap imports initial fields; "
+            "HOB stays user-controlled for burst classification, UFC/KB, "
+            "and validation point placement."
+            if not direct
+            else "Charge-centre height above the ground plane."
+        )
         self.spin_ld.setVisible(cylinder)
         self.lbl_ld_title.setVisible(cylinder)
         self.lbl_charge_l.setVisible(cylinder)
@@ -1680,6 +1704,7 @@ class Tab2D(QWidget):
         self.grp_seed.setEnabled(direct and dynamic)
         self.grp_amr.setEnabled(dynamic)
         self.btn_mesh_amr.setEnabled(dynamic)
+        self.refresh_remap_status()
         if not dynamic:
             self._mesh_dialog.hide()
         self.spin_seed_level.setEnabled(self.cmb_seed_mode.currentText() == SEED_MODE_MANUAL)
@@ -1748,6 +1773,26 @@ class Tab2D(QWidget):
         else:
             self.txt_source_case.setText("")
             self.txt_source_case.setToolTip("")
+        self.refresh_remap_status()
+
+    def refresh_remap_status(self) -> None:
+        """Show whether remap can use a last-state snapshot without an OF time folder."""
+        label = getattr(self, "lbl_remap_status", None)
+        if label is None:
+            return
+        if self.cmb_source.currentText() != REMAP_SOURCE:
+            label.hide()
+            label.setText("")
+            return
+        label.show()
+        from remap_snapshot_1d import availability_for_case, display_text
+
+        avail = availability_for_case(self._remap_case_path)
+        label.setText(display_text(avail) or avail.message or "Remap is unavailable.")
+        if avail.status in ("invalid", "stale", "missing") and not avail.snapshot_available:
+            label.setStyleSheet(WARNING_STYLE)
+        else:
+            label.setStyleSheet(SECONDARY_INFO_STYLE)
 
     def _current_1d_remap_path(self) -> str:
         return self._last_1d_case_dir or latest_case_1d_dir(self._source_cases_root)
@@ -1967,6 +2012,7 @@ class Tab2D(QWidget):
                             else int(inputs.charge_refinement_level)
                         ),
                         "buffer_layers": int(inputs.buffer_layers),
+                        "remap": inputs.initialization_source != DIRECT_SOURCE,
                     },
                     [(p.radius, p.height) for p in inputs.probes],
                 )

@@ -15,8 +15,31 @@ from execution_plan import (  # noqa: F401 — re-export for existing imports
     ExecutionPreparationError,
     build_execution_plan,
 )
+from completion_1d import (
+    STOP_REASON_END_TIME_REACHED,
+    STOP_REASON_END_TIME_WITHOUT_ARRIVAL,
+    STOP_REASON_WAVE_RADIUS_REACHED,
+    detect_arrival_in_case,
+    finalize_completion_record,
+    is_terminate_mode,
+    overpressure_arrived,
+    read_completion_record,
+    reset_completion_for_new_run,
+    resolve_arrival_probe,
+    write_completion_record,
+)
 from foam_dictionary import update_top_level_entries
-from result_storage import ResultStoragePolicy, ensure_remap_snapshot, solver_run_succeeded
+from result_storage import (
+    ResultStoragePolicy,
+    control_dict_root_end_time,
+    ensure_remap_snapshot,
+    is_generated_1d_case,
+    last_blastfoam_logged_time,
+    logged_time_reached_end,
+    solver_run_succeeded,
+)
+from validation.probes import latest_probe_field_file
+from remap_snapshot_1d import write_snapshot_after_run
 from wsl_runtime import (
     build_case_command_argv,
     popen_group_kwargs,
@@ -79,9 +102,10 @@ def probe_write_interval_from_control_dict(
 def request_solver_write_and_stop(case_dir: str) -> bool:
     """Ask a running OpenFOAM solver to dump the current time and exit.
 
-    1D field dumps are sparse (one interval at endTime). The watchdog must not
-    wait for that write; ``stopAt writeNow`` is reread because controlDict is
-    ``runTimeModifiable``.
+    1D field dumps are sparse (one interval at endTime). A verified
+    wave-radius stop must not wait for that write; ``stopAt writeNow`` is
+    reread because controlDict is ``runTimeModifiable``. The GUI records
+    this as ``wave_radius_reached``, not a normal endTime completion.
     """
     cd_path = os.path.join(case_dir, "system", "controlDict")
     try:
@@ -182,11 +206,16 @@ class SolverRunner(QThread):
         self._reconstruct_proc: Optional[subprocess.Popen] = None
         self._last_reconstructed_time: Optional[float] = None
 
-        # 1D watchdog: trigger stop when shock reaches target radius (only once)
+        # 1D wave-radius: verified overpressure at the requested radius
         self._watchdog_triggered: bool = False
-        self._watchdog_stop_requested_time: Optional[float] = None  # time.time() when writeNow was requested
-        self._watchdog_grace_seconds: float = 3.0  # wait before forcing process stop if solver ignores writeNow
+        self._watchdog_stop_requested_time: Optional[float] = None
+        self._watchdog_grace_seconds: float = 3.0
         self._watchdog_state = WatchdogState()
+        self._wave_probe_file: Optional[str] = None
+        self._wave_probe_pos: int = 0
+        self._wave_probe_index: int = 0
+        self._wave_arrival_recorded: bool = False
+        self._run_started_at: float = 0.0
 
         path = to_wsl_path_and_distro(win_case_dir)
         self._wsl_distro, self._linux_case_dir = path.distro, path.linux_path
@@ -518,54 +547,80 @@ class SolverRunner(QThread):
                     self._reconstruct_proc = None
 
     def _check_watchdog_trigger(self, case_dir: str) -> None:
-        """Stop when the shock has arrived at the target radius (peak-and-fall or strong p)."""
-        if self._watchdog_triggered:
+        """Record wave arrival; stop only in Terminate mode."""
+        if self._wave_arrival_recorded:
             return
-        base = os.path.join(case_dir, "postProcessing", "watchdog_probe")
-        if not os.path.isdir(base):
+        record = read_completion_record(case_dir)
+        if record is None:
             return
-        # Find latest p file (OpenFOAM may write 0/p or <time>/p)
-        p_files = glob.glob(os.path.join(base, "*", "p"))
-        if not p_files:
+        requested = record.requested_stop_radius_m
+        if requested is None:
             return
-        def mtime_key(p: str) -> float:
+        if self._wave_probe_file is None:
+            resolved = resolve_arrival_probe(case_dir, float(requested))
+            if resolved is None:
+                return
+            fo, index, loc, probe_r = resolved
+            path = latest_probe_field_file(case_dir, fo, "p")
+            if not path:
+                return
             try:
-                return os.path.getmtime(p)
+                if self._run_started_at > 0.0 and os.path.getmtime(path) < self._run_started_at:
+                    return
             except OSError:
-                return 0.0
-        p_path = max(p_files, key=mtime_key)
+                return
+            self._wave_probe_file = path
+            self._wave_probe_index = int(index)
+            self._wave_probe_pos = 0
+            record.probe_function_object = fo
+            record.probe_index = int(index)
+            record.probe_location = loc
+            record.probe_radius_m = probe_r
+            write_completion_record(case_dir, record)
+
         try:
-            with open(p_path, "r", encoding="utf-8", errors="ignore") as f:
-                lines = [ln.strip() for ln in f.readlines() if ln.strip() and not ln.strip().startswith("#")]
+            with open(self._wave_probe_file, "rb") as handle:
+                handle.seek(self._wave_probe_pos)
+                raw = handle.read()
+                complete, leftover = complete_probe_chunk(raw)
+                self._wave_probe_pos = handle.tell() - leftover
         except OSError:
             return
-        if not lines:
+        if not complete:
             return
-        last = lines[-1]
-        parts = last.split()
-        if len(parts) < 2:
+        parsed = parse_last_probe_pressures(complete.decode("utf-8", "ignore"))
+        if parsed is None:
             return
-        try:
-            pressure = float(parts[1])
-        except ValueError:
+        sample_time, pressures, _count = parsed
+        idx = self._wave_probe_index
+        if idx < 0 or idx >= len(pressures):
             return
-        if not watchdog_should_stop(pressure, self._watchdog_state):
+        if not overpressure_arrived(
+            pressures[idx],
+            p_atm=record.p_atm,
+            threshold_pa=record.threshold_overpressure_pa,
+        ):
+            return
+        record.wave_radius_reached = True
+        record.detected_arrival_time_s = float(sample_time)
+        record = detect_arrival_in_case(case_dir, record)
+        write_completion_record(case_dir, record)
+        self._wave_arrival_recorded = True
+        radius_str = f"{float(requested):.6g}"
+        if not is_terminate_mode(record):
+            self.status_signal.emit(
+                f"Wave reached radius ({radius_str} m). Continuing until stopped."
+            )
             return
         self._watchdog_triggered = True
-        radius_str = "?"
-        try:
-            r_path = os.path.join(case_dir, ".watchdog_target_radius")
-            if os.path.isfile(r_path):
-                with open(r_path, "r", encoding="utf-8") as f:
-                    radius_str = f.read().strip() or "?"
-        except OSError:
-            pass
-        self.status_signal.emit(f"Shockwave reached target radius ({radius_str}m). Stopping simulation.")
+        self.status_signal.emit(
+            f"Wave reached requested radius ({radius_str} m). Stopping simulation."
+        )
         request_solver_write_and_stop(case_dir)
         self._watchdog_stop_requested_time = time.time()
 
     def _maybe_stop_after_watchdog(self) -> None:
-        """If watchdog requested writeNow and grace period elapsed, terminate process so run actually stops."""
+        """If writeNow was ignored, terminate without treating this as a user interrupt."""
         if not self._watchdog_triggered or self._watchdog_stop_requested_time is None:
             return
         if self._proc is None or self._proc.poll() is not None:
@@ -573,7 +628,6 @@ class SolverRunner(QThread):
         elapsed = time.time() - self._watchdog_stop_requested_time
         if elapsed < self._watchdog_grace_seconds:
             return
-        self.keep_running = False
         terminate_process_tree(self._proc)
 
     def _read_new_probe_lines(self) -> Optional[Tuple[float, List[float], int, float]]:
@@ -630,12 +684,20 @@ class SolverRunner(QThread):
             self._run_simple(linux_dir, "chmod +x Allrun Allclean 2>/dev/null || true")
         self.status_signal.emit(f"Running: {self.intent.value}")
         args = self._build_wsl_cmd(linux_dir, execution.command)
+        self._run_started_at = time.time()
+        if is_generated_1d_case(self.win_case_dir):
+            reset_completion_for_new_run(self.win_case_dir)
         try:
             with self._process_lock:
                 if self._stop_requested or not self.keep_running:
                     self.finished_signal.emit(False)
                     return
-                self._proc = subprocess.Popen(args, **popen_group_kwargs())
+                self._proc = subprocess.Popen(
+                    args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    **popen_group_kwargs(),
+                )
         except Exception as e:
             self.status_signal.emit(
                 f"Failed command `{execution.command}`: {e}. Log: {execution.log_name}"
@@ -656,13 +718,17 @@ class SolverRunner(QThread):
         self._watchdog_triggered = False
         self._watchdog_stop_requested_time = None
         self._watchdog_state = WatchdogState()
+        self._wave_probe_file = None
+        self._wave_probe_pos = 0
+        self._wave_probe_index = 0
+        self._wave_arrival_recorded = False
         _re_time = re.compile(r"^Time\s*=\s*([\d\.eE\+\-]+)", re.MULTILINE)
         _re_dt = re.compile(r"^deltaT\s*=\s*([\d\.eE\+\-]+)", re.MULTILINE)
         _re_courant = re.compile(r"^Courant Number.*$", re.MULTILINE)
         while self.keep_running and self._proc.poll() is None:
             self._maybe_reconstruct_new_times()
-            # 1D used to stop at shock arrival via stopAt writeNow. That exits 0
-            # and the GUI labelled the run Done far below the requested endTime.
+            self._check_watchdog_trigger(self.win_case_dir)
+            self._maybe_stop_after_watchdog()
             if self._probe_file is None:
                 self._probe_file = self._discover_probe_file()
                 if self._probe_file:
@@ -700,9 +766,37 @@ class SolverRunner(QThread):
             time.sleep(0.10)
 
         rc = self._proc.poll() if self._proc else 1
-        user_stopped = bool(self._stop_requested or not self.keep_running)
+        user_stopped = bool(self._stop_requested)
+        log_path = os.path.join(self.win_case_dir, "log.blastFoam")
+        try:
+            with open(log_path, encoding="utf-8", errors="ignore") as stream:
+                log_text = stream.read()
+        except OSError:
+            log_text = ""
+        foam_fatal = "FOAM FATAL" in log_text
+        last_t = last_blastfoam_logged_time(self.win_case_dir, log_text)
+        reached_end = logged_time_reached_end(self.win_case_dir, log_text)
+        configured_end = control_dict_root_end_time(self.win_case_dir)
+        completion = None
+        if is_generated_1d_case(self.win_case_dir):
+            completion = finalize_completion_record(
+                self.win_case_dir,
+                return_code=rc,
+                user_stopped=user_stopped,
+                final_solver_time_s=last_t,
+                reached_end_time=reached_end,
+                foam_fatal=foam_fatal,
+                end_time_s=configured_end,
+            )
+            snap_msg = write_snapshot_after_run(
+                self.win_case_dir,
+                completion,
+                user_stopped=user_stopped,
+            )
+            if snap_msg:
+                self.status_signal.emit(snap_msg)
         if user_stopped:
-            self.status_signal.emit("Stopped.")
+            self.status_signal.emit("Stopped by user.")
             self.finished_signal.emit(False)
             return
 
@@ -738,11 +832,55 @@ class SolverRunner(QThread):
                 self.finished_signal.emit(False)
                 return
             self.progress_signal.emit(100)
-            self.status_signal.emit("Finished.")
+            if (
+                completion is not None
+                and completion.stop_reason == STOP_REASON_WAVE_RADIUS_REACHED
+            ):
+                self.status_signal.emit(
+                    "Wave reached requested radius. Finished."
+                )
+            elif (
+                completion is not None
+                and completion.stop_reason == STOP_REASON_END_TIME_REACHED
+            ):
+                self.status_signal.emit("Reached End Time. Finished.")
+            else:
+                self.status_signal.emit("Finished.")
             self.finished_signal.emit(True)
         else:
             self._write_debug_summary(rc if rc else 1)
-            if rc == 0:
+            if (
+                completion is not None
+                and completion.stop_reason == STOP_REASON_END_TIME_WITHOUT_ARRIVAL
+            ):
+                self.status_signal.emit(
+                    "End Time reached before verified wave arrival at the requested "
+                    f"radius (not a successful completion). Logs: {execution.log_name}, "
+                    "debug_summary.txt."
+                )
+            elif (
+                completion is not None
+                and is_terminate_mode(completion)
+                and not user_stopped
+                and not foam_fatal
+            ):
+                self.status_signal.emit(
+                    "Solver exited without verified wave arrival at the requested "
+                    f"radius (not a successful completion). Logs: {execution.log_name}, "
+                    "debug_summary.txt."
+                )
+            elif completion is not None and not is_terminate_mode(completion):
+                self.status_signal.emit(
+                    "Solver exited before End Time (Reflect mode; not a successful "
+                    f"completion). Logs: {execution.log_name}, debug_summary.txt."
+                )
+            elif rc == 0 and is_generated_1d_case(self.win_case_dir):
+                self.status_signal.emit(
+                    "Solver exited without the selected 1D completion condition "
+                    f"(not a successful completion). Logs: {execution.log_name}, "
+                    "debug_summary.txt."
+                )
+            elif rc == 0:
                 self.status_signal.emit(
                     "Solver exited before the configured endTime "
                     f"(not a successful completion). Logs: {execution.log_name}, "

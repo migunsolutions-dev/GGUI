@@ -38,12 +38,15 @@ neighbouring markers are about 5 mm apart at the normal application size.
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ui_metrics import COMPUTATIONAL_LEFT_PANEL_WIDTH, DEFAULT_WINDOW_WIDTH
 from validation import ufc_airblast as ufc_ab
+from validation.fingerprint import attach_plan_fingerprint, build_fingerprint
+from validation.kb_overlay import SOURCE_UFC
 from validation.metrics import is_finite_number
+from validation.ufc_airblast import scaled_distance
 from validation.ufc_units import cube_root
 
 PURPOSE_VALIDATION = "validation"
@@ -65,6 +68,15 @@ DEFAULT_PLOT_WIDTH_PX = float(DEFAULT_WINDOW_WIDTH - COMPUTATIONAL_LEFT_PANEL_WI
 MIN_POINTS = 6
 MAX_POINTS = 80
 SURFACE_HOB_M = 1.0e-9
+REMAP_NO_VALID_DOMAIN = (
+    "Validation cannot be generated reliably: not enough physical domain "
+    "outside the remap receiving region."
+)
+REMAP_RECEIVE_NOTE = (
+    "Automatic validation points are placed outside the remap receiving region "
+    "centred at [0, HOB, 0] (spherical radius from the target charge centre) "
+    "so the comparison is of later physical evolution."
+)
 
 
 @dataclass(frozen=True)
@@ -78,6 +90,11 @@ class ValidationPoint:
     z: float
     purpose: str = PURPOSE_VALIDATION
     reference_sampling: str = SAMPLING_AUTOMATIC
+    mass_kg: float = 0.0
+    burst: str = ""
+    figure: str = ""
+    reference_source: str = SOURCE_UFC
+    scaled_z: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +119,9 @@ class SamplingPlan:
     purpose: str = PURPOSE_VALIDATION
     reference_sampling: str = SAMPLING_AUTOMATIC
     extra: Dict[str, Any] = field(default_factory=dict)
+    fingerprint: Dict[str, Any] = field(default_factory=dict)
+    remap_timing: Dict[str, Any] = field(default_factory=dict)
+    remap_receive_r_max: Optional[float] = None
 
     @property
     def ok(self) -> bool:
@@ -243,6 +263,34 @@ def _pid(dim: str, index: int) -> str:
     return f"VAL_{dim.upper()}_{index + 1:03d}"
 
 
+def _point(
+    *,
+    dim: str,
+    index: int,
+    range_m: float,
+    x: float,
+    y: float,
+    z: float,
+    mass_kg: float,
+    burst: str,
+    figure: str,
+) -> ValidationPoint:
+    return ValidationPoint(
+        point_id=_pid(dim, index),
+        dim=dim,
+        index=index,
+        range_m=range_m,
+        x=x,
+        y=y,
+        z=z,
+        mass_kg=float(mass_kg),
+        burst=burst,
+        figure=figure,
+        reference_source=SOURCE_UFC,
+        scaled_z=scaled_distance(range_m, mass_kg),
+    )
+
+
 def plan_1d(
     *,
     mass_kg: float,
@@ -303,14 +351,16 @@ def plan_1d(
     n = point_count(usable_width_px, logical_dpi_x)
     radii = log_spaced(r_min, r_max, n)
     points = tuple(
-        ValidationPoint(
-            point_id=_pid("1d", i),
+        _point(
             dim="1d",
             index=i,
             range_m=r,
             x=r,
             y=0.0,
             z=0.0,
+            mass_kg=float(mass_kg),
+            burst=sampling_burst_1d(),
+            figure=figure,
         )
         for i, r in enumerate(radii)
     )
@@ -348,6 +398,7 @@ def plan_2d(
     cell_size: Optional[float] = None,
     usable_width_px: float = DEFAULT_PLOT_WIDTH_PX,
     logical_dpi_x: float = DEFAULT_LOGICAL_DPI_X,
+    remap_receive_r_max: Optional[float] = None,
 ) -> SamplingPlan:
     burst = sampling_burst_2d(hob_m)
     notes: List[str] = []
@@ -426,17 +477,55 @@ def plan_2d(
             domain_r_max=float(domain_radius_m),
         )
     r_min, r_max = clipped
+    inset = _inset(domain_radius_m, cell_size)
+    receive = (
+        float(remap_receive_r_max)
+        if is_finite_number(remap_receive_r_max) and float(remap_receive_r_max) > 0.0
+        else None
+    )
+    if receive is not None:
+        lo_phys = receive + inset
+        if r_max <= lo_phys:
+            notes.append(REMAP_NO_VALID_DOMAIN)
+            return SamplingPlan(
+                dim="2d",
+                burst_master=burst,
+                figure=figure,
+                mass_kg=float(mass_kg),
+                charge_center=(0.0, z_line, 0.0),
+                r_min=r_min,
+                r_max=r_max,
+                z_min=z_lo,
+                z_max=z_hi,
+                n_points=0,
+                line_kind=LINE_HORIZONTAL_2D,
+                line_z=z_line,
+                points=(),
+                function_object=FO_2D_VALIDATION,
+                data_source=SOURCE_UNAVAILABLE,
+                notes=tuple(notes),
+                domain_r_max=float(domain_radius_m),
+                remap_receive_r_max=receive,
+                extra={"remap_region": {"center": [0.0, z_line, 0.0], "radius_m": receive}},
+            )
+        r_min = max(r_min, lo_phys)
+        notes.append(
+            REMAP_RECEIVE_NOTE
+            + f" (r > {receive:.6g} m)."
+        )
     n = point_count(usable_width_px, logical_dpi_x)
     radii = log_spaced(r_min, r_max, n)
     points = tuple(
-        ValidationPoint(
-            point_id=_pid("2d", i),
+        _point(
             dim="2d",
             index=i,
             range_m=r,
             x=r,
             y=z_line,
             z=0.0,
+            mass_kg=float(mass_kg),
+            burst=burst,
+            figure=figure,
         )
         for i, r in enumerate(radii)
     )
@@ -462,6 +551,12 @@ def plan_2d(
         data_source=SOURCE_SOLVER_PROBE,
         notes=tuple(notes),
         domain_r_max=float(domain_radius_m),
+        remap_receive_r_max=receive,
+        extra=(
+            {"remap_region": {"center": [0.0, z_line, 0.0], "radius_m": receive}}
+            if receive is not None
+            else {}
+        ),
     )
 
 
@@ -479,20 +574,31 @@ def plan_from_dict(data: Dict[str, Any]) -> Optional[SamplingPlan]:
     try:
         pts = []
         for raw in data.get("points") or ():
+            mass = float(raw.get("mass_kg") or data.get("mass_kg") or 0.0)
+            burst = str(raw.get("burst") or data.get("burst_master") or "")
+            figure = str(raw.get("figure") or data.get("figure") or "")
+            rng = float(raw["range_m"])
+            z_val = raw.get("scaled_z")
             pts.append(
                 ValidationPoint(
                     point_id=str(raw["point_id"]),
                     dim=str(raw["dim"]),
                     index=int(raw["index"]),
-                    range_m=float(raw["range_m"]),
+                    range_m=rng,
                     x=float(raw["x"]),
                     y=float(raw["y"]),
                     z=float(raw["z"]),
                     purpose=str(raw.get("purpose") or PURPOSE_VALIDATION),
                     reference_sampling=str(raw.get("reference_sampling") or SAMPLING_AUTOMATIC),
+                    mass_kg=mass,
+                    burst=burst,
+                    figure=figure,
+                    reference_source=str(raw.get("reference_source") or SOURCE_UFC),
+                    scaled_z=None if z_val is None else float(z_val),
                 )
             )
         cc = data.get("charge_center") or (0.0, 0.0, 0.0)
+        receive = data.get("remap_receive_r_max")
         return SamplingPlan(
             dim=str(data.get("dim") or ""),
             burst_master=str(data.get("burst_master") or ""),
@@ -513,6 +619,10 @@ def plan_from_dict(data: Dict[str, Any]) -> Optional[SamplingPlan]:
             domain_r_max=float(data.get("domain_r_max") or 0.0),
             purpose=str(data.get("purpose") or PURPOSE_VALIDATION),
             reference_sampling=str(data.get("reference_sampling") or SAMPLING_AUTOMATIC),
+            extra=dict(data.get("extra") or {}),
+            fingerprint=dict(data.get("fingerprint") or {}),
+            remap_timing=dict(data.get("remap_timing") or {}),
+            remap_receive_r_max=None if receive is None else float(receive),
         )
     except (KeyError, TypeError, ValueError, IndexError):
         return None
@@ -553,3 +663,102 @@ def nearest_index(radii: Sequence[float], target: float) -> Optional[int]:
             best_d = d
             best_i = i
     return best_i
+
+
+def expected_plan_fingerprint(
+    plan: SamplingPlan,
+    *,
+    case_path: Optional[str],
+    cell_size: Optional[float] = None,
+    hob_m: Optional[float] = None,
+    domain_height_m: Optional[float] = None,
+    remap_receive_r_max: Optional[float] = None,
+    include_coordinates: bool = True,
+) -> Dict[str, Any]:
+    domain: Dict[str, Optional[float]] = {"radius": plan.domain_r_max}
+    if plan.dim == "2d":
+        domain["height"] = domain_height_m
+    hob = hob_m
+    if hob is None and plan.charge_center:
+        hob = plan.charge_center[1]
+    receive = remap_receive_r_max if remap_receive_r_max is not None else plan.remap_receive_r_max
+    payload = build_fingerprint(
+        dim=plan.dim,
+        case_path=case_path,
+        mass_kg=plan.mass_kg,
+        domain_size=domain,
+        hob_m=hob,
+        charge_center=plan.charge_center,
+        cell_size=cell_size,
+        burst_mode=plan.burst_master,
+        reference_mode=f"{SOURCE_UFC} Figure {plan.figure}".strip(),
+        points=plan.points if include_coordinates else (),
+        remap_receive_r_max=receive,
+    )
+    if not include_coordinates:
+        payload.pop("coordinates", None)
+        payload.pop("n_points", None)
+    return payload
+
+
+def stamp_plan(
+    plan: SamplingPlan,
+    *,
+    case_path: Optional[str],
+    cell_size: Optional[float] = None,
+    hob_m: Optional[float] = None,
+    domain_height_m: Optional[float] = None,
+    remap_receive_r_max: Optional[float] = None,
+    remap_timing: Optional[Dict[str, Any]] = None,
+) -> SamplingPlan:
+    fingerprint = expected_plan_fingerprint(
+        plan,
+        case_path=case_path,
+        cell_size=cell_size,
+        hob_m=hob_m,
+        domain_height_m=domain_height_m,
+        remap_receive_r_max=remap_receive_r_max,
+        include_coordinates=True,
+    )
+    return replace(
+        attach_plan_fingerprint(plan, fingerprint),
+        remap_timing=dict(remap_timing or plan.remap_timing or {}),
+        remap_receive_r_max=(
+            remap_receive_r_max if remap_receive_r_max is not None else plan.remap_receive_r_max
+        ),
+    )
+
+
+def live_fingerprint(
+    *,
+    dim: str,
+    case_path: Optional[str],
+    mass_kg: Optional[float],
+    domain_radius_m: Optional[float],
+    domain_height_m: Optional[float] = None,
+    hob_m: Optional[float] = None,
+    charge_center: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    cell_size: Optional[float] = None,
+    burst_mode: str = "",
+    figure: str = "",
+    remap_receive_r_max: Optional[float] = None,
+) -> Dict[str, Any]:
+    domain: Dict[str, Optional[float]] = {"radius": domain_radius_m}
+    if str(dim).strip().lower() == "2d":
+        domain["height"] = domain_height_m
+    payload = build_fingerprint(
+        dim=dim,
+        case_path=case_path,
+        mass_kg=mass_kg,
+        domain_size=domain,
+        hob_m=hob_m,
+        charge_center=charge_center,
+        cell_size=cell_size,
+        burst_mode=burst_mode,
+        reference_mode=f"{SOURCE_UFC} Figure {figure}".strip() if figure else SOURCE_UFC,
+        points=(),
+        remap_receive_r_max=remap_receive_r_max,
+    )
+    payload.pop("coordinates", None)
+    payload.pop("n_points", None)
+    return payload

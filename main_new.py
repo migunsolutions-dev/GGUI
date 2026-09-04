@@ -45,6 +45,7 @@ from models import CaseInputs1D, CaseInputs3D
 from models_2d import CaseInputs2D, SimulationState2D
 from axisymmetric_2d import FIXED_MESH, validate_case_inputs_2d, validate_mapping_source
 from path_utils import get_latest_time_dir, win_to_wsl_path
+from remap_snapshot_1d import resolve_remap_source
 from case_loader import load_case
 from case_topology import CaseDimension, classify_case_topology
 from case_loader_2d import (
@@ -2106,7 +2107,7 @@ class BlastFoamApp(QMainWindow):
             "2D Init Error",
             result.error
             or (
-                "blockMesh / charge initialization / rotateFields validation failed. "
+                "blockMesh / charge initialization / remap validation failed. "
                 "See log.initialize."
             ),
         )
@@ -2238,7 +2239,7 @@ class BlastFoamApp(QMainWindow):
                 "material_density": inputs.rho_charge,
                 "material_energy_j_per_kg": inputs.energy_j_per_kg,
                 "mesh_mode": inputs.mesh_mode,
-                "mapping_utility": "rotateFields",
+                "mapping_utility": "radial_from_target_charge_center",
                 "conservative": False,
                 "validation": {
                     "valid": validate_case_inputs_2d(inputs).valid,
@@ -2379,17 +2380,30 @@ class BlastFoamApp(QMainWindow):
                     source_case_dir_win, source_time_from_path = self._split_remap_path(remap_case_path)
                     mapped_source_dir_linux = win_to_wsl_path(source_case_dir_win) if source_case_dir_win else ""
                     remap_time_mode = getattr(inputs, "remap_time_mode", "latest") or "latest"
-                    if remap_time_mode == "latest":
-                        mapped_source_time = get_latest_time_dir(source_case_dir_win) or source_time_from_path
-                        if not mapped_source_time:
-                            QMessageBox.critical(
-                                self,
-                                "Remap time not defined",
-                                "Could not resolve a remap time in 'latest' mode.\n"
-                                "Please select a source case with solved time folders or switch to 'specific time'."
-                            )
-                            self.status_bar.set_status("Init blocked", "#e74c3c")
-                            return
+                    resolved = resolve_remap_source(source_case_dir_win)
+                    if resolved.blocked:
+                        QMessageBox.critical(
+                            self,
+                            "Remap source invalid",
+                            resolved.message
+                            or "The 1D remap snapshot is invalid. Remap is blocked.",
+                        )
+                        self.status_bar.set_status("Init blocked", "#e74c3c")
+                        return
+                    if resolved.ok:
+                        mapped_source_time = resolved.time_label
+                    elif remap_time_mode == "latest":
+                        QMessageBox.critical(
+                            self,
+                            "Remap source unavailable",
+                            resolved.message
+                            or (
+                                "Could not resolve a remap source in 'latest' mode.\n"
+                                "The last 1D solver state was not captured as a remap snapshot."
+                            ),
+                        )
+                        self.status_bar.set_status("Init blocked", "#e74c3c")
+                        return
                     else:
                         mapped_source_time = getattr(inputs, "remap_specific_time", None) or source_time_from_path
                         if not mapped_source_time:
@@ -2786,7 +2800,10 @@ class BlastFoamApp(QMainWindow):
             self._run_user_interrupted = True
             self.runner.stop()
             self.status_bar.stop_et_timing()
-            self.status_bar.set_status("Interrupted", "#e67e22")
+            if getattr(self, "_active_run_mode", None) == "1D":
+                self.status_bar.set_status("Stopped by user", "#e67e22")
+            else:
+                self.status_bar.set_status("Interrupted", "#e67e22")
             if getattr(self, "_active_run_mode", None) == "2D":
                 self.tab_2d.stop_live_follow_keep_time()
                 if getattr(self.tab_2d, "is_imported_mode", False):
@@ -3056,6 +3073,12 @@ class BlastFoamApp(QMainWindow):
         self.status_bar.stop_et_timing()
         if finished_mode == "1D":
             self.tab_1d.end_live_graph()
+            refresh_1d = getattr(self.tab_1d, "refresh_remap_status", None)
+            if callable(refresh_1d):
+                refresh_1d(finished_case_dir)
+            refresh_2d = getattr(self.tab_2d, "refresh_remap_status", None)
+            if callable(refresh_2d):
+                refresh_2d()
 
         if success:
             cleanup_eligible = bool(
@@ -3101,7 +3124,10 @@ class BlastFoamApp(QMainWindow):
                     )
         else:
             if user_interrupted:
-                self.status_bar.set_status("Interrupted", "#e67e22")
+                if finished_mode == "1D":
+                    self.status_bar.set_status("Stopped by user", "#e67e22")
+                else:
+                    self.status_bar.set_status("Interrupted", "#e67e22")
                 if finished_mode == "2D":
                     self.tab_2d.stop_live_follow_keep_time()
                     if getattr(self.tab_2d, "is_imported_mode", False):

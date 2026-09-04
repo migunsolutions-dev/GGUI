@@ -102,5 +102,50 @@ class ProfileAndConservationTests(unittest.TestCase):
         self.assertAlmostEqual(mass, 4.0 / 3.0 * np.pi, places=2)
 
 
+class RemapPhysicalTimeTests(unittest.TestCase):
+    def test_target_dir_zero_with_advanced_source_uses_physical_offset(self):
+        timing = remap_engine.build_remap_timing(
+            source_time_label="0.001",
+            target_time_label="0",
+        )
+        self.assertAlmostEqual(timing.source_physical_time, 0.001)
+        self.assertAlmostEqual(timing.target_initial_time, 0.0)
+        self.assertAlmostEqual(timing.physical_time_offset, 0.001)
+        self.assertAlmostEqual(timing.target_physical(0.0), 0.001)
+        r = np.linspace(0.1, 1.0, 10)
+        src = np.ones_like(r)
+        cmp = remap_engine.compare_profiles(
+            field="p",
+            source_r=r,
+            source_v=src,
+            target_r=r,
+            target_v=src,
+            r_max=1.0,
+            source_time=0.001,
+            target_time=0.0,
+            physical_time_offset=timing.physical_time_offset,
+        )
+        self.assertTrue(cmp.synchronized)
+        self.assertAlmostEqual(cmp.source_physical_time, 0.001)
+        self.assertAlmostEqual(cmp.target_physical_time, 0.001)
+        self.assertAlmostEqual(cmp.physical_time_offset, 0.001)
+        self.assertAlmostEqual(cmp.delta_t, 0.0)
+
+    def test_openfoam_labels_alone_do_not_prove_sync_without_offset(self):
+        r = np.linspace(0.1, 1.0, 10)
+        cmp = remap_engine.compare_profiles(
+            field="p",
+            source_r=r,
+            source_v=np.ones_like(r),
+            target_r=r,
+            target_v=np.ones_like(r),
+            r_max=1.0,
+            source_time=0.001,
+            target_time=0.0,
+        )
+        self.assertFalse(cmp.synchronized)
+        self.assertIn("physical times", cmp.message)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,6 +13,8 @@ from models import (
     BOUNDARY_1D_TRANSMIT,
     CaseInputs1D,
     RecommendedParams1D,
+    RUN_MODE_REFLECT,
+    RUN_MODE_TERMINATE,
 )
 
 
@@ -70,12 +72,13 @@ class Generator1DRightBoundaryTests(unittest.TestCase):
         self.assertNotIn("type slip", u_text)
         self.assertIn("outlet     { type patch;", mesh)
 
-    def test_terminate_uses_zero_gradient_outflow(self):
+    def test_terminate_uses_wave_transmissive_outflow(self):
         case_dir = self._generate(BOUNDARY_1D_TERMINATE)
         p_text = self._read(case_dir, "0.orig", "p")
+        u_text = self._read(case_dir, "0.orig", "U")
         mesh = self._read(case_dir, "system", "blockMeshDict")
-        self.assertNotIn("pressureWaveTransmissive", p_text)
-        self.assertIn("outlet { type zeroGradient; }", p_text.replace("\n", " ").replace("  ", " "))
+        self.assertIn("pressureWaveTransmissive", p_text)
+        self.assertNotIn("type slip", u_text)
         self.assertIn("outlet     { type patch;", mesh)
 
     def test_reflect_uses_slip_wall(self):
@@ -193,14 +196,15 @@ class Generator1DSparseOutputTests(unittest.TestCase):
         with open(os.path.join(case_dir, "system", "controlDict"), encoding="utf-8") as handle:
             return handle.read()
 
-    def test_default_writes_fields_only_at_end_time(self):
+    def test_default_writes_fields_only_at_user_end_time(self):
         text = self._read_control()
         self.assertIn("purgeWrite      1;", text)
         self.assertNotIn("writeInterval   1e-05;", text)
         self.assertNotIn("writeInterval   1e-5;", text)
-        # radius=1 m → safety endTime = (1/300)*2
-        self.assertIn("endTime         0.006666666667;", text)
-        self.assertIn("writeInterval   0.006666666667;", text)
+        self.assertNotIn("endTime         0.006666666667;", text)
+        self.assertNotIn("endTime         1000000000;", text)
+        self.assertIn("endTime         0.001;", text)
+        self.assertIn("writeInterval   0.001;", text)
 
     def test_explicit_write_interval_is_kept(self):
         text = self._read_control(write_interval_s=1e-5)
@@ -257,32 +261,69 @@ functions
 
         self.assertEqual(probe_write_interval_from_control_dict(text), 25)
         self.assertIn("writeInterval   25;", text)
-        self.assertEqual(text.count("writeInterval   25;"), 2)
+        self.assertEqual(text.count("writeInterval   25;"), 1)
+
+    def test_reflect_and_terminate_write_user_end_time_and_watchdog(self):
+        from completion_1d import read_completion_record
+
+        root = tempfile.mkdtemp(prefix="ggui_1d_modes_")
+        gen = Generator1D(root)
+        for right, mode in (
+            (BOUNDARY_1D_TERMINATE, RUN_MODE_TERMINATE),
+            (BOUNDARY_1D_REFLECT, RUN_MODE_REFLECT),
+        ):
+            case_dir = gen.generate(
+                f"case_{mode}",
+                replace(_inputs(right), stop_mode=mode, end_time_s=0.025),
+                _rec(),
+            )
+            with open(os.path.join(case_dir, "system", "controlDict"), encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertIn("watchdog_probe", text)
+            self.assertIn("endTime         0.025;", text)
+            self.assertNotIn("0.006666666667", text)
+            self.assertNotIn("1000000000", text)
+            self.assertTrue(os.path.isfile(os.path.join(case_dir, ".watchdog_target_radius")))
+            record = read_completion_record(case_dir)
+            self.assertIsNotNone(record)
+            self.assertEqual(record.mode, mode)
+            self.assertEqual(record.stop_mode, mode)
+            self.assertAlmostEqual(record.requested_stop_radius_m, 1.0)
+            self.assertAlmostEqual(record.end_time_s, 0.025)
+
+    def test_terminate_writes_completion_request_at_stop_radius(self):
+        root = tempfile.mkdtemp(prefix="ggui_1d_wave_")
+        gen = Generator1D(root)
+        case_dir = gen.generate(
+            "case_wave",
+            replace(
+                _inputs(BOUNDARY_1D_TRANSMIT),
+                stop_mode=RUN_MODE_TERMINATE,
+                stop_radius_m=0.5,
+            ),
+            _rec(),
+        )
+        from completion_1d import read_completion_record
+
+        record = read_completion_record(case_dir)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.mode, RUN_MODE_TERMINATE)
+        self.assertAlmostEqual(record.requested_stop_radius_m, 0.5)
+        with open(os.path.join(case_dir, ".watchdog_target_radius"), encoding="utf-8") as handle:
+            self.assertAlmostEqual(float(handle.read().strip()), 0.5)
+        with open(os.path.join(case_dir, "system", "controlDict"), encoding="utf-8") as handle:
+            self.assertIn("watchdog_probe", handle.read())
 
 
 class WatchdogStopLogicTests(unittest.TestCase):
-    def test_missed_149kpa_peak_stops_after_fall(self):
-        from solver_runner import WatchdogState, watchdog_should_stop
+    def test_overpressure_threshold_not_peak_and_fall(self):
+        from completion_1d import overpressure_arrived
 
-        state = WatchdogState()
-        self.assertFalse(watchdog_should_stop(101325.0, state))
-        self.assertFalse(watchdog_should_stop(148811.0, state))
-        self.assertTrue(watchdog_should_stop(133000.0, state))
-
-    def test_strong_jump_stops_immediately(self):
-        from solver_runner import WatchdogState, watchdog_should_stop
-
-        state = WatchdogState()
-        self.assertFalse(watchdog_should_stop(101325.0, state))
-        self.assertTrue(watchdog_should_stop(1.6e5, state))
-
-    def test_small_noise_does_not_stop(self):
-        from solver_runner import WatchdogState, watchdog_should_stop
-
-        state = WatchdogState()
-        self.assertFalse(watchdog_should_stop(101325.0, state))
-        self.assertFalse(watchdog_should_stop(105000.0, state))
-        self.assertFalse(watchdog_should_stop(101400.0, state))
+        self.assertFalse(overpressure_arrived(101325.0, p_atm=101325.0))
+        self.assertTrue(overpressure_arrived(148811.0, p_atm=101325.0))
+        self.assertTrue(overpressure_arrived(1.6e5, p_atm=101325.0))
+        self.assertFalse(overpressure_arrived(105000.0, p_atm=101325.0))
+        self.assertFalse(overpressure_arrived(101400.0, p_atm=101325.0))
 
 
 if __name__ == "__main__":

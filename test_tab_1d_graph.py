@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -150,6 +151,17 @@ class Tab1DInitialGraphTests(unittest.TestCase):
         self.assertEqual(tab.lbl_adj_density.text(), "1700.0")
         self.assertAlmostEqual(tab.get_case_inputs().rho_charge, 1700.0)
 
+    def test_remap_status_stays_hidden_until_yes_and_a_run_case(self):
+        tab = Tab1D()
+        self.assertTrue(tab.lbl_remap_status.isHidden())
+        tab.radio_yes.setChecked(True)
+        self.app.processEvents()
+        self.assertTrue(tab.lbl_remap_status.isHidden())
+        tab.refresh_remap_status(tempfile.gettempdir())
+        self.app.processEvents()
+        self.assertFalse(tab.lbl_remap_status.isHidden())
+        self.assertTrue(tab.lbl_remap_status.text())
+
 
 class ProbeStreamParseTests(unittest.TestCase):
     def test_incomplete_trailing_line_is_left_unread(self):
@@ -172,19 +184,29 @@ class Tab1DBoundariesTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = _app()
 
-    def test_right_boundary_has_three_options_default_transmit(self):
-        from models import BOUNDARY_1D_RIGHT_OPTIONS, BOUNDARY_1D_TRANSMIT
+    def test_run_mode_radios_default_terminate(self):
+        from models import BOUNDARY_1D_REFLECT, BOUNDARY_1D_TERMINATE, RUN_MODE_REFLECT, RUN_MODE_TERMINATE
+        from tab_1d import LABEL_RUN_REFLECT, LABEL_RUN_TERMINATE
 
         tab = Tab1D()
         self.assertFalse(tab.cmb_left.isEnabled())
         self.assertEqual(tab.cmb_left.currentText(), "Reflecting - spherical")
-        self.assertTrue(tab.cmb_right.isEnabled())
-        labels = [tab.cmb_right.itemText(i) for i in range(tab.cmb_right.count())]
-        self.assertEqual(labels, list(BOUNDARY_1D_RIGHT_OPTIONS))
-        self.assertEqual(tab.cmb_right.currentText(), BOUNDARY_1D_TRANSMIT)
-        self.assertEqual(tab.get_case_inputs().right_boundary, BOUNDARY_1D_TRANSMIT)
-        tab.cmb_right.setCurrentText("Reflect")
-        self.assertEqual(tab.get_case_inputs().right_boundary, "Reflect")
+        self.assertFalse(hasattr(tab, "cmb_right"))
+        self.assertEqual(tab.radio_terminate.text(), LABEL_RUN_TERMINATE)
+        self.assertEqual(tab.radio_reflect.text(), LABEL_RUN_REFLECT)
+        self.assertTrue(tab.radio_terminate.isChecked())
+        inputs = tab.get_case_inputs()
+        self.assertEqual(inputs.right_boundary, BOUNDARY_1D_TERMINATE)
+        self.assertEqual(inputs.stop_mode, RUN_MODE_TERMINATE)
+        tab.radio_reflect.setChecked(True)
+        restored = tab.get_case_inputs()
+        self.assertEqual(restored.right_boundary, BOUNDARY_1D_REFLECT)
+        self.assertEqual(restored.stop_mode, RUN_MODE_REFLECT)
+        self.assertTrue(tab.spin_endtime.isEnabled())
+        self.assertFalse(tab.spin_endtime.isHidden())
+        tab.radio_terminate.setChecked(True)
+        self.assertTrue(tab.spin_endtime.isEnabled())
+        self.assertFalse(tab.spin_endtime.isHidden())
 
 
 class Tab1DOutputOptionsTests(unittest.TestCase):
@@ -213,6 +235,78 @@ class Tab1DOutputOptionsTests(unittest.TestCase):
         self.assertIn("Solver", titles)
         self.assertIn("Output Options", titles)
         self.assertEqual(titles.index("Output Options"), titles.index("Solver") + 1)
+
+
+class Tab1DStopModeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _app()
+
+    def test_default_is_terminate_and_round_trips(self):
+        from models import (
+            BOUNDARY_1D_REFLECT,
+            BOUNDARY_1D_TERMINATE,
+            RUN_MODE_REFLECT,
+            RUN_MODE_TERMINATE,
+        )
+
+        tab = Tab1D()
+        self.assertTrue(tab.radio_terminate.isChecked())
+        inputs = tab.get_case_inputs()
+        self.assertEqual(inputs.stop_mode, RUN_MODE_TERMINATE)
+        self.assertEqual(inputs.right_boundary, BOUNDARY_1D_TERMINATE)
+        self.assertAlmostEqual(inputs.stop_radius_m, tab.spin_radius.value())
+        self.assertFalse(tab.spin_endtime.isHidden())
+        self.assertTrue(tab.spin_endtime.isEnabled())
+        self.assertAlmostEqual(inputs.end_time_s, tab.spin_endtime.value())
+        tab.radio_reflect.setChecked(True)
+        restored = tab.get_case_inputs()
+        self.assertEqual(restored.stop_mode, RUN_MODE_REFLECT)
+        self.assertEqual(restored.right_boundary, BOUNDARY_1D_REFLECT)
+        self.assertFalse(tab.spin_endtime.isHidden())
+        self.assertTrue(tab.spin_endtime.isEnabled())
+        tab.set_case_inputs(
+            {
+                "stop_mode": RUN_MODE_TERMINATE,
+                "right_boundary": BOUNDARY_1D_TERMINATE,
+                "radius": 1.0,
+                "end_time_s": 0.04,
+            }
+        )
+        self.assertTrue(tab.radio_terminate.isChecked())
+        self.assertTrue(tab.spin_endtime.isEnabled())
+        self.assertAlmostEqual(tab.spin_endtime.value(), 0.04)
+        self.assertAlmostEqual(tab.get_case_inputs().stop_radius_m, 1.0)
+        self.assertAlmostEqual(tab.get_case_inputs().end_time_s, 0.04)
+
+    def test_right_boundary_wins_when_legacy_stop_mode_conflicts(self):
+        from models import BOUNDARY_1D_TERMINATE, RUN_MODE_TERMINATE
+
+        tab = Tab1D()
+        tab.set_case_inputs(
+            {
+                "right_boundary": BOUNDARY_1D_TERMINATE,
+                "stop_mode": "end_time",
+            }
+        )
+        self.assertTrue(tab.radio_terminate.isChecked())
+        self.assertEqual(tab.get_case_inputs().stop_mode, RUN_MODE_TERMINATE)
+        tab.set_case_inputs({"right_boundary": "Transmit", "stop_mode": "end_time"})
+        self.assertTrue(tab.radio_terminate.isChecked())
+        tab.set_case_inputs({"stop_mode": "end_time"})
+        self.assertTrue(tab.radio_reflect.isChecked())
+
+    def test_begin_run_graph_clears_stale_profile_times(self):
+        tab = Tab1D()
+        tab._has_run_profile = True
+        tab._live_graph = True
+        tab._pending_pressures = [101325.0]
+        tab._pending_time_s = 0.0123
+        tab.begin_run_graph()
+        self.assertFalse(tab._has_run_profile)
+        self.assertFalse(tab._live_graph)
+        self.assertIsNone(tab._pending_pressures)
+        self.assertEqual(tab._pending_time_s, 0.0)
 
 
 class HiddenVtkPaintGuardTests(unittest.TestCase):

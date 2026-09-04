@@ -12,6 +12,10 @@ from charge_seed_plan import (
     SEED_MODE_AUTO,
 )
 
+# Height of Burst on the 2D target is always user-controlled geometry/metadata.
+# Remap imports initial fields; it does not lock or inherit HOB from the source.
+HOB_SOURCE_USER_TARGET = "user_target_geometry"
+
 # Authoritative native Cylindrical–2D runtime AMR interval default.
 # New Dynamic cases use the same value for refine and unrefine scheduling.
 DEFAULT_REFINE_INTERVAL = 3

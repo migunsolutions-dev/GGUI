@@ -1,9 +1,10 @@
 import math
+import os
 import numpy as np
 from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QFrame,
     QGroupBox, QFormLayout, QComboBox, QDoubleSpinBox, QSpinBox, QLineEdit,
-    QRadioButton, QSplitter, QScrollArea, QSizePolicy, QTabWidget
+    QRadioButton, QButtonGroup, QSplitter, QScrollArea, QSizePolicy, QTabWidget
 )
 from PyQt5.QtCore import QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QImage, QPixmap
@@ -11,10 +12,13 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
 from models import (
-    BOUNDARY_1D_RIGHT_OPTIONS,
-    BOUNDARY_1D_TRANSMIT,
+    BOUNDARY_1D_REFLECT,
+    BOUNDARY_1D_TERMINATE,
     CaseInputs1D,
+    RUN_MODE_REFLECT,
+    RUN_MODE_TERMINATE,
 )
+from completion_1d import normalize_run_mode
 from ui_metrics import (
     COMPUTATIONAL_LEFT_PANEL_WIDTH,
     COMPUTATIONAL_LEFT_PANEL_MIN,
@@ -22,6 +26,25 @@ from ui_metrics import (
     EXECUTION_AREA_PREFERRED_HEIGHT,
     ACTION_BUTTON_FONT_PT,
     GROUP_TITLE_FONT_PT,
+    SECONDARY_INFO_STYLE,
+    WARNING_STYLE,
+)
+
+LABEL_RUN_TERMINATE = (
+    "Terminate at radius: stop when the wave reaches the radius; End Time is the upper bound"
+)
+LABEL_RUN_REFLECT = (
+    "Reflect at radius: reflect at the radius and run until End Time or manual stop"
+)
+TIP_RUN_TERMINATE = (
+    "Stop when the wave reaches the radius; End Time is the upper bound."
+)
+TIP_RUN_REFLECT = (
+    "Reflect at the radius and run until End Time or manual stop."
+)
+TIP_END_TIME = (
+    "Written to controlDict as endTime. In Terminate mode this is an upper bound; "
+    "in Reflect mode the run completes at this time."
 )
 
 
@@ -180,8 +203,11 @@ class Tab1D(QWidget):
         self._enable_impulse = True
         self._enable_dynamic_pressure = False
         self._gauge_locations = ()
+        self._last_domain_radius = 1.0
+        self._last_run_case_dir = ""
 
         self.setup_ui()
+        self._last_domain_radius = float(self.spin_radius.value())
         self.recalc_stats()
 
     # --- הוספה: פונקציה שה-Main דורש (מותאמת למשתנים שלך) ---
@@ -202,7 +228,7 @@ class Tab1D(QWidget):
             energy_j_per_kg=float(self.edit_energy.text()),
             material_props=mat_props,
             max_cfl=self.spin_cfl.value(),
-            end_time_s=self.spin_endtime.value(), # השם המקורי שלך
+            end_time_s=self.spin_endtime.value(),
             # ברירות מחדל קבועות (כי אין להן שדות ב-UI המקורי)
             write_interval_s=0.0,
             n_probes=200,
@@ -210,12 +236,22 @@ class Tab1D(QWidget):
             wedge_angle_deg=15.0,
             cone_half_angle_deg=12.0,
             axis_epsilon=0.10,
-            right_boundary=self.cmb_right.currentText(),
+            right_boundary=(
+                BOUNDARY_1D_REFLECT
+                if self.radio_reflect.isChecked()
+                else BOUNDARY_1D_TERMINATE
+            ),
             probe_fields=tuple(getattr(self, "_probe_fields", ("p", "impulse"))),
             enable_impulse=bool(getattr(self, "_enable_impulse", True)),
             enable_dynamic_pressure=bool(getattr(self, "_enable_dynamic_pressure", False)),
             gauge_locations=tuple(getattr(self, "_gauge_locations", ()) or ()),
             material_name=self.combo_comp.currentText(),
+            stop_mode=(
+                RUN_MODE_REFLECT
+                if self.radio_reflect.isChecked()
+                else RUN_MODE_TERMINATE
+            ),
+            stop_radius_m=float(self.spin_radius.value()),
         )
 
     def set_case_inputs(self, data: dict) -> None:
@@ -242,8 +278,9 @@ class Tab1D(QWidget):
                     widget.setValue(values[key])
             if "energy_j_per_kg" in values:
                 self.edit_energy.setText(f"{float(values['energy_j_per_kg']):.12g}")
-            if "right_boundary" in values:
-                self.cmb_right.setCurrentText(str(values["right_boundary"]))
+            self._apply_run_mode_radios(values)
+            self._sync_end_time_always_editable()
+            self._last_domain_radius = float(self.spin_radius.value())
             self._probe_fields = tuple(values.get("probe_fields") or ("p",))
             self._enable_impulse = bool(values.get("enable_impulse", True))
             self._enable_dynamic_pressure = bool(
@@ -371,6 +408,12 @@ class Tab1D(QWidget):
         remap_layout.addWidget(self.radio_no)
         remap_layout.addStretch()
         charge_layout.addRow("Remap?", remap_layout)
+        self.lbl_remap_status = QLabel("")
+        self.lbl_remap_status.setWordWrap(True)
+        self.lbl_remap_status.setStyleSheet(SECONDARY_INFO_STYLE)
+        self.lbl_remap_status.hide()
+        charge_layout.addRow(self.lbl_remap_status)
+        self.radio_yes.toggled.connect(lambda *_args: self.refresh_remap_status())
         
         group_charge.setLayout(charge_layout)
         input_layout.addWidget(group_charge)
@@ -389,14 +432,19 @@ class Tab1D(QWidget):
         self.cmb_left = QComboBox()
         self.cmb_left.addItem("Reflecting - spherical")
         self.cmb_left.setEnabled(False)
-        self.cmb_right = QComboBox()
-        self.cmb_right.addItems(list(BOUNDARY_1D_RIGHT_OPTIONS))
-        self.cmb_right.setCurrentText(BOUNDARY_1D_TRANSMIT)
-        for combo in (self.cmb_left, self.cmb_right):
-            combo.setMinimumWidth(160)
-            combo.setMaximumWidth(220)
+        self.cmb_left.setMinimumWidth(160)
+        self.cmb_left.setMaximumWidth(220)
         bounds_layout.addRow("Left", self.cmb_left)
-        bounds_layout.addRow("Right", self.cmb_right)
+        self.radio_terminate = QRadioButton(LABEL_RUN_TERMINATE)
+        self.radio_reflect = QRadioButton(LABEL_RUN_REFLECT)
+        self.radio_terminate.setToolTip(TIP_RUN_TERMINATE)
+        self.radio_reflect.setToolTip(TIP_RUN_REFLECT)
+        self.radio_terminate.setChecked(True)
+        self._run_mode_group = QButtonGroup(self)
+        self._run_mode_group.addButton(self.radio_terminate)
+        self._run_mode_group.addButton(self.radio_reflect)
+        bounds_layout.addRow(self.radio_terminate)
+        bounds_layout.addRow(self.radio_reflect)
         group_bounds.setLayout(bounds_layout)
         input_layout.addWidget(group_bounds)
 
@@ -404,9 +452,12 @@ class Tab1D(QWidget):
         solver_layout = QFormLayout()
         self.spin_cfl, lay_cfl = self.create_input_row("", 0.50, 2, 0.1)
         solver_layout.addRow("Max CFL", lay_cfl)
-        
         self.spin_endtime, lay_etime = self.create_input_row("s", 0.025, 4, 0.001)
+        self.spin_endtime.setToolTip(TIP_END_TIME)
         solver_layout.addRow("End Time", lay_etime)
+        self.radio_terminate.toggled.connect(self._sync_end_time_always_editable)
+        self.radio_reflect.toggled.connect(self._sync_end_time_always_editable)
+        self._sync_end_time_always_editable()
         
         group_solver.setLayout(solver_layout)
         input_layout.addWidget(group_solver)
@@ -596,6 +647,28 @@ class Tab1D(QWidget):
         self._pending_pressures = None
         self._pending_time_s = 0.0
 
+    def _apply_run_mode_radios(self, values: dict) -> None:
+        mode = normalize_run_mode(
+            values.get("stop_mode") or values.get("mode"),
+            values.get("right_boundary"),
+        )
+        self.radio_terminate.blockSignals(True)
+        self.radio_reflect.blockSignals(True)
+        try:
+            if mode == RUN_MODE_REFLECT:
+                self.radio_reflect.setChecked(True)
+            else:
+                self.radio_terminate.setChecked(True)
+        finally:
+            self.radio_terminate.blockSignals(False)
+            self.radio_reflect.blockSignals(False)
+        self._sync_end_time_always_editable()
+
+    def _sync_end_time_always_editable(self, _checked: bool = False) -> None:
+        """End Time stays visible and editable in both 1D modes."""
+        self.spin_endtime.setVisible(True)
+        self.spin_endtime.setEnabled(True)
+
     def end_live_graph(self) -> None:
         """Freeze the last live profile after a run; do not reset to the t=0 sketch."""
         self._live_graph = False
@@ -695,9 +768,36 @@ class Tab1D(QWidget):
             self._has_run_profile = False
             self._pending_pressures = None
             self.plot_initial_condition()
+            self.refresh_remap_status()
 
         except Exception:
             pass
+
+    def refresh_remap_status(self, case_dir: str = "") -> None:
+        """Show last-solver-state remap snapshot availability after a 1D run."""
+        if case_dir:
+            self._last_run_case_dir = os.path.normpath(case_dir)
+        label = getattr(self, "lbl_remap_status", None)
+        if label is None:
+            return
+        if not self.radio_yes.isChecked():
+            label.hide()
+            label.setText("")
+            return
+        path = self._last_run_case_dir
+        if not path:
+            label.hide()
+            label.setText("")
+            return
+        label.show()
+        from remap_snapshot_1d import availability_for_case, display_text
+
+        avail = availability_for_case(path)
+        label.setText(display_text(avail) or avail.message or "Remap is unavailable.")
+        if avail.status in ("invalid", "stale", "missing") and not avail.snapshot_available:
+            label.setStyleSheet(WARNING_STYLE)
+        else:
+            label.setStyleSheet(SECONDARY_INFO_STYLE)
 
     def update_graph(self, pressures, sim_time_s: float):
         if not pressures:

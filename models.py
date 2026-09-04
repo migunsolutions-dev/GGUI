@@ -25,13 +25,20 @@ class GenerationResult1D:
 
 # 1D outer (right) radius: Autodyn-style labels mapped to blastFoam outlet BCs.
 BOUNDARY_1D_TERMINATE = "Terminate"
-BOUNDARY_1D_TRANSMIT = "Transmit"
+BOUNDARY_1D_TRANSMIT = "Transmit"  # legacy; treated as Terminate
 BOUNDARY_1D_REFLECT = "Reflect"
 BOUNDARY_1D_RIGHT_OPTIONS = (
     BOUNDARY_1D_TERMINATE,
-    BOUNDARY_1D_TRANSMIT,
     BOUNDARY_1D_REFLECT,
 )
+
+RUN_MODE_TERMINATE = "terminate"
+RUN_MODE_REFLECT = "reflect"
+STOP_MODE_TERMINATE = RUN_MODE_TERMINATE
+STOP_MODE_REFLECT = RUN_MODE_REFLECT
+STOP_MODE_WAVE_RADIUS = RUN_MODE_TERMINATE  # legacy alias
+STOP_MODE_END_TIME = RUN_MODE_REFLECT  # legacy alias for Reflect (run to End Time)
+STOP_MODE_OPTIONS = (RUN_MODE_TERMINATE, RUN_MODE_REFLECT)
 
 
 @dataclass(frozen=True)
@@ -53,12 +60,14 @@ class CaseInputs1D:
     wedge_angle_deg: float = 15.0
     cone_half_angle_deg: float = 12.0
     axis_epsilon: float = 0.10
-    right_boundary: str = BOUNDARY_1D_TRANSMIT
+    right_boundary: str = BOUNDARY_1D_TERMINATE
     probe_fields: Tuple[str, ...] = ("p", "impulse")
     enable_impulse: bool = True
     enable_dynamic_pressure: bool = False
     gauge_locations: Tuple[Tuple[float, str], ...] = ()
     material_name: str = ""
+    stop_mode: str = RUN_MODE_TERMINATE
+    stop_radius_m: Optional[float] = None
 
 @dataclass(frozen=True)
 class ObstacleData:

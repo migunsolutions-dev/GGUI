@@ -10,8 +10,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QLabel
 
-from axisymmetric_2d import DYNAMIC_MESH, FIXED_MESH, REMAP_SOURCE
-from axisymmetric_viewer import AxisymmetricViewerWidget
+from axisymmetric_2d import DIRECT_SOURCE, DYNAMIC_MESH, FIXED_MESH, REMAP_SOURCE
+from axisymmetric_viewer import AxisymmetricViewerWidget, preview_charge_markers
 from dialogs import RemapFromDialog
 from models_2d import SimulationState2D
 from tab_2d import Tab2D, case_dir_from_picked_path, latest_case_1d_dir
@@ -32,12 +32,38 @@ class Tab2DWorkflowTests(unittest.TestCase):
 
     def test_direct_remap_gating(self):
         self.assertTrue(self.tab.grp_charge.isEnabled())
+        self.assertTrue(self.tab.spin_hob.isEnabled())
         self.assertFalse(self.tab.grp_mapping.isEnabled())
         self.tab.cmb_source.setCurrentText(REMAP_SOURCE)
         self.app.processEvents()
-        self.assertFalse(self.tab.grp_charge.isEnabled())
+        self.assertTrue(self.tab.grp_charge.isEnabled())
+        self.assertTrue(self.tab.spin_hob.isEnabled())
         self.assertTrue(self.tab.grp_mapping.isEnabled())
         self.assertFalse(self.tab.grp_seed.isEnabled())
+        self.assertFalse(self.tab.spin_det_height.isEnabled())
+        self.assertFalse(self.tab.spin_mass.isEnabled())
+
+    def test_remap_hob_stays_editable_and_clears_stale_enablement(self):
+        self.tab.cmb_source.setCurrentText(REMAP_SOURCE)
+        self.app.processEvents()
+        self.assertTrue(self.tab.spin_hob.isEnabled())
+        self.tab.spin_hob.setValue(1.25)
+        self.assertAlmostEqual(self.tab.get_case_inputs().height_of_burst, 1.25)
+
+        self.tab.cmb_source.setCurrentText(DIRECT_SOURCE)
+        self.app.processEvents()
+        self.assertTrue(self.tab.spin_hob.isEnabled())
+        self.assertTrue(self.tab.spin_det_height.isEnabled())
+        self.assertTrue(self.tab.spin_mass.isEnabled())
+        self.assertFalse(self.tab.grp_mapping.isEnabled())
+        self.assertAlmostEqual(self.tab.get_case_inputs().height_of_burst, 1.25)
+
+        self.tab.cmb_source.setCurrentText(REMAP_SOURCE)
+        self.app.processEvents()
+        self.assertTrue(self.tab.spin_hob.isEnabled())
+        self.assertFalse(self.tab.spin_det_height.isEnabled())
+        self.assertTrue(self.tab.grp_mapping.isEnabled())
+        self.assertAlmostEqual(self.tab.get_case_inputs().height_of_burst, 1.25)
 
     def test_fixed_dynamic_gating(self):
         self.tab.cmb_mesh_mode.setCurrentText(FIXED_MESH)
@@ -105,8 +131,8 @@ class Tab2DWorkflowTests(unittest.TestCase):
             "Mapped radius:",
             "Source resolution:",
             (
-                "rotateFields mapping is not conservative; normal mapping uses "
-                "source-volume weighting and fallback/extension uses nearest cells."
+                "Radial mapping about the target charge centre [0, HOB, 0] is not conservative; "
+                "cells sample the 1D spherical profile by distance from that centre."
             ),
         }
         labels = {
@@ -262,6 +288,87 @@ class Tab2DWorkflowTests(unittest.TestCase):
                 os.path.normpath(newer),
             )
             self.assertEqual(self.tab.txt_source_case.text(), "Current 1D model")
+
+    def test_remap_preview_shows_one_target_hob_marker(self):
+        self.tab.cmb_source.setCurrentText(REMAP_SOURCE)
+        self.tab.spin_det_height.setValue(0.1)
+        self.tab.spin_hob.setValue(1.25)
+        self.app.processEvents()
+        preview = self.tab.viewer._last_preview_data
+        self.assertIsNotNone(preview)
+        charge = preview[2]
+        self.assertTrue(charge.get("remap"))
+        markers = preview_charge_markers(charge)
+        self.assertEqual(markers, [(0.0, 1.25)])
+        self.assertNotAlmostEqual(float(charge.get("detonation_height")), 1.25)
+
+    def test_reinitialize_clears_stale_preview_markers(self):
+        self.tab.cmb_source.setCurrentText(REMAP_SOURCE)
+        self.tab.spin_hob.setValue(0.5)
+        self.tab.spin_det_height.setValue(0.1)
+        self.app.processEvents()
+        self.assertIsNotNone(self.tab.viewer._last_preview_data)
+        self.tab.spin_hob.setValue(1.25)
+        self.app.processEvents()
+        stale = self.tab.viewer._last_preview_data
+        self.assertAlmostEqual(stale[2]["height"], 1.25)
+        self.assertEqual(preview_charge_markers(stale[2]), [(0.0, 1.25)])
+        self.tab.viewer.load_case(
+            tempfile.gettempdir(),
+            charge_center=(0.0, 1.25, 0.0),
+        )
+        self.assertIsNone(self.tab.viewer._last_preview_data)
+        self.assertEqual(self.tab.viewer._charge_center, (0.0, 1.25, 0.0))
+        self.assertTrue(self.tab.viewer.is_simulating)
+
+    def test_remap_status_visible_for_from_1d_not_hidden_advanced_row(self):
+        self.assertTrue(self.tab.lbl_remap_status.isHidden())
+        self.tab.cmb_source.setCurrentText(REMAP_SOURCE)
+        self.app.processEvents()
+        self.assertFalse(self.tab.lbl_remap_status.isHidden())
+        text = self.tab.lbl_remap_status.text().lower()
+        self.assertTrue("missing" in text or "unavailable" in text or "no 1d" in text)
+
+    def test_remap_status_reports_snapshot_from_last_solver_state(self):
+        import numpy as np
+
+        from completion_1d import (
+            RUN_MODE_TERMINATE,
+            STOP_REASON_WAVE_RADIUS_REACHED,
+            CompletionRecord,
+            write_completion_record,
+        )
+        from remap_snapshot_1d import write_snapshot
+
+        with tempfile.TemporaryDirectory() as td:
+            n = 8
+            write_completion_record(
+                td,
+                CompletionRecord(
+                    mode=RUN_MODE_TERMINATE,
+                    stop_reason=STOP_REASON_WAVE_RADIUS_REACHED,
+                    wave_radius_reached=True,
+                    final_solver_time_s=0.000639296,
+                    requested_stop_radius_m=0.8,
+                ),
+            )
+            write_snapshot(
+                td,
+                {
+                    "r": np.linspace(0.0, 1.0, n),
+                    "p": np.full(n, 2.0e5),
+                    "T": np.full(n, 300.0),
+                    "U_mag": np.linspace(0.0, 100.0, n),
+                },
+                physical_time=0.000639296,
+            )
+            self.tab.cmb_source.setCurrentText(REMAP_SOURCE)
+            self.tab._set_remap_case_path(td, from_last_1d=False)
+            self.app.processEvents()
+            text = self.tab.lbl_remap_status.text().lower()
+            self.assertIn("snapshot", text)
+            self.assertIn("last solver state", text)
+            self.assertIn("0.000639296", self.tab.lbl_remap_status.text())
 
 
 if __name__ == "__main__":

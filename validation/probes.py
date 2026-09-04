@@ -83,22 +83,81 @@ def radii_from_locations(locations: Sequence[str], *, dim: str = "1d") -> List[O
     """Cartesian probe header '(x y z)' → radius used as standoff for 1D/2D."""
     out: List[Optional[float]] = []
     for loc in locations:
-        parts = str(loc).replace(",", " ").split()
-        if len(parts) < 1:
+        xyz = xyz_from_location(loc)
+        if xyz is None:
             out.append(None)
             continue
-        try:
-            nums = [float(p) for p in parts[:3]]
-        except ValueError:
-            out.append(None)
-            continue
-        while len(nums) < 3:
-            nums.append(0.0)
         if dim == "1d":
-            out.append(math.sqrt(nums[0] ** 2 + nums[1] ** 2 + nums[2] ** 2))
+            out.append(radial_distance(*xyz))
         else:
-            out.append(abs(float(nums[0])))
+            out.append(abs(float(xyz[0])))
     return out
+
+
+def radial_distance(x: float, y: float = 0.0, z: float = 0.0) -> float:
+    """True spherical radius. Use for 1D wedge/spherical geometry, not x alone."""
+    return math.sqrt(float(x) ** 2 + float(y) ** 2 + float(z) ** 2)
+
+
+def xyz_from_location(location: str) -> Optional[Tuple[float, float, float]]:
+    parts = str(location or "").replace(",", " ").split()
+    if not parts:
+        return None
+    try:
+        nums = [float(p) for p in parts[:3]]
+    except ValueError:
+        return None
+    while len(nums) < 3:
+        nums.append(0.0)
+    return float(nums[0]), float(nums[1]), float(nums[2])
+
+
+PROBE_MATCH_ABS_TOL = 1.0e-4
+PROBE_MATCH_REL_TOL = 1.0e-5
+PROBE_MISSING = "Probe is missing for this Validation Point; comparison is N/A."
+PROBE_MISMATCH = "Probe location does not match the planned Validation Point; comparison is N/A."
+
+
+def match_probe_to_point(
+    locations: Sequence[str],
+    point_xyz: Tuple[float, float, float],
+    *,
+    abs_tol: float = PROBE_MATCH_ABS_TOL,
+    rel_tol: float = PROBE_MATCH_REL_TOL,
+) -> Tuple[Optional[int], str]:
+    """Match a planned Validation Point to a probe header by coordinates, not index.
+
+    Returns (column_index, reason). reason is empty on success.
+    """
+    target = (float(point_xyz[0]), float(point_xyz[1]), float(point_xyz[2]))
+    hits: List[int] = []
+    for index, loc in enumerate(locations):
+        xyz = xyz_from_location(loc)
+        if xyz is None:
+            continue
+        if _xyz_close(xyz, target, abs_tol=abs_tol, rel_tol=rel_tol):
+            hits.append(index)
+    if not hits:
+        if not any(str(loc).strip() for loc in locations):
+            return None, PROBE_MISSING
+        return None, PROBE_MISMATCH
+    if len(hits) > 1:
+        return None, PROBE_MISMATCH
+    return hits[0], ""
+
+
+def _xyz_close(
+    left: Tuple[float, float, float],
+    right: Tuple[float, float, float],
+    *,
+    abs_tol: float,
+    rel_tol: float,
+) -> bool:
+    for a, b in zip(left, right):
+        scale = max(abs(float(a)), abs(float(b)), 1.0)
+        if abs(float(a) - float(b)) > max(abs_tol, rel_tol * scale):
+            return False
+    return True
 
 
 def series_for_index(

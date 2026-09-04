@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import QApplication
 
 from axisymmetric_viewer import (
     AxisymmetricViewerWidget,
+    preview_charge_markers,
     preview_charge_outline_points,
 )
 from generator_2d import Generator2D
@@ -75,6 +76,26 @@ class AxisymmetricViewportTests(unittest.TestCase):
         self.assertAlmostEqual(float(full[:, 1].min()), 0.75, places=4)
         self.assertAlmostEqual(float(full[:, 1].max()), 1.25, places=4)
 
+    def test_remap_preview_markers_are_single_target_centre(self):
+        remap = preview_charge_markers(
+            {
+                "remap": True,
+                "height": 1.25,
+                "detonation_height": 0.1,
+                "shape": "Sphere",
+                "radius": 0.2,
+            }
+        )
+        self.assertEqual(remap, [(0.0, 1.25)])
+        direct = preview_charge_markers(
+            {
+                "remap": False,
+                "height": 1.25,
+                "detonation_height": 0.4,
+            }
+        )
+        self.assertEqual(direct, [(0.0, 0.4)])
+
     def test_preview_meridional_extents_mirrored_and_half(self):
         viewer = AxisymmetricViewerWidget()
         self.assertEqual(
@@ -103,13 +124,34 @@ class AxisymmetricViewportTests(unittest.TestCase):
         self.assertFalse(viewer.mirrored_view)
         self.assertEqual(viewer._axisymmetric_domain, (1.5, 2.5))
 
+    def test_load_case_clears_stale_preview(self):
+        viewer = AxisymmetricViewerWidget()
+        viewer.update_axisymmetric_preview(
+            1.5,
+            2.5,
+            {
+                "remap": True,
+                "height": 0.5,
+                "detonation_height": 0.1,
+                "shape": "Sphere",
+                "radius": 0.05,
+            },
+            [],
+        )
+        self.assertIsNotNone(viewer._last_preview_data)
+        viewer.load_case("unused-path", charge_center=(0.0, 1.25, 0.0))
+        self.assertIsNone(viewer._last_preview_data)
+        self.assertEqual(viewer._charge_center, (0.0, 1.25, 0.0))
+        self.assertTrue(viewer.is_simulating)
+
     def test_meridional_slice_of_initialized_wedge_is_xy_not_xz(self):
         import pyvista as pv
 
         case = r"C:\Users\migun\AppData\Local\Temp\ggui_2d_init_fix_20260724\diag_fixed_150k"
-        if not os.path.isdir(case):
+        foam = os.path.join(case, "case.foam")
+        if not os.path.isdir(case) or not os.path.isfile(foam):
             self.skipTest("diagnostic OpenFOAM case not present")
-        reader = pv.POpenFOAMReader(os.path.join(case, "case.foam"))
+        reader = pv.POpenFOAMReader(foam)
         reader.set_active_time_value(reader.time_values[-1])
         data = reader.read()
         mesh = data["internalMesh"] if "internalMesh" in data.keys() else data[0]

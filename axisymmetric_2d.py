@@ -78,11 +78,15 @@ class MappingValidationReport:
     energy_after: Optional[float] = None
     conservation_verified: bool = False
 
+    remap_source_type: str = ""
+    source_physical_time: Optional[float] = None
+
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
         data["method"] = (
-            "rotateFields source-volume weighting in transformed target-cell bounds; "
-            "nearest-cell fallback/extension"
+            "radial interpolation of the 1D spherical profile about the target "
+            "charge centre [0, HOB, 0]; ambient outside the 1D extent; "
+            "no below-ground mirror"
         )
         data["conservative"] = False
         data["conservation_note"] = (
@@ -280,10 +284,15 @@ def validate_mapping_source(
     warnings = list(result.warnings)
     mapped = []
     missing = []
+    remap_source_type = ""
+    source_physical_time = None
+    snapshot_ok = False
+    remap_blocked = False
     if not os.path.isdir(source_case):
         errors.append("The selected 1D source case does not exist.")
     else:
         from case_topology import CaseDimension, classify_case_topology
+        from remap_snapshot_1d import SOURCE_SNAPSHOT, resolve_remap_source
 
         classification = classify_case_topology(source_case)
         if classification.classification != CaseDimension.AXISYMMETRIC_WEDGE:
@@ -291,6 +300,23 @@ def validate_mapping_source(
                 "The source case is not verified as an axisymmetric wedge "
                 f"({classification.classification.value}: {classification.reason})."
             )
+        resolved = resolve_remap_source(source_case)
+        remap_source_type = resolved.source_type
+        source_physical_time = resolved.physical_time
+        if resolved.blocked:
+            errors.append(resolved.message)
+            remap_blocked = True
+        elif resolved.ok and resolved.source_type == SOURCE_SNAPSHOT:
+            source_time = resolved.time_label
+            mapped = list(resolved.field_names) or ["p", "T", "U"]
+            missing = []
+            snapshot_ok = True
+            warnings.append(resolved.message)
+        elif resolved.ok:
+            source_time = resolved.time_label or source_time
+            warnings.append(resolved.message)
+        else:
+            errors.append(resolved.message)
         phase_path = os.path.join(source_case, "constant", "phaseProperties")
         try:
             with open(phase_path, "r", encoding="utf-8", errors="ignore") as stream:
@@ -308,7 +334,9 @@ def validate_mapping_source(
                 )
         except OSError:
             errors.append("Source constant/phaseProperties is missing.")
-    if not source_time:
+    if snapshot_ok or remap_blocked:
+        pass
+    elif not source_time:
         errors.append("The selected source time does not exist.")
     else:
         tdir = os.path.join(source_case, source_time)
@@ -323,8 +351,7 @@ def validate_mapping_source(
             if missing:
                 errors.append("Required source fields are missing: " + ", ".join(missing))
     warnings.append(
-        "rotateFields mapping is not conservative; this commit uses source-volume weighting "
-        "for normal mapping and nearest-cell fallback/extension."
+        "Radial mapping about the target charge centre [0, HOB, 0] is not conservative."
     )
     domain = result.domain
     return MappingValidationReport(
@@ -339,4 +366,6 @@ def validate_mapping_source(
         errors=tuple(dict.fromkeys(errors)),
         source_resolution=source.source_resolution,
         target_resolution=inputs.cell_size,
+        remap_source_type=remap_source_type,
+        source_physical_time=source_physical_time,
     )

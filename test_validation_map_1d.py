@@ -95,9 +95,13 @@ class Map1DTests(unittest.TestCase):
         self.assertTrue(any(radii_close(r, 0.2036) for r in merged))
 
     def test_generator_inserts_exact_val_radii(self):
+        from validation.sampling_io import read_sampling_plan
+
         with tempfile.TemporaryDirectory() as td:
             case = Generator1D(td).generate("one", _inputs_1d(), _rec())
-            plan = plan_1d(mass_kg=1.0, domain_radius_m=2.0, cell_size=0.05)
+            plan = read_sampling_plan(case) or plan_1d(
+                mass_kg=1.0, domain_radius_m=2.0, cell_size=0.05
+            )
             with open(os.path.join(case, "system", "controlDict"), encoding="utf-8") as handle:
                 control = handle.read()
             self.assertTrue(plan.points)

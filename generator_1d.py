@@ -5,15 +5,24 @@ from typing import Dict, Tuple
 from base_generator import BaseGenerator
 from models import (
     BOUNDARY_1D_REFLECT,
-    BOUNDARY_1D_RIGHT_OPTIONS,
-    BOUNDARY_1D_TRANSMIT,
+    BOUNDARY_1D_TERMINATE,
     CaseInputs1D,
     RecommendedParams1D,
+    RUN_MODE_REFLECT,
 )
 from output_options import extra_function_objects
-from validation.auto_points import plan_1d, runtime_logical_dpi_x
+from completion_1d import (
+    initial_completion_record,
+    normalize_run_mode,
+    right_boundary_for_mode,
+    write_completion_record,
+)
+from validation.auto_points import plan_1d, runtime_logical_dpi_x, stamp_plan
 from validation.map_1d import merge_radii
 from validation.sampling_io import write_sampling_plan
+
+# OpenFOAM requires an endTime. The GUI value is always written; Terminate uses
+# it as an upper bound, Reflect uses it as the successful completion time.
 
 class Generator1D(BaseGenerator):
     """
@@ -52,9 +61,21 @@ class Generator1D(BaseGenerator):
             )
         except (TypeError, ValueError):
             val_plan = None
+        if val_plan is not None:
+            try:
+                val_plan = stamp_plan(
+                    val_plan,
+                    case_path=case_dir,
+                    cell_size=float(inputs.cell_size),
+                    hob_m=0.0,
+                    domain_height_m=None,
+                )
+            except (TypeError, ValueError):
+                pass
 
         val_radii = tuple(pt.range_m for pt in val_plan.points) if val_plan is not None else ()
         self.write_system_files(case_dir, inputs, rec, charge_radius, validation_radii=val_radii)
+        self._write_completion_request(case_dir, inputs)
         
         # --- FIX: Write Scripts ---
         self.write_scripts(case_dir, self.openfoam_bashrc)
@@ -72,9 +93,17 @@ class Generator1D(BaseGenerator):
         return case_dir
 
     @staticmethod
+    def _run_mode(inputs: CaseInputs1D) -> str:
+        return normalize_run_mode(
+            getattr(inputs, "stop_mode", None),
+            getattr(inputs, "right_boundary", None),
+        )
+
+    @staticmethod
     def _right_boundary(inputs: CaseInputs1D) -> str:
-        kind = str(getattr(inputs, "right_boundary", BOUNDARY_1D_TRANSMIT) or BOUNDARY_1D_TRANSMIT)
-        return kind if kind in BOUNDARY_1D_RIGHT_OPTIONS else BOUNDARY_1D_TRANSMIT
+        if Generator1D._run_mode(inputs) == RUN_MODE_REFLECT:
+            return BOUNDARY_1D_REFLECT
+        return BOUNDARY_1D_TERMINATE
 
     @staticmethod
     def _vtx_spherical(r: float, theta: float, phi: float) -> Tuple[float, float, float]:
@@ -91,6 +120,42 @@ class Generator1D(BaseGenerator):
         min_axis_eps = min(0.10, cone_half * 0.45)
         axis_eps = min(max(requested_eps, min_axis_eps), cone_half * 0.5)
         return axis_eps, cone_half, wedge_half
+
+    @staticmethod
+    def resolved_stop_radius_m(inputs: CaseInputs1D) -> float:
+        domain = float(inputs.radius)
+        raw = getattr(inputs, "stop_radius_m", None)
+        if raw is None:
+            return domain
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return domain
+        if not math.isfinite(value) or value <= 0.0:
+            return domain
+        return min(value, domain)
+
+    @staticmethod
+    def resolved_end_time_s(inputs: CaseInputs1D) -> float:
+        try:
+            value = float(inputs.end_time_s)
+        except (TypeError, ValueError):
+            return 0.0
+        return value if math.isfinite(value) else 0.0
+
+    @staticmethod
+    def _write_completion_request(case_dir: str, inputs: CaseInputs1D) -> None:
+        mode = Generator1D._run_mode(inputs)
+        write_completion_record(
+            case_dir,
+            initial_completion_record(
+                mode=mode,
+                requested_stop_radius_m=Generator1D.resolved_stop_radius_m(inputs),
+                p_atm=float(inputs.p_atm),
+                right_boundary=right_boundary_for_mode(mode),
+                end_time_s=Generator1D.resolved_end_time_s(inputs),
+            ),
+        )
 
     def ignition_point_in_wedge(
         self, inputs: CaseInputs1D, rec: RecommendedParams1D
@@ -124,7 +189,7 @@ class Generator1D(BaseGenerator):
                 elif pch in ("axis", "outerCone", "origin"):
                     lines.append(f"    {pch} {{ type symmetry; }}")
                 elif pch == "outlet":
-                    if right == BOUNDARY_1D_TRANSMIT and name == "p":
+                    if right != BOUNDARY_1D_REFLECT and name == "p":
                         lines.append(
                             f"    {pch} {{ type pressureWaveTransmissive; value uniform {inputs.p_atm}; }}"
                         )
@@ -319,13 +384,9 @@ regions ( sphereToCell {{ centre (0 0 0); radius {float(charge_radius):.10g}; fi
 """
         self._write_text(os.path.join(sys_dir, "setFieldsDict"), sf)
 
-        # Watchdog probe at spherical radius target_radius, mid-wedge (theta=cone/2, phi=0)
-        watchdog_mid = vtx_spherical(target_radius, theta_mid, 0.0)
-        watchdog_point = f"            ({watchdog_mid[0]:.6g} {watchdog_mid[1]:.6g} {watchdog_mid[2]:.6g})"
-        # Safety end time so run does not end before shock can reach target (slow shock ~300 m/s, *2 margin)
-        safe_end_time = (target_radius / 300.0) * 2.0
-        end_time = max(float(inputs.end_time_s), safe_end_time)
-        # write_interval_s <= 0: one field dump at endTime. Probes still stream the 1D graph.
+        end_time = self.resolved_end_time_s(inputs)
+        # write_interval_s <= 0: one field dump at the configured OpenFOAM endTime.
+        # Probes still stream the 1D graph; Terminate dumps via writeNow on arrival.
         user_write = float(inputs.write_interval_s)
         field_write_interval = user_write if user_write > 0.0 else end_time
         probe_steps = max(1, int(inputs.probe_write_interval_steps))
@@ -360,6 +421,32 @@ regions ( sphereToCell {{ centre (0 0 0); radius {float(charge_radius):.10g}; fi
     }}
 """
 
+        watchdog_path = os.path.join(case_dir, ".watchdog_target_radius")
+        stop_radius = max(
+            r_min + 1e-7,
+            min(self.resolved_stop_radius_m(inputs), r_max_val - 1e-7),
+        )
+        watchdog_mid = vtx_spherical(stop_radius, theta_mid, 0.0)
+        watchdog_point = (
+            f"            ({watchdog_mid[0]:.6g} {watchdog_mid[1]:.6g} {watchdog_mid[2]:.6g})"
+        )
+        watchdog_block = f"""
+    watchdog_probe
+    {{
+        type            probes;
+        libs            ("libfieldFunctionObjects.so");
+        fields          (p);
+        writeControl    timeStep;
+        writeInterval   1;
+        probeLocations  ( {watchdog_point} );
+    }}
+"""
+        try:
+            with open(watchdog_path, "w", encoding="utf-8") as f:
+                f.write(f"{stop_radius:.6g}\n")
+        except OSError:
+            pass
+
         cd = self._foam_header("controlDict", "dictionary", "system") + f"""
 application     blastFoam;
 startFrom       startTime;
@@ -388,22 +475,7 @@ functions
         writeInterval   {probe_steps};
         probeLocations  ( {os.linesep.join(probe_points)} );
     }}
-{gauges_block}    watchdog_probe
-    {{
-        type            probes;
-        libs            ("libfieldFunctionObjects.so");
-        fields          (p);
-        writeControl    timeStep;
-        writeInterval   {probe_steps};
-        probeLocations  ( {watchdog_point} );
-    }}
-}}
+{gauges_block}{watchdog_block}}}
 """
         self._write_text(os.path.join(sys_dir, "controlDict"), cd)
         self._write_text(os.path.join(sys_dir, "decomposeParDict"), self._foam_header("decomposeParDict", "dictionary") + "numberOfSubdomains 1; method scotch;")
-        # Store target_radius for solver_runner watchdog log message
-        try:
-            with open(os.path.join(case_dir, ".watchdog_target_radius"), "w", encoding="utf-8") as f:
-                f.write(f"{target_radius:.6g}\n")
-        except OSError:
-            pass

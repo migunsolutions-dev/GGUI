@@ -18,6 +18,12 @@ from validation.metrics import (
     mean_absolute_error,
     rms_error,
 )
+from validation.remap_timing import (
+    RemapTiming,
+    build_remap_timing,
+    physical_times_synchronized,
+    remap_timing_from_mapping,
+)
 from validation.spatial import (
     first_initialized_time,
     parse_remap2d_ggui,
@@ -52,6 +58,9 @@ class ProfileCompare:
     peak_target: Optional[float]
     peak_r_source: Optional[float]
     peak_r_target: Optional[float]
+    source_physical_time: Optional[float]
+    target_physical_time: Optional[float]
+    physical_time_offset: Optional[float]
     message: str = ""
 
 
@@ -64,15 +73,6 @@ class ConservationCompare:
     relative: Optional[float]
     geometry: str
     message: str = ""
-
-
-def _parse_time_label(label: Optional[str]) -> Optional[float]:
-    if label is None:
-        return None
-    try:
-        return float(str(label).strip())
-    except (TypeError, ValueError):
-        return None
 
 
 def resolve_1d_to_2d(
@@ -174,6 +174,7 @@ def compare_profiles(
     r_max: float,
     source_time: Optional[float],
     target_time: Optional[float],
+    physical_time_offset: Optional[float] = None,
 ) -> ProfileCompare:
     r_src = np.asarray(source_r, dtype=float)
     v_src = np.asarray(source_v, dtype=float)
@@ -191,9 +192,15 @@ def compare_profiles(
         else:
             rel.append(None)
     dt = None
-    if is_finite_number(source_time) and is_finite_number(target_time):
-        dt = float(target_time) - float(source_time)
-    sync = dt is not None and abs(dt) <= 1e-12
+    src_phys = float(source_time) if is_finite_number(source_time) else None
+    tgt_of = float(target_time) if is_finite_number(target_time) else None
+    offset = float(physical_time_offset) if is_finite_number(physical_time_offset) else None
+    tgt_phys = None
+    if tgt_of is not None:
+        tgt_phys = tgt_of + offset if offset is not None else tgt_of
+    if src_phys is not None and tgt_phys is not None:
+        dt = float(tgt_phys) - float(src_phys)
+    sync = physical_times_synchronized(src_phys, tgt_of, offset=offset)
     src_list = [float(v) if is_finite_number(v) else float("nan") for v in src]
     tgt_list = [float(v) if is_finite_number(v) else float("nan") for v in tgt]
     interval = (float(r.min()) if r.size else 0.0, float(r.max()) if r.size else 0.0)
@@ -203,7 +210,7 @@ def compare_profiles(
     peak_rt = float(r_tgt[int(np.nanargmax(v_tgt))]) if v_tgt.size and np.isfinite(v_tgt).any() else None
     msg = ""
     if not sync:
-        msg = "Source and target times do not match; comparison is not synchronized."
+        msg = "Source and target physical times do not match; comparison is not synchronized."
     if r.size == 0:
         msg = "No overlapping samples inside the remap radius."
     return ProfileCompare(
@@ -228,6 +235,9 @@ def compare_profiles(
         peak_target=peak_t,
         peak_r_source=peak_rs,
         peak_r_target=peak_rt,
+        source_physical_time=src_phys,
+        target_physical_time=tgt_phys,
+        physical_time_offset=offset,
         message=msg,
     )
 
@@ -323,8 +333,10 @@ def conservation_1d_2d(
     return tuple(items)
 
 
-def load_line_from_case(case_dir: str, time_label: str, field: str) -> Tuple[np.ndarray, np.ndarray]:
+def load_line_from_case(
+    case_dir: str, time_label: str, field: str, *, dim: str = "1d"
+) -> Tuple[np.ndarray, np.ndarray]:
+    geometry = "spherical_1d" if str(dim).strip().lower() == "1d" else "axisymmetric_2d"
     if field == "U":
-        r, u = read_1d_profile(case_dir, time_label, "U")
-        return r, u
-    return read_1d_profile(case_dir, time_label, field)
+        return read_1d_profile(case_dir, time_label, "U", geometry=geometry)
+    return read_1d_profile(case_dir, time_label, field, geometry=geometry)
