@@ -56,6 +56,7 @@ _wsl_*.log
 _commit_msg.txt
 _inspect_*.sh
 _test_*.py
+_test_*.txt
 _refactor_*.py
 *.bak
 *.tmp
@@ -65,6 +66,16 @@ _refactor_*.py
 # --- Local debug / agent dumps --------------------------------------------
 debug_summary.txt
 /debug_*.txt
+_debug_*.py
+_diag_*.py
+_live_*.py
+_head_*.py
+_tail_*.py
+/_import_proof_screens/
+
+# Root-level review packaging dumps
+/GGUI-*-review*.zip
+/GGUI_*_review_upload/
 
 # UI Review overlay output (never commit)
 _ui_review/
