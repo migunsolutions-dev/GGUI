@@ -68,6 +68,8 @@ class CaseInputs1D:
     material_name: str = ""
     stop_mode: str = RUN_MODE_TERMINATE
     stop_radius_m: Optional[float] = None
+    # True when this 1D run is a 2D/3D remap precursor (GUI "Remap? Yes").
+    remap_for_2d: bool = False
 
 @dataclass(frozen=True)
 class ObstacleData:

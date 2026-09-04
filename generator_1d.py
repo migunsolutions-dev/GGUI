@@ -17,6 +17,13 @@ from completion_1d import (
     right_boundary_for_mode,
     write_completion_record,
 )
+from remap_handoff_1d import (
+    HANDOFF_CRITERION,
+    handoff_plan,
+    handoff_radius_m,
+    uses_remap_handoff,
+    write_handoff_metadata,
+)
 from validation.auto_points import plan_1d, runtime_logical_dpi_x, stamp_plan
 from validation.map_1d import merge_radii
 from validation.sampling_io import write_sampling_plan
@@ -33,6 +40,8 @@ class Generator1D(BaseGenerator):
         self.openfoam_bashrc = openfoam_bashrc
 
     def generate(self, case_name: str, inputs: CaseInputs1D, rec: RecommendedParams1D) -> str:
+        if uses_remap_handoff(inputs):
+            handoff_radius_m(float(inputs.radius), float(inputs.cell_size))
         # 1. Create Dirs
         case_dir = self.create_case_dirs(case_name)
         
@@ -76,6 +85,15 @@ class Generator1D(BaseGenerator):
         val_radii = tuple(pt.range_m for pt in val_plan.points) if val_plan is not None else ()
         self.write_system_files(case_dir, inputs, rec, charge_radius, validation_radii=val_radii)
         self._write_completion_request(case_dir, inputs)
+        if uses_remap_handoff(inputs):
+            write_handoff_metadata(
+                case_dir,
+                handoff_plan(
+                    float(inputs.radius),
+                    float(inputs.cell_size),
+                    source_1d_case=case_dir,
+                ),
+            )
         
         # --- FIX: Write Scripts ---
         self.write_scripts(case_dir, self.openfoam_bashrc)
@@ -124,6 +142,8 @@ class Generator1D(BaseGenerator):
     @staticmethod
     def resolved_stop_radius_m(inputs: CaseInputs1D) -> float:
         domain = float(inputs.radius)
+        if uses_remap_handoff(inputs):
+            return handoff_radius_m(domain, float(inputs.cell_size))
         raw = getattr(inputs, "stop_radius_m", None)
         if raw is None:
             return domain
@@ -146,6 +166,12 @@ class Generator1D(BaseGenerator):
     @staticmethod
     def _write_completion_request(case_dir: str, inputs: CaseInputs1D) -> None:
         mode = Generator1D._run_mode(inputs)
+        remap = uses_remap_handoff(inputs)
+        plan = (
+            handoff_plan(float(inputs.radius), float(inputs.cell_size), source_1d_case=case_dir)
+            if remap
+            else None
+        )
         write_completion_record(
             case_dir,
             initial_completion_record(
@@ -154,6 +180,14 @@ class Generator1D(BaseGenerator):
                 p_atm=float(inputs.p_atm),
                 right_boundary=right_boundary_for_mode(mode),
                 end_time_s=Generator1D.resolved_end_time_s(inputs),
+                remap_for_2d=remap,
+                remap_radius_m=None if plan is None else plan["remap_radius_m"],
+                dr_1d_m=None if plan is None else plan["dr_1d_m"],
+                remap_front_buffer_cells=(
+                    None if plan is None else plan["remap_front_buffer_cells"]
+                ),
+                handoff_radius_m=None if plan is None else plan["handoff_radius_m"],
+                criterion=HANDOFF_CRITERION if remap else None,
             ),
         )
 

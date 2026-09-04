@@ -252,6 +252,7 @@ class Tab1D(QWidget):
                 else RUN_MODE_TERMINATE
             ),
             stop_radius_m=float(self.spin_radius.value()),
+            remap_for_2d=bool(self.radio_yes.isChecked()),
         )
 
     def set_case_inputs(self, data: dict) -> None:
@@ -287,6 +288,10 @@ class Tab1D(QWidget):
                 values.get("enable_dynamic_pressure", False)
             )
             self.set_gauge_locations(tuple(values.get("gauge_locations") or ()))
+            if "remap_for_2d" in values:
+                remap = bool(values.get("remap_for_2d"))
+                self.radio_yes.setChecked(remap)
+                self.radio_no.setChecked(not remap)
         finally:
             self.combo_comp.blockSignals(False)
         self.recalc_stats()

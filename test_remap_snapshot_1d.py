@@ -193,6 +193,34 @@ class RemapSnapshot1DTests(unittest.TestCase):
             self.assertTrue(meta["wave_radius_reached"])
             self.assertEqual(meta["completion_mode"], RUN_MODE_TERMINATE)
 
+    def test_poly_mesh_cell_radii_match_owner_cells_not_a_linspace(self):
+        from remap_snapshot_1d import capture_arrays_from_time_dir, cell_radii_from_poly_mesh
+
+        with tempfile.TemporaryDirectory() as td:
+            mesh = os.path.join(td, "constant", "polyMesh")
+            os.makedirs(mesh)
+            with open(os.path.join(mesh, "points"), "w", encoding="utf-8") as handle:
+                handle.write(
+                    "8\n(\n"
+                    "(0.10 0 0)\n(0.10 0.01 0)\n(0.10 0.01 0.01)\n(0.10 0 0.01)\n"
+                    "(1.50 0 0)\n(1.50 0.01 0)\n(1.50 0.01 0.01)\n(1.50 0 0.01)\n"
+                    ")\n"
+                )
+            with open(os.path.join(mesh, "faces"), "w", encoding="utf-8") as handle:
+                handle.write("2\n(\n4(4 5 6 7)\n4(0 1 2 3)\n)\n")
+            with open(os.path.join(mesh, "owner"), "w", encoding="utf-8") as handle:
+                handle.write("2\n(\n0\n1\n)\n")
+            radii = cell_radii_from_poly_mesh(td, 2)
+            self.assertIsNotNone(radii)
+            self.assertGreater(float(radii[0]), 1.49)
+            self.assertLess(float(radii[1]), 0.12)
+            self.assertGreater(float(radii[0]), float(radii[1]))
+            _write_time_dir(td, "0.001", n=2, p_peak=2.0e6)
+            arrays = capture_arrays_from_time_dir(td, "0.001")
+            self.assertIsNotNone(arrays)
+            self.assertGreater(float(arrays["r"][0]), 1.49)
+            self.assertLess(float(arrays["r"][1]), 0.12)
+
     def test_2d_remap_from_snapshot_without_final_time_directory(self):
         with tempfile.TemporaryDirectory() as td:
             _write_control(td)
@@ -483,6 +511,9 @@ class RemapSnapshot1DTests(unittest.TestCase):
             self.assertIn("using dedicated 1D remap snapshot", script)
             self.assertNotIn('SOURCE_TIME = "snapshot"', script)
             self.assertTrue(os.path.isfile(os.path.join(case3d, "remap_snapshot_1d.py")))
+            self.assertTrue(os.path.isfile(os.path.join(case3d, "remap_fields_2d.py")))
+            self.assertIn("carry_mixture_mass_in_air", script)
+            self.assertNotIn("a4_3d = np.zeros(n_cells)", script)
             self.assertIn(resolved.time_label, script)
 
     def test_2d_metadata_records_source_type_and_physical_time(self):

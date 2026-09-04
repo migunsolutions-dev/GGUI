@@ -180,6 +180,37 @@ class CompletionRecordTests(unittest.TestCase):
             self.assertEqual(detected.threshold_overpressure_pa, ARRIVAL_OVERPRESSURE_PA)
             self.assertEqual(detected.criterion, ARRIVAL_CRITERION)
 
+    def test_remap_detect_arrival_ignores_8kpa_plateau(self) -> None:
+        from remap_handoff_1d import HANDOFF_CRITERION
+
+        with tempfile.TemporaryDirectory() as case:
+            _write_probe(
+                case,
+                fo_name="watchdog_probe",
+                location="0.59 0 0",
+                samples=(
+                    (0.0, 101325.0),
+                    (1.0e-4, 120000.0),
+                    (2.0e-4, 146000.0),
+                    (3.0e-4, 400000.0),
+                ),
+            )
+            record = initial_completion_record(
+                mode=RUN_MODE_TERMINATE,
+                requested_stop_radius_m=0.59,
+                p_atm=101325.0,
+                remap_for_2d=True,
+                remap_radius_m=0.60,
+                dr_1d_m=0.001,
+                remap_front_buffer_cells=10,
+                handoff_radius_m=0.59,
+            )
+            detected = detect_arrival_in_case(case, record)
+            self.assertTrue(detected.wave_radius_reached)
+            self.assertAlmostEqual(detected.detected_arrival_time_s, 3.0e-4)
+            self.assertEqual(detected.criterion, HANDOFF_CRITERION)
+            self.assertTrue(detected.remap_for_2d)
+
     def test_finalize_persists_stop_reason_and_arrival_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as case:
             _arrived_record(case, mode=RUN_MODE_TERMINATE)

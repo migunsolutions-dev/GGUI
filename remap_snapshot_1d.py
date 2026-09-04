@@ -185,8 +185,13 @@ def _completion_info(case_dir: str) -> Dict[str, Any]:
         "detected_arrival_time_s": None,
         "arrival_criterion": "",
         "final_solver_time_s": None,
-        "end_time_s": None,
-    }
+            "end_time_s": None,
+            "remap_for_2d": False,
+            "remap_radius_m": None,
+            "dr_1d_m": None,
+            "remap_front_buffer_cells": None,
+            "handoff_radius_m": None,
+        }
     try:
         from completion_1d import read_completion_record
     except Exception:
@@ -204,6 +209,11 @@ def _completion_info(case_dir: str) -> Dict[str, Any]:
             "arrival_criterion": str(record.criterion or ""),
             "final_solver_time_s": record.final_solver_time_s,
             "end_time_s": record.end_time_s,
+            "remap_for_2d": bool(record.remap_for_2d),
+            "remap_radius_m": record.remap_radius_m,
+            "dr_1d_m": record.dr_1d_m,
+            "remap_front_buffer_cells": record.remap_front_buffer_cells,
+            "handoff_radius_m": record.handoff_radius_m,
         }
     )
     return info
@@ -267,14 +277,49 @@ def write_snapshot(
         ),
         "created_utc": _utcnow(),
         "remap_source_type": SOURCE_SNAPSHOT,
+        "remap_radius_m": completion.get("remap_radius_m"),
+        "dr_1d_m": completion.get("dr_1d_m"),
+        "remap_front_buffer_cells": completion.get("remap_front_buffer_cells"),
+        "handoff_radius_m": completion.get("handoff_radius_m"),
+        "handoff_time_s": completion.get("detected_arrival_time_s") or phys,
+        "source_1d_case": canonical_case_path(case_dir),
     }
     if extra_metadata:
         metadata.update(extra_metadata)
+    try:
+        r_arr = packed.get("r")
+        if r_arr is not None and getattr(r_arr, "size", 0):
+            metadata["field_r_max_m"] = float(np.max(r_arr))
+            metadata["field_r_min_m"] = float(np.min(r_arr))
+    except (TypeError, ValueError):
+        pass
     os.makedirs(case_dir, exist_ok=True)
     np.savez_compressed(snapshot_npz_path(case_dir), **packed)
     with open(snapshot_json_path(case_dir), "w", encoding="utf-8", newline="\n") as handle:
         json.dump(metadata, handle, indent=2, sort_keys=True)
         handle.write("\n")
+    if metadata.get("handoff_radius_m") is not None:
+        try:
+            from remap_handoff_1d import read_handoff_metadata, write_handoff_metadata
+
+            existing = read_handoff_metadata(case_dir) or {}
+            existing.update(
+                {
+                    "remap_radius_m": metadata.get("remap_radius_m"),
+                    "dr_1d_m": metadata.get("dr_1d_m"),
+                    "remap_front_buffer_cells": metadata.get("remap_front_buffer_cells"),
+                    "handoff_radius_m": metadata.get("handoff_radius_m"),
+                    "handoff_time_s": metadata.get("handoff_time_s"),
+                    "source_1d_case": metadata.get("source_1d_case")
+                    or canonical_case_path(case_dir),
+                    "field_r_max_m": metadata.get("field_r_max_m"),
+                    "field_r_min_m": metadata.get("field_r_min_m"),
+                    "source_physical_time": metadata.get("source_physical_time"),
+                }
+            )
+            write_handoff_metadata(case_dir, existing)
+        except Exception:
+            pass
     return metadata
 
 
@@ -501,6 +546,95 @@ def _read_field(time_path: str, name: str, is_vector: bool = False):
     return _parse_internal_field(path, is_vector=is_vector)
 
 
+def _foam_list_body(text: str) -> str:
+    start = text.find("(")
+    end = text.rfind(")")
+    if start < 0 or end <= start:
+        return ""
+    return text[start + 1 : end]
+
+
+def _parse_mesh_points(path: str) -> Optional[np.ndarray]:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    pts = [
+        (float(a), float(b), float(c))
+        for a, b, c in re.findall(
+            r"\(\s*([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s*\)",
+            _foam_list_body(text),
+        )
+    ]
+    if not pts:
+        return None
+    return np.asarray(pts, dtype=float)
+
+
+def _parse_mesh_faces(path: str) -> Optional[List[np.ndarray]]:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    faces: List[np.ndarray] = []
+    for match in re.finditer(r"\d+\s*\(([^)]+)\)", _foam_list_body(text)):
+        idx = [int(tok) for tok in match.group(1).split() if tok]
+        if idx:
+            faces.append(np.asarray(idx, dtype=int))
+    return faces or None
+
+
+def _parse_mesh_labels(path: str) -> Optional[np.ndarray]:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    nums = [int(tok) for tok in _foam_list_body(text).split() if tok]
+    if not nums:
+        return None
+    return np.asarray(nums, dtype=int)
+
+
+def cell_radii_from_poly_mesh(case_dir: str, n_cells: int) -> Optional[np.ndarray]:
+    """True cell radii from constant/polyMesh. Do not linspace the point cloud."""
+    mesh = os.path.join(case_dir or "", "constant", "polyMesh")
+    points = _parse_mesh_points(os.path.join(mesh, "points"))
+    faces = _parse_mesh_faces(os.path.join(mesh, "faces"))
+    owner = _parse_mesh_labels(os.path.join(mesh, "owner"))
+    if points is None or faces is None or owner is None:
+        return None
+    n_owner = int(owner.max()) + 1 if owner.size else 0
+    n = max(int(n_cells), n_owner)
+    if n < 2 or len(faces) != len(owner):
+        return None
+    acc = np.zeros((n, 3), dtype=float)
+    weight = np.zeros(n, dtype=float)
+    n_pts = len(points)
+
+    def accumulate(cell: int, face_idx: int) -> None:
+        if cell < 0 or cell >= n or face_idx < 0 or face_idx >= len(faces):
+            return
+        idx = faces[face_idx]
+        if idx.size == 0 or int(idx.max()) >= n_pts:
+            return
+        acc[cell] += points[idx].mean(axis=0)
+        weight[cell] += 1.0
+
+    for face_i, cell in enumerate(owner):
+        accumulate(int(cell), face_i)
+    neighbour = _parse_mesh_labels(os.path.join(mesh, "neighbour"))
+    if neighbour is not None:
+        for face_i, cell in enumerate(neighbour):
+            accumulate(int(cell), face_i)
+    if not np.all(weight[:n_cells] > 0.0):
+        return None
+    centres = acc[:n_cells] / weight[:n_cells, None]
+    return np.linalg.norm(centres, axis=1)
+
+
 def capture_arrays_from_time_dir(case_dir: str, time_label: str) -> Optional[Dict[str, np.ndarray]]:
     time_path = os.path.join(case_dir, time_label)
     p_arr, p_def = _read_field(time_path, "p")
@@ -538,26 +672,7 @@ def capture_arrays_from_time_dir(case_dir: str, time_label: str) -> Optional[Dic
         if c_arr is not None and len(c_arr) == n:
             r_1d = np.linalg.norm(np.asarray(c_arr, dtype=float), axis=1)
     if r_1d is None:
-        points_path = os.path.join(case_dir, "constant", "polyMesh", "points")
-        if os.path.isfile(points_path):
-            try:
-                with open(points_path, encoding="utf-8", errors="replace") as handle:
-                    content = handle.read()
-            except OSError:
-                content = ""
-            start = content.find("points")
-            pts = [
-                (float(m.group(1)), float(m.group(2)), float(m.group(3)))
-                for m in re.finditer(
-                    r"\(\s*([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s*\)",
-                    content[start:] if start >= 0 else content,
-                )
-            ]
-            if pts:
-                radii = np.linalg.norm(np.array(pts, dtype=float), axis=1)
-                r_min, r_max = float(np.min(radii)), float(np.max(radii))
-                span = r_max - r_min
-                r_1d = np.linspace(r_min + span / (2 * n), r_max - span / (2 * n), n)
+        r_1d = cell_radii_from_poly_mesh(case_dir, n)
     if r_1d is None:
         r_1d = np.arange(n, dtype=float) + 0.5
     return {

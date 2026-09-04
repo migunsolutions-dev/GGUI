@@ -228,6 +228,48 @@ class SolverWriteNowStopTests(unittest.TestCase):
         self.assertIn("stopAt          writeNow;", text)
         self.assertNotIn("stopAt          endTime;", text)
 
+    def test_request_solver_write_and_stop_keeps_complete_header(self):
+        from solver_runner import request_solver_write_and_stop
+
+        root = tempfile.mkdtemp(prefix="ggui_1d_stop_hdr_")
+        sys_dir = os.path.join(root, "system")
+        os.makedirs(sys_dir)
+        cd_path = os.path.join(sys_dir, "controlDict")
+        original = (
+            "FoamFile\n{\n    version     2.0;\n    format      ascii;\n"
+            "    class       dictionary;\n    object      controlDict;\n}\n"
+            "stopAt          endTime;\nendTime         0.03;\n"
+        )
+        with open(cd_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(original)
+        self.assertTrue(request_solver_write_and_stop(root))
+        with open(cd_path, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertTrue(text.startswith("FoamFile"))
+        self.assertIn("object      controlDict;", text)
+        self.assertIn("stopAt          writeNow;", text)
+        leftovers = [name for name in os.listdir(sys_dir) if name.startswith(".ggui-cd-")]
+        self.assertEqual(leftovers, [])
+
+
+class WatchdogArrivalStopTests(unittest.TestCase):
+    def test_stops_on_first_8kpa_overpressure_not_after_peak_drop(self):
+        from solver_runner import WatchdogState, watchdog_should_stop
+
+        state = WatchdogState()
+        self.assertFalse(watchdog_should_stop(101325.0, state))
+        self.assertFalse(watchdog_should_stop(105000.0, state))
+        self.assertTrue(watchdog_should_stop(101325.0 + 8000.0, state))
+
+    def test_does_not_wait_for_negative_phase(self):
+        from solver_runner import WatchdogState, watchdog_should_stop
+
+        state = WatchdogState()
+        watchdog_should_stop(101325.0, state)
+        self.assertTrue(watchdog_should_stop(140000.0, state))
+        # A later rarefaction must not be required before stopping.
+        self.assertGreater(state.peak_over, 0.0)
+
 
 class ProbeWriteIntervalParseTests(unittest.TestCase):
     def test_reads_probes1d_not_watchdog(self):

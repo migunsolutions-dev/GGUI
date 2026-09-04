@@ -157,6 +157,31 @@ def map_fields_to_2d_cells(
     return out
 
 
+def carry_mixture_mass_in_air(
+    mapped: Dict[str, np.ndarray],
+    *,
+    unused_rho_c4: float,
+) -> Dict[str, np.ndarray]:
+    """Drop the HE phase after remap without creating vacuum cells.
+
+    1D product cells have ``alpha.c4 ~ 1`` and ``rho.air ~ 0``. The remapped
+    2D case uses ``activationModel none`` and carries the blast in air, so
+    those cells must keep the 1D *mixture* density in ``rho.air``. Zeroing
+    ``alpha.c4`` / ``rho.c4`` without this step leaves ``rho_mix ~ 0`` and
+    ``compressibleBlastSystem::decode`` divides by density on the first step.
+    Unused HE-phase density stays at the generated ambient value (0.orig).
+    """
+    if "rho.air" not in mapped or "rho.c4" not in mapped or "alpha.c4" not in mapped:
+        return mapped
+    alpha = np.asarray(mapped["alpha.c4"], dtype=float)
+    rho_c4 = np.asarray(mapped["rho.c4"], dtype=float)
+    rho_air = np.asarray(mapped["rho.air"], dtype=float)
+    mapped["rho.air"] = alpha * rho_c4 + (1.0 - alpha) * rho_air
+    mapped["alpha.c4"] = np.zeros_like(alpha)
+    mapped["rho.c4"] = np.full_like(alpha, float(unused_rho_c4))
+    return mapped
+
+
 def remap_region_metadata(
     hob_m: float,
     *,
@@ -329,25 +354,33 @@ def _read_1d_data(source_case: str, time_dir: str) -> Optional[Dict[str, np.ndar
     if centres is not None:
         r_1d = np.linalg.norm(centres, axis=1)
     else:
-        mesh_dir = os.path.join(source_case, "constant", "polyMesh")
-        points_path = os.path.join(mesh_dir, "points")
-        r_min, r_max = 0.0, 1.0
-        if os.path.isfile(points_path):
-            with open(points_path, "r", encoding="utf-8", errors="replace") as handle:
-                content = handle.read()
-            pts = [
-                (float(m.group(1)), float(m.group(2)), float(m.group(3)))
-                for m in re.finditer(
-                    r"\(\s*([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s*\)",
-                    content[content.find("points") :],
-                )
-            ]
-            if pts:
-                radii = np.linalg.norm(np.array(pts), axis=1)
-                r_min = float(np.min(radii))
-                r_max = float(np.max(radii))
-        span = r_max - r_min
-        r_1d = np.linspace(r_min + span / (2 * n), r_max - span / (2 * n), n)
+        r_1d = None
+        try:
+            from remap_snapshot_1d import cell_radii_from_poly_mesh
+
+            r_1d = cell_radii_from_poly_mesh(source_case, n)
+        except Exception:
+            r_1d = None
+        if r_1d is None or len(r_1d) != n:
+            mesh_dir = os.path.join(source_case, "constant", "polyMesh")
+            points_path = os.path.join(mesh_dir, "points")
+            r_min, r_max = 0.0, 1.0
+            if os.path.isfile(points_path):
+                with open(points_path, "r", encoding="utf-8", errors="replace") as handle:
+                    content = handle.read()
+                pts = [
+                    (float(m.group(1)), float(m.group(2)), float(m.group(3)))
+                    for m in re.finditer(
+                        r"\(\s*([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s*\)",
+                        content[content.find("points") :],
+                    )
+                ]
+                if pts:
+                    radii = np.linalg.norm(np.array(pts), axis=1)
+                    r_min = float(np.min(radii))
+                    r_max = float(np.max(radii))
+            span = r_max - r_min
+            r_1d = np.linspace(r_min + span / (2 * n), r_max - span / (2 * n), n)
     if p_arr is None:
         p_arr = np.full(n, 101325.0 if p_def is None else p_def)
     if t_arr is None:
@@ -516,9 +549,15 @@ def run_case_remap(
         mapped_radius=mapped_radius,
         ambient=ambient,
     )
-    # activationModel none: the blast is carried by p/U/T in the air phase.
-    mapped["alpha.c4"] = np.zeros(n_cells)
-    mapped["rho.c4"] = np.zeros(n_cells)
+    unused_rho_c4 = 1600.0
+    raw_c4 = ambient.get("rho.c4")
+    if raw_c4 is not None:
+        arr_c4 = np.asarray(raw_c4, dtype=float)
+        if arr_c4.size:
+            candidate = float(arr_c4.reshape(-1)[0])
+            if candidate > 0.0:
+                unused_rho_c4 = candidate
+    carry_mixture_mass_in_air(mapped, unused_rho_c4=unused_rho_c4)
     os.makedirs(out_dir, exist_ok=True)
     scalars = (
         ("p", "[1 -1 -2 0 0 0 0]"),

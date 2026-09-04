@@ -6,9 +6,14 @@ import unittest
 
 import numpy as np
 
+import os
+import tempfile
+
 from remap_fields_2d import (
     GROUND_CLIP,
     MAPPING_METHOD,
+    _read_1d_data,
+    carry_mixture_mass_in_air,
     charge_center_xyz,
     effective_mapped_radius,
     map_fields_to_2d_cells,
@@ -139,6 +144,85 @@ class RemapFields2DTests(unittest.TestCase):
         self.assertGreater(mapped["p"][0], mapped["p"][1])
         self.assertAlmostEqual(float(mapped["p"][1]), p_amb)
         self.assertEqual(mapped["U"].shape, (n, 3))
+
+    def test_product_cells_keep_mixture_mass_when_he_phase_is_dropped(self):
+        mapped = {
+            "rho.air": np.array([1e-16, 1e-16, 1.225]),
+            "rho.c4": np.array([2.0, 1.0, 1600.0]),
+            "alpha.c4": np.array([1.0, 1.0, 0.0]),
+            "U": np.array([[800.0, 0.0, 0.0], [400.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+        }
+        before_air = mapped["rho.air"].copy()
+        carry_mixture_mass_in_air(mapped, unused_rho_c4=1600.0)
+        self.assertTrue(np.all(mapped["alpha.c4"] == 0.0))
+        self.assertTrue(np.all(mapped["rho.c4"] == 1600.0))
+        self.assertAlmostEqual(float(mapped["rho.air"][0]), 2.0)
+        self.assertAlmostEqual(float(mapped["rho.air"][1]), 1.0)
+        self.assertAlmostEqual(float(mapped["rho.air"][2]), 1.225)
+        self.assertGreater(float(mapped["rho.air"][0]), float(before_air[0]))
+        self.assertTrue(np.all(mapped["rho.air"] > 0.1))
+        self.assertAlmostEqual(float(mapped["U"][0, 0]), 800.0)
+
+        r = np.array([0.0, 0.3, 1.5])
+        z = np.array([1.0, 1.0, 1.0])
+        r_1d = np.array([0.0, 0.3, 0.6])
+        from_source = map_fields_to_2d_cells(
+            r,
+            z,
+            1.0,
+            r_1d,
+            {
+                "p": np.array([2.0e6, 4.0e5, 1.01325e5]),
+                "T": np.array([2000.0, 800.0, 288.0]),
+                "rho.air": np.array([1e-16, 1e-16, 1.225]),
+                "rho.c4": np.array([2.0, 1.0, 1600.0]),
+                "alpha.c4": np.array([1.0, 1.0, 0.0]),
+                "U_mag": np.array([800.0, 400.0, 0.0]),
+            },
+            ambient={"p": 101325.0, "T": 288.0, "rho.air": 1.225, "rho.c4": 1600.0},
+        )
+        carry_mixture_mass_in_air(from_source, unused_rho_c4=1600.0)
+        self.assertTrue(np.all(from_source["rho.air"] > 0.1))
+        self.assertAlmostEqual(float(from_source["rho.air"][1]), 1.0)
+        self.assertAlmostEqual(float(from_source["rho.air"][2]), 1.225)
+
+    def test_read_1d_data_uses_poly_mesh_cell_radii_not_linspace(self):
+        with tempfile.TemporaryDirectory() as td:
+            mesh = os.path.join(td, "constant", "polyMesh")
+            os.makedirs(mesh)
+            os.makedirs(os.path.join(td, "0.001"))
+            with open(os.path.join(mesh, "points"), "w", encoding="utf-8") as handle:
+                handle.write(
+                    "8\n(\n"
+                    "(0.10 0 0)\n(0.10 0.01 0)\n(0.10 0.01 0.01)\n(0.10 0 0.01)\n"
+                    "(1.50 0 0)\n(1.50 0.01 0)\n(1.50 0.01 0.01)\n(1.50 0 0.01)\n"
+                    ")\n"
+                )
+            with open(os.path.join(mesh, "faces"), "w", encoding="utf-8") as handle:
+                handle.write("2\n(\n4(4 5 6 7)\n4(0 1 2 3)\n)\n")
+            with open(os.path.join(mesh, "owner"), "w", encoding="utf-8") as handle:
+                handle.write("2\n(\n0\n1\n)\n")
+            with open(os.path.join(td, "0.001", "p"), "w", encoding="utf-8") as handle:
+                handle.write(
+                    "internalField nonuniform List<scalar>\n2\n(\n 2.0e6\n 1.0e5\n);\n"
+                )
+            data = _read_1d_data(td, "0.001")
+            self.assertIsNotNone(data)
+            self.assertGreater(float(data["r"][0]), 1.49)
+            self.assertLess(float(data["r"][1]), 0.12)
+            self.assertGreater(float(data["p"][0]), float(data["p"][1]))
+
+    def test_he_wipe_without_carry_discards_product_mass(self):
+        """1D->3D used to zero HE without moving mass into rho.air."""
+        alpha = np.array([1.0, 0.0])
+        rho_c4 = np.array([2.5, 1600.0])
+        rho_air = np.array([1e-16, 1.225])
+        mix = alpha * rho_c4 + (1.0 - alpha) * rho_air
+        wiped = np.zeros_like(alpha) * rho_c4 + (1.0 - 0.0) * rho_air
+        carried = mix.copy()
+        self.assertLess(float(wiped[0]), 1e-10)
+        self.assertAlmostEqual(float(carried[0]), 2.5)
+        self.assertAlmostEqual(float(carried[1]), float(wiped[1]))
 
     def test_mapped_radius_does_not_clip_below_1d_extent(self):
         r_1d = np.array([0.0, 0.8, 1.6])

@@ -1,6 +1,8 @@
 import glob
 import os
 import re
+import shlex
+import tempfile
 import time
 import subprocess
 import threading
@@ -28,6 +30,7 @@ from completion_1d import (
     resolve_arrival_probe,
     write_completion_record,
 )
+from remap_handoff_1d import primary_shock_at_probe
 from foam_dictionary import update_top_level_entries
 from result_storage import (
     ResultStoragePolicy,
@@ -42,6 +45,7 @@ from validation.probes import latest_probe_field_file
 from remap_snapshot_1d import write_snapshot_after_run
 from wsl_runtime import (
     build_case_command_argv,
+    build_wsl_argv,
     popen_group_kwargs,
     terminate_process_tree,
     to_wsl_path_and_distro,
@@ -52,7 +56,28 @@ DEBUG_TAIL_LINES = 50
 DEFAULT_PROBE_WRITE_INTERVAL_STEPS = 25
 WATCHDOG_STRONG_P_PA = 1.5e5
 WATCHDOG_ARRIVAL_OVER_PA = 8.0e3
-WATCHDOG_DROP_FRAC = 0.10
+
+
+def live_log_read_position(
+    previous_pos: int,
+    file_size: int,
+    *,
+    armed: bool,
+    skip_existing: bool,
+) -> Tuple[int, bool, bool]:
+    """Choose the next byte offset when tailing log.blastFoam.
+
+    Returns (seek_pos, now_armed, truncated). On first arm, Resume skips
+    historical Time= lines by starting at EOF; a fresh run starts at 0.
+    If tee truncated the file, rewind to 0 so the new process can be parsed.
+    """
+    size = max(0, int(file_size))
+    pos = max(0, int(previous_pos))
+    if not armed:
+        return (size if skip_existing else 0), True, False
+    if pos > size:
+        return 0, True, True
+    return pos, True, False
 
 
 class WatchdogState:
@@ -66,10 +91,12 @@ class WatchdogState:
 
 
 def watchdog_should_stop(pressure: float, state: WatchdogState) -> bool:
-    """True when the shock has reached the target radius.
+    """True when the shock first reaches the target radius.
 
-    A hard 150 kPa cut misses weak arrivals (e.g. ~149 kPa at 4 m). Stop on a
-    strong jump, or after overpressure at the target has peaked and fallen.
+    Stop on the documented arrival threshold (8 kPa overpressure), or on a
+    strong absolute jump. Waiting for the peak to fall dumps the 1D state
+    after the positive phase has left the mesh, so 2D remap receives a
+    rarefaction shell instead of the blast front.
     """
     if pressure != pressure or pressure <= 0.0:
         return False
@@ -81,9 +108,7 @@ def watchdog_should_stop(pressure: float, state: WatchdogState) -> bool:
         state.peak_over = over
     if float(pressure) >= WATCHDOG_STRONG_P_PA:
         return True
-    arrived = state.peak_over >= WATCHDOG_ARRIVAL_OVER_PA
-    dropped = over <= (1.0 - WATCHDOG_DROP_FRAC) * state.peak_over
-    return bool(arrived and dropped)
+    return over >= WATCHDOG_ARRIVAL_OVER_PA
 
 
 def probe_write_interval_from_control_dict(
@@ -99,6 +124,33 @@ def probe_write_interval_from_control_dict(
         return max(1, int(default))
 
 
+def _publish_control_dict(temp_path: str, dest_path: str) -> None:
+    """Replace controlDict without leaving a truncated file for OpenFOAM.
+
+    blastFoam rereads ``system/controlDict`` because it is runTimeModifiable.
+    A Windows truncate-and-rewrite of the live file, while the solver reads
+    it from Linux, produces ``FOAM FATAL IO ERROR: problem while reading
+    header for object controlDict``. Publish a complete temp file, then
+    rename it in place (Linux ``mv`` when the case lives in WSL).
+    """
+    dest = to_wsl_path_and_distro(dest_path)
+    src = to_wsl_path_and_distro(temp_path)
+    if dest.distro and dest.linux_path.startswith("/"):
+        script = (
+            f"mv -f {shlex.quote(src.linux_path)} {shlex.quote(dest.linux_path)}"
+        )
+        argv = build_wsl_argv(script, distro=dest.distro)
+        try:
+            completed = subprocess.run(
+                argv, capture_output=True, text=True, timeout=20
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            completed = None
+        if completed is not None and completed.returncode == 0:
+            return
+    os.replace(temp_path, dest_path)
+
+
 def request_solver_write_and_stop(case_dir: str) -> bool:
     """Ask a running OpenFOAM solver to dump the current time and exit.
 
@@ -108,16 +160,29 @@ def request_solver_write_and_stop(case_dir: str) -> bool:
     this as ``wave_radius_reached``, not a normal endTime completion.
     """
     cd_path = os.path.join(case_dir, "system", "controlDict")
+    temp_path = ""
     try:
         with open(cd_path, "r", encoding="utf-8") as handle:
             text = handle.read()
         new_text, _changed = update_top_level_entries(
             text, {"stopAt": "writeNow"}
         )
-        with open(cd_path, "w", encoding="utf-8", newline="") as handle:
+        sys_dir = os.path.dirname(cd_path)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".ggui-cd-", suffix=".tmp", dir=sys_dir
+        )
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(new_text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _publish_control_dict(temp_path, cd_path)
         return True
     except (OSError, KeyError):
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
         return False
 
 
@@ -203,6 +268,9 @@ class SolverRunner(QThread):
 
         # On-the-fly reconstruction (parallel only): tail solver log, spawn reconstructPar -newTimes
         self._log_blastfoam_pos: int = 0
+        self._log_data_pos: int = 0
+        self._log_step_count: int = 0
+        self._log_tail_armed: bool = False
         self._reconstruct_proc: Optional[subprocess.Popen] = None
         self._last_reconstructed_time: Optional[float] = None
 
@@ -319,6 +387,8 @@ class SolverRunner(QThread):
         self._probe_write_interval_steps = probe_write_interval_from_control_dict(text)
 
     def _discover_probe_file(self) -> Optional[str]:
+        if not is_generated_1d_case(self.win_case_dir):
+            return None
         try:
             base = os.path.join(self.win_case_dir, "postProcessing", "probes1d")
             if not os.path.isdir(base):
@@ -595,27 +665,37 @@ class SolverRunner(QThread):
         idx = self._wave_probe_index
         if idx < 0 or idx >= len(pressures):
             return
-        if not overpressure_arrived(
-            pressures[idx],
-            p_atm=record.p_atm,
-            threshold_pa=record.threshold_overpressure_pa,
-        ):
+        if record.remap_for_2d:
+            reached = primary_shock_at_probe(pressures[idx], record.p_atm)
+        else:
+            reached = overpressure_arrived(
+                pressures[idx],
+                p_atm=record.p_atm,
+                threshold_pa=record.threshold_overpressure_pa,
+            )
+        if not reached:
             return
         record.wave_radius_reached = True
         record.detected_arrival_time_s = float(sample_time)
         record = detect_arrival_in_case(case_dir, record)
         write_completion_record(case_dir, record)
         self._wave_arrival_recorded = True
-        radius_str = f"{float(requested):.6g}"
+        stop_r = record.handoff_radius_m if record.handoff_radius_m is not None else requested
+        radius_str = f"{float(stop_r):.6g}"
         if not is_terminate_mode(record):
             self.status_signal.emit(
                 f"Wave reached radius ({radius_str} m). Continuing until stopped."
             )
             return
         self._watchdog_triggered = True
-        self.status_signal.emit(
-            f"Wave reached requested radius ({radius_str} m). Stopping simulation."
-        )
+        if record.handoff_radius_m is not None:
+            self.status_signal.emit(
+                f"Wave reached remap handoff radius ({radius_str} m). Stopping simulation."
+            )
+        else:
+            self.status_signal.emit(
+                f"Wave reached requested radius ({radius_str} m). Stopping simulation."
+            )
         request_solver_write_and_stop(case_dir)
         self._watchdog_stop_requested_time = time.time()
 
@@ -710,8 +790,9 @@ class SolverRunner(QThread):
         self._total_lines_read = 0
         self._last_time_val = 0.0
         self._log_blastfoam_pos = 0
-        self._log_data_pos = 0          # separate pos for data parsing from log
-        self._log_step_count = 0        # step counter from log parsing
+        self._log_data_pos = 0
+        self._log_step_count = 0
+        self._log_tail_armed = False
         self._reconstruct_proc = None
         self._last_reconstructed_time = None
 
@@ -741,10 +822,23 @@ class SolverRunner(QThread):
                 t_s, pressures, step_n, dt_val = latest
                 self.data_signal.emit(pressures, t_s, step_n, dt_val)
             elif self._probe_file is None:
-                # No probe file (3D): parse log.blastFoam for step/time/dt
+                # 2D/3D: tail log.blastFoam for step/time/dt (no probes1d).
                 log_path = os.path.join(self.win_case_dir, "log.blastFoam")
                 if os.path.isfile(log_path):
                     try:
+                        skip_existing = self.intent in (
+                            ExecutionIntent.RESUME,
+                            ExecutionIntent.ONE_STEP_RESUME,
+                        )
+                        seek_pos, self._log_tail_armed, truncated = live_log_read_position(
+                            self._log_data_pos,
+                            os.path.getsize(log_path),
+                            armed=self._log_tail_armed,
+                            skip_existing=skip_existing,
+                        )
+                        if truncated:
+                            self._log_step_count = 0
+                        self._log_data_pos = seek_pos
                         with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
                             f.seek(self._log_data_pos)
                             new_text = f.read()

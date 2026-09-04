@@ -43,6 +43,10 @@ class Generator2DTests(unittest.TestCase):
             self.assertNotIn("refineInternal", fields)
             self.assertNotIn("setRefinedFields", command)
             self.assertIn("setFields", command)
+            self.assertIn("set -eo pipefail", command)
+            self.assertIn("| tee log.blastFoam", command)
+            self.assertIn("PIPESTATUS[0]", command)
+            self.assertIn('exit "$solver_rc"', command)
 
     def test_fixed_axial_cylinder_geometry(self):
         with tempfile.TemporaryDirectory() as td:
@@ -141,6 +145,10 @@ class Generator2DTests(unittest.TestCase):
                 self.assertEqual(" -refine" in command, expects_refine)
                 self.assertNotIn("setRefinedFields", command)
                 self.assertNotIn("setFields &&", command)
+                allrun = _read(case, "Allrun")
+                self.assertIn("set -eo pipefail", allrun)
+                self.assertIn("| tee log.blastFoam", allrun)
+                self.assertIn("PIPESTATUS[0]", allrun)
                 self.assertIn("regions ();", _read(case, "system/setFieldsDict"))
                 self.assertIn("from remap_fields_2d import run_case_remap", _read(case, "remap_2d.py"))
                 self.assertIn("hob=0.5,\n", _read(case, "remap_2d.py"))

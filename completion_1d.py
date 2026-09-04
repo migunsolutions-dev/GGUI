@@ -71,6 +71,11 @@ class CompletionRecord:
     final_solver_time_s: Optional[float] = None
     stop_reason: str = ""
     return_code: Optional[int] = None
+    remap_for_2d: bool = False
+    remap_radius_m: Optional[float] = None
+    dr_1d_m: Optional[float] = None
+    remap_front_buffer_cells: Optional[int] = None
+    handoff_radius_m: Optional[float] = None
 
     def as_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -181,6 +186,11 @@ def read_completion_record(case_dir: str) -> Optional[CompletionRecord]:
             final_solver_time_s=_opt_float(data.get("final_solver_time_s")),
             stop_reason=str(data.get("stop_reason") or ""),
             return_code=None if data.get("return_code") is None else int(data["return_code"]),
+            remap_for_2d=bool(data.get("remap_for_2d")),
+            remap_radius_m=_opt_float(data.get("remap_radius_m")),
+            dr_1d_m=_opt_float(data.get("dr_1d_m")),
+            remap_front_buffer_cells=_opt_int(data.get("remap_front_buffer_cells")),
+            handoff_radius_m=_opt_float(data.get("handoff_radius_m")),
         )
     except (TypeError, ValueError):
         return None
@@ -194,8 +204,23 @@ def initial_completion_record(
     p_atm: float = 101325.0,
     right_boundary: Optional[str] = None,
     end_time_s: Optional[float] = None,
+    remap_for_2d: bool = False,
+    remap_radius_m: Optional[float] = None,
+    dr_1d_m: Optional[float] = None,
+    remap_front_buffer_cells: Optional[int] = None,
+    handoff_radius_m: Optional[float] = None,
+    criterion: Optional[str] = None,
 ) -> CompletionRecord:
     resolved = normalize_run_mode(mode or stop_mode, right_boundary)
+    remap = bool(remap_for_2d)
+    if criterion is not None:
+        resolved_criterion = str(criterion)
+    elif remap:
+        from remap_handoff_1d import HANDOFF_CRITERION
+
+        resolved_criterion = HANDOFF_CRITERION
+    else:
+        resolved_criterion = ARRIVAL_CRITERION
     return CompletionRecord(
         mode=resolved,
         stop_mode=resolved,
@@ -204,7 +229,7 @@ def initial_completion_record(
         end_time_s=_opt_float(end_time_s),
         p_atm=float(p_atm) if is_finite_number(p_atm) else 101325.0,
         threshold_overpressure_pa=ARRIVAL_OVERPRESSURE_PA,
-        criterion=ARRIVAL_CRITERION,
+        criterion=resolved_criterion,
         wave_radius_reached=False,
         detected_arrival_time_s=None,
         probe_function_object="",
@@ -214,6 +239,11 @@ def initial_completion_record(
         final_solver_time_s=None,
         stop_reason="",
         return_code=None,
+        remap_for_2d=remap,
+        remap_radius_m=_opt_float(remap_radius_m),
+        dr_1d_m=_opt_float(dr_1d_m),
+        remap_front_buffer_cells=_opt_int(remap_front_buffer_cells),
+        handoff_radius_m=_opt_float(handoff_radius_m),
     )
 
 
@@ -231,9 +261,14 @@ def reset_completion_for_new_run(case_dir: str) -> CompletionRecord:
             p_atm=existing.p_atm,
             right_boundary=existing.right_boundary,
             end_time_s=existing.end_time_s,
+            remap_for_2d=existing.remap_for_2d,
+            remap_radius_m=existing.remap_radius_m,
+            dr_1d_m=existing.dr_1d_m,
+            remap_front_buffer_cells=existing.remap_front_buffer_cells,
+            handoff_radius_m=existing.handoff_radius_m,
+            criterion=existing.criterion,
         )
         record.threshold_overpressure_pa = existing.threshold_overpressure_pa
-        record.criterion = existing.criterion
     write_completion_record(case_dir, record)
     try:
         from remap_snapshot_1d import invalidate_snapshot
@@ -290,6 +325,16 @@ def _opt_float(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _opt_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number
 
 
 def _probe_ref_from_file(
@@ -375,12 +420,17 @@ def detect_arrival_in_case(
         return updated
     _locs, times, cols = parse_probe_history(path)
     _t, pressures = series_for_index(times, cols, index)
-    arrived_at = arrival_time_from_history(
-        _t,
-        pressures,
-        p_atm=updated.p_atm,
-        threshold_pa=updated.threshold_overpressure_pa,
-    )
+    if updated.remap_for_2d:
+        from remap_handoff_1d import primary_shock_arrival_time
+
+        arrived_at = primary_shock_arrival_time(_t, pressures, updated.p_atm)
+    else:
+        arrived_at = arrival_time_from_history(
+            _t,
+            pressures,
+            p_atm=updated.p_atm,
+            threshold_pa=updated.threshold_overpressure_pa,
+        )
     if arrived_at is not None:
         updated.wave_radius_reached = True
         if not is_finite_number(updated.detected_arrival_time_s):

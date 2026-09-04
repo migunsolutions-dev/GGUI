@@ -564,7 +564,16 @@ def _read_1d_data(source_case, time_dir):
     U_arr, U_def = read_field("U", vec=True)
     n = len(p_arr) if p_arr is not None else (len(T_arr) if T_arr is not None else 1)
     n = max(1, n)
-    r_1d = np.linspace(r_min + (r_max - r_min) / (2 * n), r_max - (r_max - r_min) / (2 * n), n)
+    r_1d = None
+    try:
+        from remap_snapshot_1d import cell_radii_from_poly_mesh
+        r_mesh = cell_radii_from_poly_mesh(SOURCE_1D_CASE, n)
+        if r_mesh is not None and len(r_mesh) == n:
+            r_1d = r_mesh
+    except Exception:
+        r_1d = None
+    if r_1d is None:
+        r_1d = np.linspace(r_min + (r_max - r_min) / (2 * n), r_max - (r_max - r_min) / (2 * n), n)
     if p_arr is None: p_arr = np.full(n, p_def)
     if T_arr is None: T_arr = np.full(n, T_def)
     if rho4_arr is None: rho4_arr = np.full(n, r4_def)
@@ -776,11 +785,30 @@ def main():
     rhoa_3d = np.where(mask, rhoa_mapped, rhoa_orig)
     a4_3d = np.where(mask, a4_mapped, a4_orig)
     U_3d = np.where(mask[:, np.newaxis], U_mapped, U_orig)
-    # Always zero explosive phase: with activationModel none the blast wave
-    # is carried entirely by p/U/T in the air phase; any non-zero alpha.c4
-    # or rho.c4 creates an inconsistent thermodynamic state (sigFpe).
-    a4_3d = np.zeros(n_cells)
-    rho4_3d = np.zeros(n_cells)
+    # Same air-only conversion as 1D->2D: drop HE after remap, but keep the
+    # mixture density in rho.air. Zeroing alpha.c4/rho.c4 while product cells
+    # already have rho.air~0 creates vacuum and decode() / 0. POST_DETONATION
+    # is unused (always False); if it is ever enabled it still needs this carry.
+    from remap_fields_2d import carry_mixture_mass_in_air
+    unused_rho_c4 = 1600.0
+    raw_c4 = np.asarray(rho4_orig, dtype=float).reshape(-1)
+    if raw_c4.size and float(raw_c4[0]) > 0.0:
+        unused_rho_c4 = float(raw_c4[0])
+    mapped = {{
+        "p": p_3d,
+        "T": T_3d,
+        "rho.c4": rho4_3d,
+        "rho.air": rhoa_3d,
+        "alpha.c4": a4_3d,
+        "U": U_3d,
+    }}
+    carry_mixture_mass_in_air(mapped, unused_rho_c4=unused_rho_c4)
+    p_3d = mapped["p"]
+    T_3d = mapped["T"]
+    rho4_3d = mapped["rho.c4"]
+    rhoa_3d = mapped["rho.air"]
+    a4_3d = mapped["alpha.c4"]
+    U_3d = mapped["U"]
     # Debug: sample cells outside R_remap to confirm they get original values
     outside_idx = np.where(~mask)[0]
     if len(outside_idx) > 0:
@@ -1149,9 +1177,13 @@ class Generator3D(BaseGenerator):
     ) -> None:
         """Write remap_radial.py into the case root for Autodyn-style radial remap from 1D."""
         ox, oy, oz = float(origin[0]), float(origin[1]), float(origin[2])
-        snap_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "remap_snapshot_1d.py")
+        here = os.path.dirname(os.path.abspath(__file__))
+        snap_src = os.path.join(here, "remap_snapshot_1d.py")
         if os.path.isfile(snap_src):
             shutil.copyfile(snap_src, os.path.join(case_dir, "remap_snapshot_1d.py"))
+        fields_src = os.path.join(here, "remap_fields_2d.py")
+        if os.path.isfile(fields_src):
+            shutil.copyfile(fields_src, os.path.join(case_dir, "remap_fields_2d.py"))
         script = _REMAP_RADIAL_SCRIPT.format(
             source_case=repr(source_case_linux),
             source_time=repr(source_time),

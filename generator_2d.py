@@ -23,8 +23,14 @@ from models_2d import CaseInputs2D, HOB_SOURCE_USER_TARGET
 from output_options import REMAP_2D_FILENAME, extra_function_objects
 from path_utils import win_to_wsl_path
 from remap_fields_2d import charge_center_xyz, remap_region_metadata
-from remap_snapshot_1d import resolve_remap_source
+from remap_handoff_1d import (
+    merge_target_handoff,
+    read_handoff_metadata,
+    write_handoff_metadata,
+)
+from remap_snapshot_1d import canonical_case_path, resolve_remap_source
 from validation.auto_points import FO_2D_VALIDATION, plan_2d, runtime_logical_dpi_x, stamp_plan
+from validation.kb_propagation import copied_1d2d_radius_m
 from validation.remap_timing import build_remap_timing, remap_timing_from_mapping
 from validation.sampling_io import write_sampling_plan
 
@@ -497,9 +503,13 @@ snGradSchemes { default corrected; }
             cell_size=inputs.cell_size,
             logical_dpi_x=runtime_logical_dpi_x(),
             remap_receive_r_max=(
-                float(inputs.mapping.mapped_radius)
+                copied_1d2d_radius_m(
+                    source_1d_case=str(inputs.mapping.case_path or ""),
+                    widget_mapped_radius=float(
+                        getattr(inputs.mapping, "mapped_radius", 0.0) or 0.0
+                    ),
+                )
                 if inputs.initialization_source != DIRECT_SOURCE
-                and float(getattr(inputs.mapping, "mapped_radius", 0.0) or 0.0) > 0.0
                 else None
             ),
         )
@@ -629,9 +639,11 @@ functions
         allrun = f"""#!/usr/bin/env bash
 cd "$(dirname "$0")" || exit 1
 source "{self.openfoam_bashrc}" || true
-set -e
+set -eo pipefail
 {init}
 {decompose}{solver} 2>&1 | tee log.blastFoam
+solver_rc=${{PIPESTATUS[0]}}
+exit "$solver_rc"
 """
         if bool(getattr(inputs, "output_remap_data", False)):
             allrun += f"""
@@ -675,6 +687,15 @@ rm -rf 0 2>/dev/null || true
                 time_mode=str(getattr(inputs.mapping, "time_mode", "") or ""),
                 target_time="0",
             )
+            copied = copied_1d2d_radius_m(
+                source_1d_case=str(inputs.mapping.case_path or ""),
+                widget_mapped_radius=float(
+                    getattr(inputs.mapping, "mapped_radius", 0.0) or 0.0
+                ),
+            )
+            if copied is not None:
+                remap_region["copied_radius_m"] = copied
+                remap_region["field_r_max_m"] = copied
             remap_region["physical_time_offset"] = remap_timing.physical_time_offset
             remap_region["source_physical_time"] = remap_timing.source_physical_time
             remap_region["target_initial_time"] = remap_timing.target_initial_time
@@ -710,6 +731,34 @@ rm -rf 0 2>/dev/null || true
             "remap_timing": None if remap_timing is None else remap_timing.as_dict(),
             "warnings": list(checked.warnings),
         }
+        if remap:
+            src_handoff = read_handoff_metadata(str(inputs.mapping.case_path or ""))
+            if src_handoff is None:
+                resolved_src = resolve_remap_source(str(inputs.mapping.case_path or ""))
+                meta = resolved_src.metadata if resolved_src is not None else None
+                if isinstance(meta, dict) and meta.get("handoff_radius_m") is not None:
+                    src_handoff = {
+                        "remap_radius_m": meta.get("remap_radius_m"),
+                        "dr_1d_m": meta.get("dr_1d_m"),
+                        "remap_front_buffer_cells": meta.get("remap_front_buffer_cells"),
+                        "handoff_radius_m": meta.get("handoff_radius_m"),
+                        "handoff_time_s": meta.get("handoff_time_s")
+                        or meta.get("arrival_time_s")
+                        or meta.get("source_physical_time"),
+                        "source_1d_case": meta.get("source_1d_case")
+                        or meta.get("source_case_path"),
+                        "field_r_max_m": meta.get("field_r_max_m"),
+                    }
+            if src_handoff:
+                merged = merge_target_handoff(
+                    src_handoff,
+                    target_2d_case=canonical_case_path(case_dir),
+                    hob_m=hob,
+                    charge_center=list(charge_center_xyz(hob)),
+                    actual_remap_geometry=remap_region,
+                )
+                write_handoff_metadata(case_dir, merged)
+                data["remap_handoff"] = merged
         self._write_text(
             os.path.join(case_dir, "case_2d.json"),
             json.dumps(data, indent=2, sort_keys=True) + "\n",
