@@ -22,6 +22,7 @@ from initialization_plan import (
 from mesh_domain import align_domain_to_cell_size
 from material_catalog import jwl_parameters
 from models import CaseInputs3D
+from output_options import extra_function_objects, obstacle_monitor_block, section_plane_point, surfaces_vtk_block
 from path_utils import get_latest_time_dir, win_to_wsl_path
 from startup_capture_guard import require_safe_capture
 
@@ -1992,6 +1993,11 @@ dumpLevel      true;
         if init_pt is None or (isinstance(init_pt, (list, tuple)) and len(init_pt) < 3):
             init_pt = inputs.charge_center
         # Canonical material catalog shared with dimensional workflows.
+        # Density/energy completeness is enforced here; jwl_parameters validates
+        # JWL-specific Custom keys only (see material_catalog responsibility split).
+        from material_validation import validate_required_values
+
+        validate_required_values(inputs).raise_if_invalid()
         j = jwl_parameters(inputs.material_name, getattr(inputs, "material_props", None))
         eos = f"equationOfState {{ rho0 {inputs.rho_charge}; A {j['A']:.4g}; B {j['B']:.4g}; R1 {j['R1']}; R2 {j['R2']}; omega {j['omega']}; }}"
         cv_coeffs = j.get("CvCoeffs", (413.15, 2.1538))
@@ -3570,12 +3576,16 @@ if __name__ == "__main__":
         wc_type = getattr(inputs, "write_control_type", "timeStep")
         if wc_type == "adjustableRunTime":
             w_interval = getattr(inputs, "write_interval_time", 5e-5)
-            cd_lines.append(f"writeControl    adjustableRunTime;")
+            cd_lines.append("writeControl    adjustableRunTime;")
             cd_lines.append(f"writeInterval   {w_interval};")
         else:
             cd_lines.append("writeControl    timeStep;")
             cd_lines.append(f"writeInterval   {inputs.write_interval_steps};")
-        cycle_w = getattr(inputs, "cycle_write", 0)
+        cycle_w = (
+            int(getattr(inputs, "cycle_write", 0))
+            if bool(getattr(inputs, "keep_openfoam_time_folders", False))
+            else 0
+        )
         cd_lines += [
             f"cycleWrite      {cycle_w};",
             "purgeWrite      0;",  # Keep all time directories (0 = unlimited)
@@ -3590,33 +3600,92 @@ if __name__ == "__main__":
             "",
             "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //",
         ]
-        if getattr(inputs, "enable_post_processing", False):
+        probe_pts = tuple(getattr(inputs, "probe_points", ()) or ())
+        probe_fields = tuple(getattr(inputs, "probe_fields", ("p",)) or ("p",))
+        if "p" not in probe_fields:
+            probe_fields = ("p",) + probe_fields
+        want_impulse = "impulse" in probe_fields
+        want_dyn = "dynamicPressure" in probe_fields
+        peaks = bool(getattr(inputs, "enable_post_processing", False))
+        extras = extra_function_objects(
+            p_atm=float(inputs.p_atm),
+            impulse=want_impulse or peaks,
+            overpressure=peaks or bool(getattr(inputs, "write_arrival", False)),
+            dynamic_pressure=want_dyn,
+            peaks=peaks,
+        )
+        probes_block = ""
+        if probe_pts:
+            loc_lines = "\n".join(
+                f"            ({float(pt[0]):.10g} {float(pt[1]):.10g} {float(pt[2]):.10g})"
+                for pt in probe_pts
+            )
+            probes_block = (
+                "    probes3d\n    {\n"
+                "        type            probes;\n"
+                '        libs            ("libfieldFunctionObjects.so");\n'
+                f"        fields          ({' '.join(probe_fields)});\n"
+                "        writeControl    timeStep;\n"
+                "        writeInterval   1;\n"
+                "        probeLocations\n        (\n"
+                f"{loc_lines}\n"
+                "        );\n    }\n"
+            )
+        surfaces_block = ""
+        if bool(getattr(inputs, "write_surfaces", True)):
+            planes = list(getattr(inputs, "surface_planes", ()) or ())
+            if not planes:
+                ox, oy, oz = section_plane_point(
+                    (0.0, 0.0, 1.0),
+                    0.5 * (float(inputs.min_point[2]) + float(inputs.max_point[2])),
+                    inputs.min_point,
+                    inputs.max_point,
+                )
+                planes = [("midXY", ox, oy, oz, 0.0, 0.0, 1.0)]
+            patches = []
+            if getattr(inputs, "obstacles", None):
+                patches = self._get_obstacle_patch_names(inputs)
+            section_fields = tuple(getattr(inputs, "section_fields", ()) or ()) or ("p",)
+            obstacle_fields = tuple(getattr(inputs, "obstacle_fields", ()) or ())
+            write_oid = bool(getattr(inputs, "write_obstacle_id", False))
+            write_arrival = bool(getattr(inputs, "write_arrival", False))
+            if write_arrival and "overpressure" not in obstacle_fields:
+                obstacle_fields = obstacle_fields + ("overpressure",)
+            sections_part = surfaces_vtk_block(
+                name="sectionsVTK",
+                by_time=wc_type == "adjustableRunTime",
+                interval_time=float(getattr(inputs, "write_interval_time", 5e-5)),
+                interval_steps=int(getattr(inputs, "write_interval_steps", 100)),
+                fields=section_fields,
+                planes=planes,
+                patches=(),
+            )
+            obstacles_part = ""
+            if patches and (obstacle_fields or write_oid or write_arrival):
+                obstacles_part = surfaces_vtk_block(
+                    name="obstaclesVTK",
+                    by_time=wc_type == "adjustableRunTime",
+                    interval_time=float(getattr(inputs, "write_interval_time", 5e-5)),
+                    interval_steps=int(getattr(inputs, "write_interval_steps", 100)),
+                    fields=obstacle_fields or ("p",),
+                    planes=(),
+                    patches=patches,
+                )
+            arrival_part = obstacle_monitor_block(patches) if write_arrival and patches else ""
+            surfaces_block = sections_part + obstacles_part + arrival_part
+            if write_oid and patches:
+                id_lines = "\n".join(f"{name}    {i + 1};" for i, name in enumerate(patches))
+                self._write_text(
+                    os.path.join(case_dir, "obstacleIds"),
+                    self._foam_header("obstacleIds", "dictionary", "") + id_lines + "\n",
+                )
+        if extras or probes_block or surfaces_block:
             cd_lines += [
                 "functions",
                 "{",
-                "    impulse",
-                "    {",
-                "        type            impulse;",
-                "        writeControl    writeTime;",
-                f"        pRef            {inputs.p_atm};",
-                "    }",
-                "    overpressure",
-                "    {",
-                "        type            overpressure;",
-                "        writeControl    writeTime;",
-                "        store           yes;",
-                f"        pRef            {inputs.p_atm};",
-                "    }",
-                "    maxPImpulse",
-                "    {",
-                "        type            fieldMinMax;",
-                "        writeControl    writeTime;",
-                "        fields",
-                "        (",
-                "            overpressure",
-                "            impulse",
-                "        );",
-                "    }",
+                extras.rstrip("\n") + ("\n" if extras else ""),
+                probes_block.rstrip("\n"),
+                surfaces_block.rstrip("\n"),
                 "};",
             ]
         cd_lines += [

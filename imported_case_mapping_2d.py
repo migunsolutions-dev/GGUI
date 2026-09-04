@@ -16,7 +16,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from case_topology import ClassificationResult, classify_case_topology
 from material_catalog import materials_copy
-from material_validation import REQUIRED_IMPORTED_PHYSICS_KEYS, UNSUPPORTED_IMPORT_KEYS
+from material_validation import (
+    REQUIRED_IMPORTED_PHYSICS_KEYS,
+    UNSUPPORTED_IMPORT_KEYS,
+    validate_required_values,  # re-export for a single import surface
+)
 
 
 class FieldProvenance(str, Enum):
@@ -511,25 +515,11 @@ def _add(
         result.gui_values[mf.gui_key] = value
 
 
-def map_imported_case_to_gui(
-    case_dir: str,
-    classification: Optional[ClassificationResult] = None,
-) -> ImportMappingResult:
-    """Build a typed mapping from an imported working-case directory."""
-    case_dir = os.path.normpath(case_dir)
-    classification = classification or classify_case_topology(case_dir)
-    result = ImportMappingResult()
-    notes: List[str] = []
+def map_domain(result: ImportMappingResult, block: dict, ev, notes: List[str]):
+    """Map domain radius, height, and cell-size fields from blockMesh evidence.
 
-    block = _parse_block_mesh(case_dir)
-    control = _parse_control(case_dir)
-    decompose = _parse_decompose(case_dir)
-    control_probes, control_output_fields = _parse_control_probes(control)
-    setfields = _parse_setfields(case_dir)
-    phases = _parse_phase_properties(case_dir)
-    dyn = _parse_dynamic_mesh(case_dir)
-    ev = classification.evidence
-
+    Returns ``(radius, height)`` for downstream charge placement checks.
+    """
     # --- Domain ---
     radius = block.get("radius", ev.radius_extent_m)
     height = block.get("height", ev.height_extent_m)
@@ -695,7 +685,18 @@ def map_imported_case_to_gui(
             reason="base cell size not recovered",
             apply_gui=False,
         )
+    return radius, height
 
+
+def map_charge(
+    result: ImportMappingResult,
+    setfields: dict,
+    phases: dict,
+    notes: List[str],
+    *,
+    height=None,
+):
+    """Map charge shape, geometry, and mass from setFields / phaseProperties."""
     # --- Charge ---
     shape = setfields.get("shape")
     if shape:
@@ -919,6 +920,12 @@ def map_imported_case_to_gui(
             apply_gui=False,
         )
 
+    return setfields.get("shape")
+
+
+def map_material(result: ImportMappingResult, setfields: dict, phases: dict, notes: List[str], shape=None) -> None:
+    """Map material identity, density, and energy without silent catalog substitution."""
+    # --- Material ---
     phase_field = setfields.get("phase_field")
     material, mat_reason = _map_material(phase_field, phases.get("phases") or [])
     if material:
@@ -1017,15 +1024,17 @@ def map_imported_case_to_gui(
                 source_file=phases.get("path", ""),
                 reason=f"initiation points {ip}",
             )
-    elif phases.get("useCOM") and centre and len(centre) >= 2:
-        _add(
-            result,
-            "detonation_height",
-            float(centre[1]),
-            FieldProvenance.DERIVED,
-            source_file=phases.get("path", ""),
-            reason="phaseProperties useCOM yes → charge centre",
-        )
+    elif phases.get("useCOM"):
+        centre = setfields.get("centre")
+        if centre and len(centre) >= 2:
+            _add(
+                result,
+                "detonation_height",
+                float(centre[1]),
+                FieldProvenance.DERIVED,
+                source_file=phases.get("path", ""),
+                reason="phaseProperties useCOM yes → charge centre",
+            )
 
     _add(
         result,
@@ -1036,7 +1045,11 @@ def map_imported_case_to_gui(
         reason="setFieldsDict present",
     )
 
-    # Atmosphere
+    
+
+def map_atmosphere(result: ImportMappingResult, case_dir: str, notes: List[str]) -> None:
+    """Map atmospheric pressure and temperature when recoverable."""
+# Atmosphere
     p_atm = _parse_uniform_field(case_dir, "p")
     if p_atm is not None:
         _add(
@@ -1074,7 +1087,11 @@ def map_imported_case_to_gui(
             apply_gui=False,
         )
 
-    # Boundaries: prefer 0/ field BC types (authoritative physics), then blockMeshDict.
+    
+
+def map_boundaries(result: ImportMappingResult, case_dir: str, block: dict, notes: List[str]) -> None:
+    """Map logical outer/top/bottom boundary types from fields and patches."""
+# Boundaries: prefer 0/ field BC types (authoritative physics), then blockMeshDict.
     # Official axisymmetricCharge uses ground type patch + U=slip / p=zeroGradient.
     bm_text = ""
     if block.get("path") and os.path.isfile(block["path"]):
@@ -1200,7 +1217,11 @@ def map_imported_case_to_gui(
                 reason=reason or f"boundary mapping for {label}",
             )
 
-    # Solver / controlDict — editable when keys exist
+    
+
+def map_solver_controls(result: ImportMappingResult, control: dict, decompose: dict, notes: List[str]) -> None:
+    """Map solver/controlDict and decomposition controls."""
+# Solver / controlDict — editable when keys exist
     def _float_ctrl(of_key: str, gui_key: str) -> None:
         if of_key not in control:
             _add(
@@ -1340,7 +1361,11 @@ def map_imported_case_to_gui(
             reason="decomposeParDict numberOfSubdomains",
         )
 
-    # Mesh / AMR
+    
+
+def map_mesh(result: ImportMappingResult, dyn: dict, setfields: dict, notes: List[str], shape=None) -> None:
+    """Map mesh mode and AMR / seed controls."""
+# Mesh / AMR
     dynamic_mesh = bool(
         dyn.get("path") and dyn.get("dynamicFvMesh") != "staticFvMesh"
     )
@@ -1533,7 +1558,11 @@ def map_imported_case_to_gui(
             reason="setFieldsDict nBufferLayers",
         )
 
-    # Generator2D writes native probes in controlDict/functions/probes2d.
+    
+
+def map_output(result: ImportMappingResult, control_probes, control_output_fields, notes: List[str]) -> None:
+    """Map probes and output field selections."""
+# Generator2D writes native probes in controlDict/functions/probes2d.
     result.probes = control_probes
     if control_probes:
         result.gui_values["probes"] = list(control_probes)
@@ -1542,7 +1571,11 @@ def map_imported_case_to_gui(
     if not control_probes:
         notes.append("No compatible probe table found — probe list left empty.")
 
-    # Converted imported cases are fully editable GGUI models: mark every
+    
+
+def build_mapping_result(result: ImportMappingResult, notes: List[str]):
+    """Finalize editable flags, summaries, unsupported features, and notes."""
+# Converted imported cases are fully editable GGUI models: mark every
     # recovered DIRECT/DERIVED field that applies to the GUI as editable.
     for key, mf in list(result.fields.items()):
         if (
@@ -1603,3 +1636,35 @@ def map_imported_case_to_gui(
     )
     result.notes = tuple(notes)
     return result
+
+
+def map_imported_case_to_gui(
+    case_dir: str,
+    classification: Optional[ClassificationResult] = None,
+) -> ImportMappingResult:
+    """Build a typed mapping from an imported working-case directory."""
+    case_dir = os.path.normpath(case_dir)
+    classification = classification or classify_case_topology(case_dir)
+    result = ImportMappingResult()
+    notes: List[str] = []
+
+    block = _parse_block_mesh(case_dir)
+    control = _parse_control(case_dir)
+    decompose = _parse_decompose(case_dir)
+    control_probes, control_output_fields = _parse_control_probes(control)
+    setfields = _parse_setfields(case_dir)
+    phases = _parse_phase_properties(case_dir)
+    dyn = _parse_dynamic_mesh(case_dir)
+    ev = classification.evidence
+
+    _domain_radius, domain_height = map_domain(result, block, ev, notes)
+    shape = map_charge(result, setfields, phases, notes, height=domain_height)
+    map_material(result, setfields, phases, notes, shape=shape)
+    map_atmosphere(result, case_dir, notes)
+    map_boundaries(result, case_dir, block, notes)
+    map_solver_controls(result, control, decompose, notes)
+    map_mesh(result, dyn, setfields, notes, shape=shape)
+    map_output(result, control_probes, control_output_fields, notes)
+    return build_mapping_result(result, notes)
+
+

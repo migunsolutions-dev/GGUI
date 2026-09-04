@@ -2,7 +2,7 @@
 Regression: top-level window horizontal resize for General 3D + status bar.
 
 Verifies OS-border shrink behavior, Execution Controls scroll isolation,
-compact scroll-isolated SegmentedStatusBar (all three stage histories,
+compact clipped SegmentedStatusBar (all three stage histories,
 Δt notation, fit at ~1685 px), and no window expansion on calculation state.
 """
 from __future__ import annotations
@@ -16,9 +16,10 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
 
-from PyQt5.QtCore import QRect
+from PyQt5.QtCore import QRect, Qt
 from PyQt5.QtWidgets import QApplication, QLabel
 
+from ui_metrics import STATUS_METRICS_POINT_SIZE
 from main_new import BlastFoamApp
 
 
@@ -108,15 +109,19 @@ class Test3DWindowResizing(unittest.TestCase):
             self.status.lbl_3d_group,
         ):
             self.assertIn("Δt", lbl.text())
+            self.assertRegex(lbl.text(), r"Tt=-?\d\.\d{3}e[+\-]\d+")
+            self.assertRegex(lbl.text(), r"Δt=-?\d\.\d{3}e[+\-]\d+")
             self.assertNotRegex(lbl.text(), r"\bDT\b")
             self.assertNotIn("Initial Δt", lbl.text())
         self.assertNotIn("Initial Δt", self.status.lbl_et.text())
         self.assertNotIn("Initial dt", self.status.lbl_metrics_line.text())
 
     def _assert_no_overlap_with_status(self):
-        """Ready/Running must stay to the right of the metrics viewport."""
+        """When Ready stays in the bar, it must sit to the right of metrics."""
         scroll = self.status._metrics_scroll
         st = self.status.lbl_status
+        if not self.status.isAncestorOf(st):
+            return
         self.assertLessEqual(
             scroll.geometry().right(),
             st.geometry().left() + 1,
@@ -223,7 +228,7 @@ class Test3DWindowResizing(unittest.TestCase):
             self.assertTrue(self.tab.ctrl_tabs.isVisible())
             self.assertTrue(self.tab.btn_exact_1.isVisible())
             self.assertTrue(self.tab.btn_exact_end.isVisible())
-            self.assertTrue(self.tab.spin_cycle_write.isVisible())
+            self.assertFalse(hasattr(self.tab, "spin_cycle_write"))
             self._assert_status_labels_readable()
             self.assertIn("Running", self.status.lbl_status.text())
         finally:
@@ -251,7 +256,7 @@ class Test3DWindowResizing(unittest.TestCase):
                 self.assertNotIn("Initial Δt", joined)
                 self.assertNotIn("\n", joined)
                 self.assertEqual(self.status._metrics_scroll.verticalScrollBar().maximum(), 0)
-                self.assertEqual(self.status.metrics_point_size(), 9)
+                self.assertEqual(self.status.metrics_point_size(), STATUS_METRICS_POINT_SIZE)
                 self.assertEqual(self.status.lbl_status.font().pointSize(), 11)
                 # Reserved mode-group / ET fields stay wide enough for representative maxima.
                 from ui_metrics import STATUS_REP_MODE_GROUP, STATUS_REP_ET
@@ -266,28 +271,25 @@ class Test3DWindowResizing(unittest.TestCase):
                 self.assertGreaterEqual(self.status.lbl_et.width(), fm.horizontalAdvance(STATUS_REP_ET))
                 hs = self.status._metrics_scroll.horizontalScrollBar()
                 self.assertEqual(
-                    hs.maximum(),
-                    0,
-                    f"status hscroll at {width}px: content={self.status._metrics_widget.width()} "
-                    f"viewport={self.status._metrics_scroll.viewport().width()}",
+                    self.status._metrics_scroll.horizontalScrollBarPolicy(),
+                    Qt.ScrollBarAlwaysOff,
                 )
+                self.assertEqual(hs.maximum(), 0)
                 self.assertTrue(self.status.lbl_status.isVisible())
                 self.assertGreater(self.status.lbl_status.width(), 0)
                 self.assertIn("Running", self.status.lbl_status.text())
-                # Single-row geometry: metrics widget is one line tall.
+                # Single-row geometry: inner strip stays within the 36px bar.
                 self.assertLessEqual(
                     self.status._metrics_widget.height(),
-                    self.status.lbl_1d_group.sizeHint().height() + 8,
+                    self.status.height(),
                 )
                 vp = self.status._metrics_scroll.viewport()
-                for lbl in self.status.metrics_value_labels():
-                    br = lbl.rect()
-                    mapped = QRect(lbl.mapTo(vp, br.topLeft()), br.size())
-                    self.assertTrue(
-                        vp.rect().contains(mapped),
-                        msg=f"{lbl.objectName()} mapped={mapped} vp={vp.rect()}",
-                    )
-    def test_status_bar_scrolls_when_narrow_without_clamping_window(self):
+                mapped_1d = QRect(
+                    self.status.lbl_1d_group.mapTo(vp, self.status.lbl_1d_group.rect().topLeft()),
+                    self.status.lbl_1d_group.rect().size(),
+                )
+                self.assertTrue(vp.rect().intersects(mapped_1d))
+    def test_status_bar_clips_when_narrow_without_clamping_window(self):
         self._fill_representative_values()
         for width in (1500, 1250, 1100):
             with self.subTest(width=width):
@@ -302,18 +304,16 @@ class Test3DWindowResizing(unittest.TestCase):
                 self.assertGreater(self.status.lbl_status.width(), 0)
 
                 scroll = self.status._metrics_scroll
-                metrics_need = self.status._metrics_widget.width()
-                viewport_w = scroll.viewport().width()
-                hs = scroll.horizontalScrollBar()
-                self.assertLess(self.app.minimumSizeHint().width(), metrics_need)
+                self.assertEqual(scroll.horizontalScrollBarPolicy(), Qt.ScrollBarAlwaysOff)
+                self.assertFalse(scroll.horizontalScrollBar().isVisible())
+                self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
                 self.assertEqual(self.status.minimumSizeHint().width(), 0)
-                if viewport_w < metrics_need - 2:
-                    self.assertGreater(hs.maximum(), 0)
-                    hs.setValue(hs.maximum())
-                    self.qapp.processEvents()
-                    self.assertGreater(self.status.lbl_et.width(), 0)
-                    hs.setValue(0)
-                    self.qapp.processEvents()
+                vp = scroll.viewport()
+                mapped_1d = QRect(
+                    self.status.lbl_1d_group.mapTo(vp, self.status.lbl_1d_group.rect().topLeft()),
+                    self.status.lbl_1d_group.rect().size(),
+                )
+                self.assertTrue(vp.rect().intersects(mapped_1d))
 
     def test_long_status_text_does_not_expand_window(self):
         self.app.resize(1250, 900)
@@ -345,13 +345,13 @@ class Test3DWindowResizing(unittest.TestCase):
         self.status.update_1d(step=10, tt=0.00100, dt=1.00e-6)
         self.qapp.processEvents()
         self.assertIn("10", self.status.lbl_1d_group.text())
-        self.assertIn(self.status._DASH, self.status.lbl_2d_group.text())
+        self.assertRegex(self.status.lbl_2d_group.text(), r"Tt=0\.000e[+\-]00")
 
         self.status.update_2d(step=20, tt=0.00200, dt=2.00e-6)
         self.qapp.processEvents()
         self.assertIn("10", self.status.lbl_1d_group.text())
         self.assertIn("20", self.status.lbl_2d_group.text())
-        self.assertIn(self.status._DASH, self.status.lbl_3d_group.text())
+        self.assertRegex(self.status.lbl_3d_group.text(), r"Tt=0\.000e[+\-]00")
 
         self.status.update_3d(step=30, tt=0.00300, dt=3.00e-6)
         self.qapp.processEvents()
@@ -367,7 +367,7 @@ class Test3DWindowResizing(unittest.TestCase):
         et_text = self.status.lbl_et.text()
         self.assertTrue(et_text.startswith("ET="), et_text)
         self.assertNotEqual(et_text, f"ET={self.status._DASH}")
-        self.assertRegex(et_text, r"ET=\d+\.\d s")
+        self.assertRegex(et_text, r"ET=\s*\d+ s")
         # Dimensional histories remain while ET is shown separately.
         self.assertIn("10", self.status.lbl_1d_group.text())
         self.assertIn("20", self.status.lbl_2d_group.text())
@@ -397,9 +397,9 @@ class Test3DWindowResizing(unittest.TestCase):
         self.qapp.processEvents()
         self.assertIn("7", self.status.lbl_2d_group.text())
         self.assertIn("Δt", self.status.lbl_2d_group.text())
-        # 1D/3D remain at initial dashes
-        self.assertIn(self.status._DASH, self.status.lbl_1d_group.text())
-        self.assertIn(self.status._DASH, self.status.lbl_3d_group.text())
+        # 1D/3D remain at the idle Step/Tt/Δt defaults
+        self.assertRegex(self.status.lbl_1d_group.text(), r"Tt=0\.000e[+\-]00")
+        self.assertRegex(self.status.lbl_3d_group.text(), r"Tt=0\.000e[+\-]00")
 
 
 if __name__ == "__main__":

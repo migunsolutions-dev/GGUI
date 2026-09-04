@@ -45,6 +45,9 @@ JWL_PARAMETERS: Dict[str, Dict[str, Any]] = {
 # Shared thermodynamic template coefficients (not a material identity fallback).
 DEFAULT_CV_COEFFS = (413.15, 2.1538)
 
+# JWL-specific keys validated by ``jwl_parameters`` for Custom materials.
+# Density (rho) and GUI energy are validated by ``material_validation`` /
+# ``validate_required_values`` before any generator calls ``jwl_parameters``.
 REQUIRED_CUSTOM_JWL_KEYS = ("A", "B", "R1", "R2", "omega")
 
 
@@ -53,10 +56,18 @@ def materials_copy() -> Dict[str, Dict[str, Any]]:
 
 
 def jwl_parameters(material_name: str, custom: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    """Return JWL parameters for a known catalog material or a complete Custom dict.
+    """Return JWL EOS parameters for a known catalog material or complete Custom.
 
-    Never substitutes another catalog material (including C4/TNT) when the name is
-    unknown or Custom parameters are incomplete.
+    Responsibility split (Checkpoint 3):
+    * ``jwl_parameters`` validates **JWL-specific** Custom keys
+      (``A``, ``B``, ``R1``, ``R2``, ``omega``, and ``E0``/``energy``).
+    * Density (``rho`` / ``rho_charge``) is **not** validated here — it is
+      enforced by ``material_validation.validate_material_definition`` /
+      ``validate_required_values`` before generation. Generators also write
+      ``inputs.rho_charge`` separately into phaseProperties.
+
+    Never substitutes another catalog material when the name is unknown or
+    Custom JWL parameters are incomplete.
     """
     name = str(material_name or "").strip()
     if name == "Custom":
@@ -65,16 +76,11 @@ def jwl_parameters(material_name: str, custom: Dict[str, Any] | None = None) -> 
                 "Custom material requires a complete parameter dictionary."
             )
         missing = [key for key in REQUIRED_CUSTOM_JWL_KEYS if key not in custom]
-        has_energy = "E0" in custom or "energy" in custom
-        if not has_energy:
+        if "E0" not in custom and "energy" not in custom:
             missing.append("E0 (or energy)")
-        if "rho" not in custom:
-            # rho is required for case generation completeness checks; phase
-            # properties also consume inputs.rho_charge separately.
-            pass
         if missing:
             raise IncompleteMaterialError(
-                "Custom material is incomplete; missing required parameter(s): "
+                "Custom material is incomplete; missing required JWL parameter(s): "
                 + ", ".join(missing)
                 + "."
             )
@@ -95,7 +101,10 @@ def jwl_parameters(material_name: str, custom: Dict[str, Any] | None = None) -> 
         for key, number in values.items():
             if key == "CvCoeffs":
                 continue
-            if not isinstance(number, float) or number != number or number in (float("inf"), float("-inf")):
+            if not isinstance(number, float) or number != number or number in (
+                float("inf"),
+                float("-inf"),
+            ):
                 raise IncompleteMaterialError(
                     f"Custom material parameter {key!r} is non-finite."
                 )

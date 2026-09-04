@@ -18,6 +18,7 @@ from axisymmetric_2d import BOUNDARY_SLIP, DYNAMIC_MESH, validate_case_inputs_2d
 from case_loader_2d import inspect_imported_axisymmetric_case
 from external_case_workflow_2d import inventory_case
 from generator_2d import Generator2D
+import preparation_service_2d
 from imported_case_mapping_2d import FieldProvenance, full_sphere_mass_kg, map_imported_case_to_gui
 from models_2d import CaseInputs2D, ProbePoint2D
 from physical_charge_geometry import physical_charge_geometry
@@ -233,6 +234,7 @@ class GeneratedCaseRoundTripTests(unittest.TestCase):
                 buffer_layers=3,
                 dyn_refine_max=3,
                 cycle_write=4,
+                keep_openfoam_time_folders=True,
                 cores=3,
                 probes=(ProbePoint2D("near", 0.5, 4.0),),
                 output_fields=("p", "alpha.c4"),
@@ -315,6 +317,7 @@ class ImportUiEditableTests(unittest.TestCase):
         for p in cls._patches:
             p.start()
         cls.win = BlastFoamApp()
+        cls.win._force_sync_prep = True
 
     @classmethod
     def tearDownClass(cls):
@@ -363,6 +366,7 @@ class ImportInitUsesGeneratorTests(unittest.TestCase):
         for p in cls._patches:
             p.start()
         cls.win = BlastFoamApp()
+        cls.win._force_sync_prep = True
 
     @classmethod
     def tearDownClass(cls):
@@ -381,14 +385,16 @@ class ImportInitUsesGeneratorTests(unittest.TestCase):
             with mock.patch.object(self.win, "base_projects_path", str(case_root)):
                 self.win.open_openfoam_case_path(str(source))
             generated = []
+            original_generate = Generator2D.generate
 
-            def fake_generate(name, inputs):
-                out = Path(td) / "generated" / name
-                Generator2D(str(out.parent)).generate(name, inputs)
+            def fake_generate(generator, name, inputs):
+                out = original_generate(generator, name, inputs)
                 generated.append(str(out))
                 return str(out)
 
-            def fake_run(case_dir, command):
+            def fake_run(case_dir, command, **_kwargs):
+                from wsl_runtime import WslRunResult
+
                 Path(case_dir, "log.checkMesh").write_text(
                     "Mesh OK\n", encoding="utf-8"
                 )
@@ -401,12 +407,12 @@ class ImportInitUsesGeneratorTests(unittest.TestCase):
                     'FoamFile { note "nCells: 400"; }\n4\n(0\n1\n2\n3\n)\n',
                     encoding="utf-8",
                 )
-                return True
+                return WslRunResult(ok=True, exit_code=0)
 
             with mock.patch.object(
-                self.win.service, "generate_case", side_effect=fake_generate
+                Generator2D, "generate", autospec=True, side_effect=fake_generate
             ) as gen, mock.patch.object(
-                self.win, "_run_wsl_commands", side_effect=fake_run
+                preparation_service_2d, "run_initialization_wsl", side_effect=fake_run
             ) as run, mock.patch(
                 "main_new.prepare_working_copy"
             ) as prepare, mock.patch.object(
@@ -414,6 +420,7 @@ class ImportInitUsesGeneratorTests(unittest.TestCase):
             ), mock.patch.object(
                 self.win.tab_2d.viewer, "set_field", autospec=True
             ):
+                self.win._force_sync_prep = True
                 self.win.on_initialize_imported_model_2d()
                 gen.assert_called_once()
                 run.assert_called_once()

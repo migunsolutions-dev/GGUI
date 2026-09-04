@@ -46,6 +46,52 @@ def _minimal(**overrides):
 
 
 class Generator3DWriteTests(unittest.TestCase):
+    def test_shared_write_frequency_drives_native_and_surface_outputs(self) -> None:
+        inp = _minimal(
+            write_control_type="timeStep",
+            write_interval_steps=37,
+            write_volumes=False,
+            write_surfaces=True,
+            keep_openfoam_time_folders=True,
+            cycle_write=6,
+            probe_points=((0.0, 0.0, 1.0),),
+            probe_fields=("p", "impulse", "dynamicPressure"),
+            enable_post_processing=True,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            case_dir = Generator3D(td).generate("shared_output_rate", inp)
+            with open(
+                os.path.join(case_dir, "system", "controlDict"), encoding="utf-8"
+            ) as stream:
+                control = stream.read()
+        self.assertIn("writeControl    timeStep;", control)
+        self.assertIn("writeInterval   37;", control)
+        self.assertIn("cycleWrite      6;", control)
+        self.assertIn("type            surfaces;", control)
+        self.assertGreaterEqual(control.count("writeInterval   37;"), 2)
+        self.assertGreaterEqual(control.count("writeInterval   1;"), 4)
+
+    def test_retention_off_disables_cycle_without_changing_requested_rate(self) -> None:
+        inp = _minimal(
+            write_control_type="adjustableRunTime",
+            write_interval_time=0.00023,
+            keep_openfoam_time_folders=False,
+            cycle_write=8,
+            probe_points=((0.0, 0.0, 1.0),),
+            probe_fields=("p", "impulse", "dynamicPressure"),
+            enable_post_processing=True,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            case_dir = Generator3D(td).generate("normal_storage", inp)
+            with open(
+                os.path.join(case_dir, "system", "controlDict"), encoding="utf-8"
+            ) as stream:
+                control = stream.read()
+        self.assertIn("writeControl    adjustableRunTime;", control)
+        self.assertIn("writeInterval   0.00023;", control)
+        self.assertIn("cycleWrite      0;", control)
+        self.assertGreaterEqual(control.count("writeInterval   1;"), 4)
+
     def test_cylinder_outer_snappy_is_searchable_cylinder(self) -> None:
         inp = _minimal(
             charge_shape="Cylinder",

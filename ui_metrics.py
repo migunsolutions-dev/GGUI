@@ -23,16 +23,35 @@ INFO_PANEL_HEIGHT = 140
 # 1D / 2D lower execution region (vertical splitter allocation).
 EXECUTION_AREA_MIN_HEIGHT = 180
 EXECUTION_AREA_PREFERRED_HEIGHT = 230
+# 2D stacked actions + Solver Controls need a taller opening pane than 1D
+# so Simulation Control and Solver Controls fit without a vertical scrollbar.
+EXECUTION_AREA_PREFERRED_HEIGHT_2D = 420
 
 # Readable status-bar fonts (fixed; never scaled down with window width).
-# Metrics: single non-wrapping row at 9 pt monospace. Ready/Running stays 11 pt.
-STATUS_METRICS_POINT_SIZE = 9
+# Metrics: 8 pt bold monospace so 1D|2D|3D|ET fits the 1685 opening width.
+# Ready/Running stays 11 pt.
+STATUS_METRICS_POINT_SIZE = 8
 STATUS_READY_POINT_SIZE = 11
-STATUS_FONT_MIN_POINT_SIZE = 9
+STATUS_FONT_MIN_POINT_SIZE = 8
+
+# Step shows 0 until a solver reports a value. The field is 7 digits wide
+# (the idle 0 plus room for six more → max 9999999).
+STATUS_STEP_WIDTH = 7
+STATUS_REP_STEP = "9" * STATUS_STEP_WIDTH
+STATUS_SCI_DIGITS = 3
+STATUS_REP_SCI = "9.999e-99"
+STATUS_REP_TT = STATUS_REP_SCI
+STATUS_REP_DT = STATUS_REP_SCI
+
+# ET idle 0 is right-aligned in 6 digits; values >= 1e6 use scientific notation.
+STATUS_ET_WIDTH = 6
+STATUS_ET_SCI_THRESHOLD = 10 ** STATUS_ET_WIDTH
+STATUS_REP_ET = f"ET={STATUS_REP_SCI} s"
 
 # Representative full mode-group string for reserved label width (monospace).
-STATUS_REP_MODE_GROUP = "3D: Step=12345678  Tt=1.234567e-04  Δt=1.234e-07"
-STATUS_REP_ET = "ET=12345.6 s"
+STATUS_REP_MODE_GROUP = (
+    f"3D: Step={STATUS_REP_STEP} Tt={STATUS_REP_TT} Δt={STATUS_REP_DT}"
+)
 
 # Primary action buttons (1D Run / Interrupt, etc.). Point size — not px.
 ACTION_BUTTON_FONT_PT = 10

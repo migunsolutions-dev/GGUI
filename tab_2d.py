@@ -1,27 +1,34 @@
 """Production Cylindrical–2D axisymmetric workflow tab."""
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import asdict, replace
 from typing import Dict, List
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import QPoint, QTimer, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QStyle,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -32,6 +39,7 @@ from PyQt5.QtWidgets import (
 )
 
 from axisymmetric_2d import (
+    BOUNDARY_OPEN,
     BOUNDARY_SLIP,
     DIRECT_SOURCE,
     DYNAMIC_MESH,
@@ -42,6 +50,7 @@ from axisymmetric_2d import (
 )
 from axisymmetric_viewer import AxisymmetricViewerWidget
 from charge_seed_plan import SEED_MODE_AUTO, SEED_MODE_MANUAL, SEED_MODE_OFF
+from dialogs import RemapFromDialog
 from external_case_workflow_2d import ImportMode2D, import_mode_label
 from imported_case_mapping_2d import FieldProvenance
 from material_catalog import materials_copy
@@ -56,22 +65,102 @@ from models_2d import (
 
 MATERIAL_UNDEFINED_PLACEHOLDER = "— select material —"
 UNDEFINED_CONTROL_STYLE = "background-color: #fff3cd;"
+VIEW_FIELD_OPTIONS = (
+    ("p", "Pressure"),
+    ("rho", "Density"),
+    ("T", "Temperature"),
+    ("U", "Velocity"),
+    ("alpha.c4", "Explosive fraction"),
+    ("cellLevel", "Refinement level"),
+)
 from physical_charge_geometry import physical_charge_geometry
 from ui_metrics import (
-    ACTION_BUTTON_FONT_PT,
     COMPUTATIONAL_LEFT_PANEL_MIN,
     COMPUTATIONAL_LEFT_PANEL_WIDTH,
     CONTROL_MAX_WIDTH_DEFAULT,
     EXECUTION_AREA_MIN_HEIGHT,
-    EXECUTION_AREA_PREFERRED_HEIGHT,
     FORM_ROW_SPACING,
     GROUP_MARGINS,
-    INFO_PANEL_HEIGHT,
     INFO_ROW_STYLE,
     INFO_TITLE_STYLE,
     SECONDARY_INFO_STYLE,
     WARNING_STYLE,
 )
+
+
+class TimeComboBox(QComboBox):
+    """Time selector. The on-disk catalog is loaded only when the popup opens."""
+
+    popup_requested = pyqtSignal()
+
+    def showPopup(self):
+        self.popup_requested.emit()
+        super().showPopup()
+
+
+def compact_spin_text(value: float, max_decimals: int) -> str:
+    """Whole values have no decimal; other values keep one trailing zero."""
+    if not math.isfinite(value):
+        return ""
+    places = max(0, int(max_decimals))
+    rounded = round(float(value), places)
+    if places == 0 or abs(rounded - round(rounded)) < 10 ** (-places):
+        return str(int(round(rounded)))
+    text = f"{rounded:.{places}f}".rstrip("0")
+    if "." not in text or text.endswith("."):
+        return str(int(round(rounded)))
+    return text + "0"
+
+
+class CompactDoubleSpinBox(QDoubleSpinBox):
+    """Setup numeric field: right-aligned compact display, stored value unchanged."""
+
+    def textFromValue(self, value: float) -> str:
+        return compact_spin_text(float(value), self.decimals())
+
+
+def latest_case_1d_dir(work_root: str) -> str:
+    """Newest Case_1D_* folder under the Work/run directory, or empty."""
+    if not work_root or not os.path.isdir(work_root):
+        return ""
+    try:
+        names = os.listdir(work_root)
+    except OSError:
+        return ""
+    newest_name = ""
+    newest_path = ""
+    for name in names:
+        if not name.startswith("Case_1D_"):
+            continue
+        path = os.path.join(work_root, name)
+        if os.path.isdir(path) and name > newest_name:
+            newest_name = name
+            newest_path = path
+    return os.path.normpath(newest_path) if newest_path else ""
+
+
+def case_dir_from_picked_path(path: str) -> str:
+    """Map a picked results file or folder to the OpenFOAM case root."""
+    path = os.path.normpath(path) if path else ""
+    if not path:
+        return ""
+    if os.path.isfile(path):
+        parent = os.path.dirname(path)
+        name = os.path.basename(path).lower()
+        if name.endswith(".foam") and os.path.isdir(os.path.join(parent, "system")):
+            return parent
+        if os.path.isdir(os.path.join(parent, "system")):
+            return parent
+        grand = os.path.dirname(parent)
+        if os.path.isdir(os.path.join(grand, "system")):
+            return grand
+        return parent
+    if os.path.isdir(os.path.join(path, "system")):
+        return path
+    parent = os.path.dirname(path)
+    if os.path.isdir(os.path.join(parent, "system")):
+        return parent
+    return path
 
 
 class Tab2D(QWidget):
@@ -88,6 +177,7 @@ class Tab2D(QWidget):
         self._state = SimulationState2D.DRAFT
         self._loading = False
         self._actual_cell_count = None
+        self._initialized_charge_cell_count = None
         self._active_case_dir = None
         self._imported_case = None
         self._import_mode = ImportMode2D.NATIVE_GGUI_2D
@@ -96,6 +186,24 @@ class Tab2D(QWidget):
         self._case_defined_gui_keys = set()
         self._undefined_gui_keys = set()
         self._unsupported_features = []
+        self._defer_viewer_preview = False
+        self._pending_setup_preview = None
+        self._source_cases_root = ""
+        self._remap_case_path = ""
+        self._remap_from_last_1d = True
+        self._remap_kind = RemapFromDialog.CURRENT_1D
+        self._last_1d_case_dir = ""
+        self._enable_impulse = True
+        self._enable_dynamic_pressure = False
+        self._output_remap_data = False
+        self._keep_openfoam_time_folders = False
+        self._cycle_write = 0
+        self._vtk_fields = ("p",)
+        self._output_option_fields = ("p",)
+        self._preview_flush_timer = QTimer(self)
+        self._preview_flush_timer.setSingleShot(True)
+        self._preview_flush_timer.timeout.connect(self._flush_setup_preview)
+        self._execution_pane_opening_applied = False
         self._build_ui()
         self.viewer.cell_count_updated.connect(self._on_cell_count_updated)
         self.viewer.log_scale_rejected.connect(self._on_log_scale_rejected)
@@ -130,23 +238,41 @@ class Tab2D(QWidget):
         running = state == SimulationState2D.RUNNING or (
             self._import_mode == ImportMode2D.IMPORTED_2D_RUNNING
         )
-        initialized = state in (
-            SimulationState2D.INITIALIZED,
-            SimulationState2D.INTERRUPTED,
-            SimulationState2D.COMPLETED,
-        ) or self._import_mode == ImportMode2D.IMPORTED_2D_READY
+        from state_machine_2d import can_run
+
+        # Buttons derive from the explicit state machine; STALE/FAILED/INITIALIZING
+        # never look initialized. Imported-ready mode is an additional enablement path.
+        initialized = can_run(state) or (
+            self._import_mode == ImportMode2D.IMPORTED_2D_READY
+            and state
+            not in (
+                SimulationState2D.INITIALIZING,
+                SimulationState2D.FAILED,
+                SimulationState2D.STALE,
+            )
+        )
         self._apply_action_buttons(running=running, initialized=initialized)
         self.sig_state_changed.emit(state.value)
+        if hasattr(self, "_info_row_widgets"):
+            self._refresh_info()
 
     def _apply_action_buttons(
         self, *, running: bool = False, initialized: bool = False
     ) -> None:
         self.btn_initialize.setText("Initialise Model")
-        self.btn_initialize.setMinimumWidth(140)
+        self.btn_initialize.setMinimumWidth(198)
         if not self.is_imported_mode:
-            self.btn_initialize.setEnabled(not running)
-            self.btn_exact_end.setEnabled(initialized and not running)
-            self.btn_stop.setEnabled(running)
+            preparing = self._state == SimulationState2D.INITIALIZING
+            self.btn_initialize.setEnabled(not running and not preparing)
+            self.btn_exact_end.setEnabled(initialized and not running and not preparing)
+            if preparing:
+                self.btn_stop.setText("Cancel Preparation")
+                self.btn_stop.setEnabled(True)
+                self.btn_stop.setToolTip("Cancel the active 2D preparation operation")
+            else:
+                self.btn_stop.setText("Interrupt")
+                self.btn_stop.setToolTip("")
+                self.btn_stop.setEnabled(running)
             return
 
         mode = self._import_mode
@@ -157,7 +283,9 @@ class Tab2D(QWidget):
         elif mode == ImportMode2D.IMPORTED_2D_INITIALIZING:
             self.btn_initialize.setEnabled(False)
             self.btn_exact_end.setEnabled(False)
-            self.btn_stop.setEnabled(False)  # prep has no safe interrupt yet
+            self.btn_stop.setText("Cancel Preparation")
+            self.btn_stop.setEnabled(True)
+            self.btn_stop.setToolTip("Cancel the active 2D preparation operation")
         elif mode == ImportMode2D.IMPORTED_2D_READY:
             self.btn_initialize.setText("Reinitialise")
             self.btn_initialize.setEnabled(not running)
@@ -193,6 +321,7 @@ class Tab2D(QWidget):
         self._import_mode = state.mode
         self._active_case_dir = state.active_case_path
         self._actual_cell_count = state.cell_count
+        self._initialized_charge_cell_count = state.charge_cell_count
         if apply_mapping:
             self._apply_import_mapping(state)
         self._update_provenance_banner()
@@ -206,8 +335,7 @@ class Tab2D(QWidget):
             field = "alpha.c4" if "alpha.c4" in state.fields else (
                 "p" if "p" in state.fields else (state.fields[0] if state.fields else "p")
             )
-            if self.cmb_field.findText(field) < 0:
-                self.cmb_field.addItem(field)
+            self._ensure_view_field_option(field)
             self.cmb_field.setCurrentText(field)
             self.viewer.load_case(state.active_case_path)
             self.viewer.set_field(field)
@@ -231,21 +359,49 @@ class Tab2D(QWidget):
         self.load_imported_case(state)
 
     def clear_imported_case(self) -> None:
-        self._imported_case = None
-        self._import_mode = ImportMode2D.NATIVE_GGUI_2D
-        self._imported_field_meta = {}
-        self._unrecovered_gui_keys = set()
-        self._case_defined_gui_keys = set()
-        self._clear_all_undefined_controls()
-        self._unsupported_features = []
-        self._restore_native_control_editability()
-        if hasattr(self, "lbl_import_banner"):
-            self.lbl_import_banner.setVisible(False)
-        self.btn_initialize.setText("Initialise Model")
-        self.btn_initialize.setMinimumWidth(140)
-        self.set_simulation_state(SimulationState2D.DRAFT)
-        self._apply_enablement()
-        self._apply_action_buttons(running=False, initialized=False)
+        was_loading = self._loading
+        self._loading = True
+        try:
+            self._imported_case = None
+            self._import_mode = ImportMode2D.NATIVE_GGUI_2D
+            self._imported_field_meta = {}
+            self._unrecovered_gui_keys = set()
+            self._case_defined_gui_keys = set()
+            self._clear_all_undefined_controls()
+            # Undefined spins restore to their minimum (often 0). Reinstate native
+            # defaults so a subsequent Setup Preview refresh cannot abort on
+            # non-positive physics inputs.
+            defaults = CaseInputs2D()
+            if float(self.spin_mass.value()) <= 0.0:
+                self.spin_mass.setValue(float(defaults.mass_kg or 1.0))
+            if float(self.spin_density.value()) <= 0.0:
+                self.spin_density.setValue(float(defaults.rho_charge or 1600.0))
+            if float(self.spin_energy.value()) <= 0.0:
+                self.spin_energy.setValue(float(defaults.energy_j_per_kg or 4.5e6))
+            if float(self.spin_cell.value()) <= 0.0:
+                self.spin_cell.setValue(float(defaults.cell_size or 0.05))
+            if self.cmb_material.currentText() in ("", MATERIAL_UNDEFINED_PLACEHOLDER):
+                self.cmb_material.setCurrentText(str(defaults.material_name or "TNT"))
+            self._unsupported_features = []
+            self._restore_native_control_editability()
+            self._active_case_dir = None
+            self._actual_cell_count = None
+            self._initialized_charge_cell_count = None
+            if hasattr(self, "lbl_import_banner"):
+                self.lbl_import_banner.setVisible(False)
+            self.btn_initialize.setText("Initialise Model")
+            self.btn_initialize.setMinimumWidth(198)
+            try:
+                clearer = getattr(self.viewer, "clear_simulation_view", None)
+                if callable(clearer):
+                    clearer()
+            except Exception:
+                pass
+            self.set_simulation_state(SimulationState2D.DRAFT)
+            self._apply_enablement()
+            self._apply_action_buttons(running=False, initialized=False)
+        finally:
+            self._loading = was_loading
 
     def clear_external_case(self) -> None:
         self.clear_imported_case()
@@ -255,11 +411,6 @@ class Tab2D(QWidget):
             return
         self.set_import_mode(ImportMode2D.IMPORTED_2D_INITIALIZING)
         self.lbl_state.setText(f"State: Initialising imported case ({utility})")
-        from PyQt5.QtWidgets import QApplication
-
-        app = QApplication.instance()
-        if app:
-            app.processEvents()
 
     def _update_provenance_banner(self) -> None:
         if not hasattr(self, "lbl_import_banner"):
@@ -421,19 +572,26 @@ class Tab2D(QWidget):
             widget.setToolTip("")
 
     def _clear_all_undefined_controls(self) -> None:
-        for key in list(self._undefined_gui_keys):
-            self._clear_control_undefined(key)
-        self._undefined_gui_keys.clear()
-        # Ensure placeholder is removed when leaving imported undefined state.
-        if hasattr(self, "cmb_material"):
-            idx = self.cmb_material.findText(MATERIAL_UNDEFINED_PLACEHOLDER)
-            if idx >= 0:
-                current = self.cmb_material.currentText()
-                self.cmb_material.removeItem(idx)
-                if current == MATERIAL_UNDEFINED_PLACEHOLDER:
-                    self.cmb_material.setCurrentText("TNT")
-            self.cmb_material.setStyleSheet("")
-            self.cmb_material.setToolTip("")
+        # Suppress spin/combo change handlers while restoring defaults — those
+        # handlers refresh the VTK preview and can abort offscreen plotters.
+        was_loading = self._loading
+        self._loading = True
+        try:
+            for key in list(self._undefined_gui_keys):
+                self._clear_control_undefined(key)
+            self._undefined_gui_keys.clear()
+            # Ensure placeholder is removed when leaving imported undefined state.
+            if hasattr(self, "cmb_material"):
+                idx = self.cmb_material.findText(MATERIAL_UNDEFINED_PLACEHOLDER)
+                if idx >= 0:
+                    current = self.cmb_material.currentText()
+                    self.cmb_material.removeItem(idx)
+                    if current == MATERIAL_UNDEFINED_PLACEHOLDER:
+                        self.cmb_material.setCurrentText("TNT")
+                self.cmb_material.setStyleSheet("")
+                self.cmb_material.setToolTip("")
+        finally:
+            self._loading = was_loading
 
     def undefined_gui_keys(self) -> tuple[str, ...]:
         return tuple(sorted(self._undefined_gui_keys))
@@ -492,7 +650,8 @@ class Tab2D(QWidget):
     def _set_result_controls_available(self, available: bool) -> None:
         """Disable result-only field/log controls before initialization."""
         tip = "" if available else "Unavailable until Initialise Model completes"
-        for widget in (self.cmb_field, self.chk_log_scale):
+        widgets = [self.cmb_field, self.chk_log_scale, *self._field_radios.values()]
+        for widget in widgets:
             widget.setEnabled(bool(available))
             widget.setToolTip(tip)
         # Mesh/probe overlays remain available for Setup Preview.
@@ -527,9 +686,15 @@ class Tab2D(QWidget):
                 widget.setSpecialValueText("")
             # Actual enablement is owned by _apply_enablement.
 
-    def mark_initialized(self, case_dir: str, actual_cells: int | None = None) -> None:
+    def mark_initialized(
+        self,
+        case_dir: str,
+        actual_cells: int | None = None,
+        charge_cells: int | None = None,
+    ) -> None:
         self._active_case_dir = case_dir
         self._actual_cell_count = actual_cells
+        self._initialized_charge_cell_count = charge_cells
         self.set_simulation_state(SimulationState2D.INITIALIZED)
         self._on_probe_view_toggled(self.chk_view_probes.isChecked())
         self._refresh_info()
@@ -540,6 +705,7 @@ class Tab2D(QWidget):
         """Failed init must not look like a valid initialized model."""
         self._active_case_dir = case_dir
         self._actual_cell_count = None
+        self._initialized_charge_cell_count = None
         self.set_simulation_state(SimulationState2D.FAILED)
         if hasattr(self.viewer, "clear_simulation_view"):
             self.viewer.clear_simulation_view(
@@ -562,16 +728,13 @@ class Tab2D(QWidget):
             settings = self.viewer.field_settings.get(self.viewer.current_field)
             if settings is not None:
                 settings.log_scale = False
-        if hasattr(self, "lbl_info_actual"):
-            tip = str(message or "Log scale disabled: field has non-positive values.")
-            self.chk_log_scale.setToolTip(tip)
-            # Surface the policy in the info strip without changing physics/data.
-            current = self.lbl_info_actual.text()
-            note = f"Log scale off: {tip}"
-            if note not in current:
-                self.lbl_info_actual.setText(
-                    f"{current}  |  {note}" if current else note
-                )
+        tip = str(message or "Log scale disabled: field has non-positive values.")
+        self.chk_log_scale.setToolTip(tip)
+
+    def set_preparation_step(self, name: str) -> None:
+        """Show the current asynchronous preparation step in the state label."""
+        if hasattr(self, "lbl_state") and self.lbl_state is not None:
+            self.lbl_state.setText(f"Preparing: {name}")
 
     def mark_stale(self) -> None:
         if self._loading:
@@ -579,15 +742,11 @@ class Tab2D(QWidget):
         if self.is_imported_mode:
             # Imported mode: only editable controlDict fields may dirty the case.
             return
-        if self._state in (
-            SimulationState2D.INITIALIZED,
-            SimulationState2D.INTERRUPTED,
-            SimulationState2D.COMPLETED,
-            SimulationState2D.FAILED,
-        ):
-            self.set_simulation_state(SimulationState2D.STALE)
-        elif self._state != SimulationState2D.RUNNING:
-            self.set_simulation_state(SimulationState2D.DRAFT)
+        from state_machine_2d import state_after_input_edit
+
+        next_state = state_after_input_edit(self._state)
+        if next_state != self._state:
+            self.set_simulation_state(next_state)
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -610,11 +769,20 @@ class Tab2D(QWidget):
         self.input_tabs = QTabWidget()
         self.input_tabs.setMinimumWidth(0)
         self.input_tabs.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
-        self.input_tabs.addTab(self._scroll_tab(self._build_setup_tab()), "Setup")
-        self.input_tabs.addTab(self._scroll_tab(self._build_mesh_tab()), "Mesh & AMR")
-        self.input_tabs.addTab(self._scroll_tab(self._build_output_tab()), "Output & Probes")
+        self._left_setup_scroll = self._scroll_tab(self._build_setup_tab())
+        self.input_tabs.addTab(self._left_setup_scroll, "Setup")
+        self._build_mesh_amr_dialog()
+        self._left_output_scroll = self._scroll_tab(self._build_output_tab())
+        output_idx = self.input_tabs.addTab(self._left_output_scroll, "Output & Probes")
+        if hasattr(self.input_tabs, "setTabVisible"):
+            self.input_tabs.setTabVisible(output_idx, False)
+        else:
+            self.input_tabs.removeTab(output_idx)
+            self._left_output_scroll.setParent(self.input_tabs)
+            self._left_output_scroll.hide()
+        self.input_tabs.setCurrentIndex(0)
+        self.input_tabs.tabBar().hide()
         ll.addWidget(self.input_tabs, 1)
-        self._left_setup_scroll = self.input_tabs.widget(0)
         ll.addWidget(self._build_info_panel(), 0)
         self._main_splitter.addWidget(left)
 
@@ -635,7 +803,7 @@ class Tab2D(QWidget):
         self._right_v_splitter.addWidget(self.ctrl_tabs)
         self._right_v_splitter.setStretchFactor(0, 1)
         self._right_v_splitter.setStretchFactor(1, 0)
-        self._right_v_splitter.setSizes([800, EXECUTION_AREA_PREFERRED_HEIGHT])
+        self._right_v_splitter.setSizes([600, self._execution_pane_preferred_height()])
         self._2d_exec_splitter_sizes = list(self._right_v_splitter.sizes())
         self._right_v_splitter.splitterMoved.connect(self._on_2d_exec_splitter_moved)
         rl.addWidget(self._right_v_splitter)
@@ -670,47 +838,110 @@ class Tab2D(QWidget):
 
     @staticmethod
     def _double(value, minimum=0.0, maximum=1e9, decimals=6, suffix="") -> QDoubleSpinBox:
-        spin = QDoubleSpinBox()
+        spin = CompactDoubleSpinBox()
         spin.setRange(minimum, maximum)
         spin.setDecimals(decimals)
         spin.setValue(value)
         spin.setSuffix(suffix)
-        spin.setMaximumWidth(CONTROL_MAX_WIDTH_DEFAULT)
+        spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        spin.wheelEvent = lambda event: event.ignore()
+        spin.setMaximumWidth(max(72, CONTROL_MAX_WIDTH_DEFAULT - 20))
         return spin
+
+    @staticmethod
+    def _with_unit(spin: QDoubleSpinBox, unit: str, stretch: bool = True) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        spin.setSuffix("")
+        layout.addWidget(spin, 0)
+        layout.addWidget(QLabel(unit), 0)
+        if stretch:
+            layout.addStretch(1)
+        return row
+
+    @staticmethod
+    def _solver_field(label: str, widget: QWidget, stretch: bool = True) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        lbl = QLabel(label)
+        lbl.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
+        layout.addWidget(lbl, 0)
+        layout.addWidget(widget, 0)
+        if stretch:
+            layout.addStretch(1)
+        return row
+
+    @staticmethod
+    def _limit_width_to_half_or_text(widget, current_width: int) -> None:
+        half = max(1, int(current_width) // 2)
+        widget.setMaximumWidth(max(half, widget.sizeHint().width()))
 
     @staticmethod
     def _int(value, minimum=0, maximum=1000000000) -> QSpinBox:
         spin = QSpinBox()
         spin.setRange(minimum, maximum)
         spin.setValue(value)
-        spin.setMaximumWidth(CONTROL_MAX_WIDTH_DEFAULT)
+        spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        spin.setButtonSymbols(QSpinBox.NoButtons)
+        spin.wheelEvent = lambda event: event.ignore()
+        spin.setMaximumWidth(max(72, CONTROL_MAX_WIDTH_DEFAULT - 20))
         return spin
+
+    @staticmethod
+    def _fill_boundary_combo(combo: QComboBox) -> None:
+        combo.clear()
+        combo.addItem("Open", BOUNDARY_OPEN)
+        combo.addItem("Reflection", BOUNDARY_SLIP)
+
+    @staticmethod
+    def _combo_stored_value(combo: QComboBox) -> str:
+        data = combo.currentData()
+        return str(data) if data is not None else combo.currentText()
+
+    @staticmethod
+    def _set_combo_stored_value(combo: QComboBox, value: str) -> None:
+        text = str(value)
+        idx = combo.findData(text)
+        if idx < 0:
+            idx = combo.findText(text)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+
+    def _sync_write_interval_display(self) -> None:
+        time_write = self._combo_stored_value(self.cmb_write_control) == "adjustableRunTime"
+        self.lbl_write_interval.setText(
+            "Write interval (time):" if time_write else "Write interval (steps):"
+        )
+        self.spin_write_time.setVisible(time_write)
+        self.spin_write_time.setEnabled(time_write)
+        self.spin_write_steps.setVisible(not time_write)
+        self.spin_write_steps.setEnabled(not time_write)
+        self.lbl_write_interval_unit.setVisible(time_write)
 
     def _build_setup_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
 
         group, form = self._group("Domain Definition")
-        self.spin_radius = self._double(1.5, 1e-6, suffix=" m")
-        self.spin_height = self._double(1.5, 1e-6, suffix=" m")
-        self.spin_cell = self._double(0.05, 1e-6, suffix=" m")
-        self.lbl_radial_cells = QLabel("—")
-        self.lbl_vertical_cells = QLabel("—")
-        self.lbl_effective_domain = QLabel("—")
-        self.lbl_effective_domain.setWordWrap(True)
-        self.lbl_effective_domain.setStyleSheet(SECONDARY_INFO_STYLE)
-        form.addRow("Radius:", self.spin_radius)
-        form.addRow("Height:", self.spin_height)
-        form.addRow("Base Cell Size:", self.spin_cell)
-        form.addRow("Radial cells:", self.lbl_radial_cells)
-        form.addRow("Vertical cells:", self.lbl_vertical_cells)
-        form.addRow(self.lbl_effective_domain)
+        self.spin_radius = self._double(1.5, 1e-6)
+        self.spin_height = self._double(1.5, 1e-6)
+        self.spin_cell = self._double(0.05, 1e-6)
+        form.addRow("Radius:", self._with_unit(self.spin_radius, "m"))
+        form.addRow("Height:", self._with_unit(self.spin_height, "m"))
+        form.addRow("Base Cell Size:", self._with_unit(self.spin_cell, "m"))
+        form.addRow(self._build_mesh_mode_selector())
         layout.addWidget(group)
 
         group, form = self._group("Initialization Source")
         self.cmb_source = QComboBox()
         self.cmb_source.addItems([DIRECT_SOURCE, REMAP_SOURCE])
         form.addRow("Source:", self.cmb_source)
+        self._limit_width_to_half_or_text(self.cmb_source, 355)
         layout.addWidget(group)
 
         self.grp_charge, form = self._group("Direct Charge")
@@ -718,27 +949,30 @@ class Tab2D(QWidget):
         self.cmb_material.addItems(self.materials_db.keys())
         self.cmb_shape = QComboBox()
         self.cmb_shape.addItems(["Sphere", "Cylinder"])
-        self.spin_mass = self._double(1.0, 1e-9, suffix=" kg")
-        self.spin_density = self._double(1630.0, 1e-9, suffix=" kg/m³")
-        self.spin_energy = self._double(4.29e6, 1e-9, 1e12, 2, " J/kg")
-        self.spin_hob = self._double(0.5, 0.0, suffix=" m")
+        self.spin_mass = self._double(1.0, 1e-9)
+        self.cmb_material.setMaximumWidth(self.spin_mass.maximumWidth())
+        self.cmb_shape.setMaximumWidth(self.spin_mass.maximumWidth())
+        self.spin_density = self._double(1630.0, 1e-9)
+        self.spin_energy = self._double(4.29e6, 1e-9, 1e12, 2)
+        self.spin_hob = self._double(0.5, 0.0)
         self.spin_ld = self._double(2.5, 1e-6, 100.0, 3)
-        self.spin_det_height = self._double(0.5, 0.0, suffix=" m")
+        self.spin_det_height = self._double(0.5, 0.0)
         self.lbl_charge_r = QLabel("—")
         self.lbl_charge_d = QLabel("—")
         self.lbl_charge_l = QLabel("—")
         self.lbl_axis_lock = QLabel("Charge centre r = 0; detonation r = 0 (axisymmetric, locked)")
         self.lbl_axis_lock.setWordWrap(True)
         self.lbl_axis_lock.setStyleSheet(SECONDARY_INFO_STYLE)
+        self.lbl_axis_lock.setVisible(False)
         form.addRow("Composition:", self.cmb_material)
         form.addRow("Shape:", self.cmb_shape)
-        form.addRow("Mass:", self.spin_mass)
-        form.addRow("Density:", self.spin_density)
-        form.addRow("Energy:", self.spin_energy)
-        form.addRow("Height of Burst:", self.spin_hob)
+        form.addRow("Mass:", self._with_unit(self.spin_mass, "kg"))
+        form.addRow("Density:", self._with_unit(self.spin_density, "kg/m³"))
+        form.addRow("Energy:", self._with_unit(self.spin_energy, "J/kg"))
+        form.addRow("Height of Burst:", self._with_unit(self.spin_hob, "m"))
         self.lbl_ld_title = QLabel("Cylinder L/D:")
         form.addRow(self.lbl_ld_title, self.spin_ld)
-        form.addRow("Detonation height:", self.spin_det_height)
+        form.addRow("Detonation height:", self._with_unit(self.spin_det_height, "m"))
         form.addRow("Computed radius:", self.lbl_charge_r)
         form.addRow("Computed diameter:", self.lbl_charge_d)
         self.lbl_length_title = QLabel("Computed length:")
@@ -746,34 +980,62 @@ class Tab2D(QWidget):
         form.addRow(self.lbl_axis_lock)
         layout.addWidget(self.grp_charge)
 
-        self.grp_mapping, form = self._group("1D → 2D rotateFields")
-        self.txt_source_case = QComboBox()
-        self.txt_source_case.setEditable(True)
+        self.grp_mapping, form = self._group("Remap")
+        self.txt_source_case = QLabel()
+        self.txt_source_case.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.txt_source_case.setWordWrap(True)
+        self.btn_edit_remap = QPushButton("Edit...")
+        self.btn_edit_remap.setToolTip(
+            "Choose the current 1D model or import 1D/2D results."
+        )
+        self._limit_width_to_half_or_text(self.btn_edit_remap, 438)
+        source_row = QWidget()
+        source_lay = QHBoxLayout(source_row)
+        source_lay.setContentsMargins(0, 0, 0, 0)
+        source_lay.setSpacing(8)
+        source_lay.addWidget(self.txt_source_case, 1)
+        source_lay.addWidget(self.btn_edit_remap, 0)
         self.cmb_source_time_mode = QComboBox()
         self.cmb_source_time_mode.addItems(["latest", "specific"])
         self.txt_source_time = QComboBox()
         self.txt_source_time.setEditable(True)
-        self.spin_mapped_radius = self._double(0.5, 1e-9, suffix=" m")
-        self.spin_source_resolution = self._double(0.01, 1e-9, suffix=" m")
+        self.spin_mapped_radius = self._double(0.5, 1e-9)
+        self.spin_source_resolution = self._double(0.01, 1e-9)
         self.lbl_mapping_note = QLabel(
             "rotateFields mapping is not conservative; normal mapping uses source-volume "
             "weighting and fallback/extension uses nearest cells."
         )
         self.lbl_mapping_note.setWordWrap(True)
         self.lbl_mapping_note.setStyleSheet(WARNING_STYLE)
-        form.addRow("Source case:", self.txt_source_case)
+        form.addRow("Remap from:", source_row)
         form.addRow("Source time:", self.cmb_source_time_mode)
         form.addRow("Specific time:", self.txt_source_time)
-        form.addRow("Mapped radius:", self.spin_mapped_radius)
-        form.addRow("Source resolution:", self.spin_source_resolution)
+        mapped_radius_row = self._with_unit(self.spin_mapped_radius, "m")
+        source_resolution_row = self._with_unit(self.spin_source_resolution, "m")
+        form.addRow("Mapped radius:", mapped_radius_row)
+        form.addRow("Source resolution:", source_resolution_row)
         form.addRow(self.lbl_mapping_note)
-        layout.addWidget(self.grp_mapping)
+        # Mapping always uses the latest available source time. Keep the hidden
+        # controls alive for project compatibility and generator inputs.
+        for field in (
+            self.cmb_source_time_mode,
+            self.txt_source_time,
+            mapped_radius_row,
+            source_resolution_row,
+        ):
+            label = form.labelForField(field)
+            if label is not None:
+                label.hide()
+            field.hide()
+        self.lbl_mapping_note.hide()
+        form.setFormAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
         group, form = self._group("Atmosphere")
-        self.spin_pressure = self._double(101325.0, 1.0, 1e10, 2, " Pa")
-        self.spin_temperature = self._double(288.15, 1.0, 1e5, 2, " K")
-        form.addRow("Pressure:", self.spin_pressure)
-        form.addRow("Temperature:", self.spin_temperature)
+        self.spin_pressure = self._double(101325.0, 1.0, 1e10, 2)
+        self.spin_temperature = self._double(288.15, 1.0, 1e5, 2)
+        form.addRow("Pressure:", self._with_unit(self.spin_pressure, "Pa"))
+        form.addRow("Temperature:", self._with_unit(self.spin_temperature, "K"))
         layout.addWidget(group)
 
         group, form = self._group("Boundaries")
@@ -781,53 +1043,98 @@ class Tab2D(QWidget):
         self.cmb_outer = QComboBox()
         self.cmb_top = QComboBox()
         self.cmb_bottom = QComboBox()
+        boundary_width = max(1, (261 * 2) // 3)
         for combo in (self.cmb_outer, self.cmb_top, self.cmb_bottom):
-            combo.addItems(["Open", "Reflecting slip wall"])
-        self.cmb_bottom.setCurrentText("Reflecting slip wall")
+            self._fill_boundary_combo(combo)
+            combo.setMaximumWidth(boundary_width)
+        self._set_combo_stored_value(self.cmb_bottom, BOUNDARY_SLIP)
         form.addRow("Axis:", self.lbl_axis)
         form.addRow("Outer Radius:", self.cmb_outer)
         form.addRow("Top:", self.cmb_top)
         form.addRow("Ground / Bottom:", self.cmb_bottom)
         layout.addWidget(group)
-
-        group, form = self._group("Solver Controls")
-        self.spin_max_co = self._double(0.5, 1e-6, 10.0, 3)
-        self.spin_end_time = self._double(1e-3, 1e-12, 1e6, 9, " s")
-        self.spin_delta_t = self._double(1e-8, 1e-15, 1.0, 12, " s")
-        self.chk_adjust = QCheckBox()
-        self.chk_adjust.setChecked(True)
-        self.cmb_write_control = QComboBox()
-        self.cmb_write_control.addItems(["adjustableRunTime", "timeStep"])
-        self.spin_write_time = self._double(1e-5, 1e-12, 1e6, 9, " s")
-        self.spin_write_steps = self._int(100, 1)
-        self.spin_cycle_write = self._int(0, 0)
-        self.spin_cores = self._int(1, 1, 1024)
-        form.addRow("CFL / maxCo:", self.spin_max_co)
-        form.addRow("End Time:", self.spin_end_time)
-        form.addRow("Initial time step:", self.spin_delta_t)
-        form.addRow("Adjust time step:", self.chk_adjust)
-        form.addRow("Write control:", self.cmb_write_control)
-        form.addRow("Write interval (time):", self.spin_write_time)
-        form.addRow("Write interval (steps):", self.spin_write_steps)
-        form.addRow("cycleWrite:", self.spin_cycle_write)
-        form.addRow("Processor cores:", self.spin_cores)
-        layout.addWidget(group)
+        layout.addWidget(self.grp_mapping)
         layout.addStretch()
         return page
+
+    def _build_mesh_mode_selector(self) -> QWidget:
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(2)
+        title = QLabel("Mesh mode")
+        self.cmb_mesh_mode = QComboBox(box)
+        self.cmb_mesh_mode.addItems([FIXED_MESH, DYNAMIC_MESH])
+        self.cmb_mesh_mode.setCurrentText(DYNAMIC_MESH)
+        self.cmb_mesh_mode.hide()
+        self.rad_fixed_mesh = QRadioButton("Fixed Mesh")
+        self.rad_dyn_mesh = QRadioButton("Dyn Mesh (AMR)")
+        self.rad_dyn_mesh.setChecked(True)
+        self._mesh_mode_group = QButtonGroup(box)
+        self._mesh_mode_group.setExclusive(True)
+        self._mesh_mode_group.addButton(self.rad_fixed_mesh)
+        self._mesh_mode_group.addButton(self.rad_dyn_mesh)
+        layout.addWidget(title)
+        layout.addWidget(self.rad_fixed_mesh)
+        layout.addWidget(self.rad_dyn_mesh)
+        self.btn_mesh_amr = QPushButton("Mesh & AMR")
+        self.btn_mesh_amr.setToolTip(
+            "Startup charge refinement and runtime wave AMR. "
+            "Available when Mesh mode is Dyn Mesh (AMR)."
+        )
+        layout.addWidget(self.btn_mesh_amr)
+        self._limit_width_to_half_or_text(self.btn_mesh_amr, 438)
+        return box
+
+    def _open_mesh_amr_dialog(self) -> None:
+        if self.cmb_mesh_mode.currentText() != DYNAMIC_MESH:
+            return
+        self._mesh_dialog.show()
+        self._mesh_dialog.raise_()
+        self._mesh_dialog.activateWindow()
+
+    def _build_mesh_amr_dialog(self) -> None:
+        self._mesh_dialog = QDialog(self)
+        self._mesh_dialog.setWindowTitle("Mesh & AMR")
+        self._mesh_dialog.setModal(False)
+        self._mesh_dialog.resize(480, 640)
+        layout = QVBoxLayout(self._mesh_dialog)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self._scroll_tab(self._build_mesh_tab()))
+
+    def _on_mesh_mode_radio_toggled(self, checked: bool) -> None:
+        if not checked:
+            return
+        if self.sender() is self.rad_fixed_mesh:
+            target = FIXED_MESH
+        elif self.sender() is self.rad_dyn_mesh:
+            target = DYNAMIC_MESH
+        else:
+            return
+        if self.cmb_mesh_mode.currentText() != target:
+            self._defer_viewer_preview = True
+            try:
+                self.cmb_mesh_mode.setCurrentText(target)
+            finally:
+                self._defer_viewer_preview = False
+                self._preview_flush_timer.start(0)
+
+    def _sync_mesh_mode_radios(self, text: str) -> None:
+        dynamic = str(text) == DYNAMIC_MESH
+        radio = self.rad_dyn_mesh if dynamic else self.rad_fixed_mesh
+        if radio.isChecked():
+            return
+        radio.blockSignals(True)
+        radio.setChecked(True)
+        radio.blockSignals(False)
 
     def _build_mesh_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        group, form = self._group("Mesh Mode")
-        self.cmb_mesh_mode = QComboBox()
-        self.cmb_mesh_mode.addItems([FIXED_MESH, DYNAMIC_MESH])
-        self.cmb_mesh_mode.setCurrentText(DYNAMIC_MESH)
         self.lbl_mesh_definition = QLabel()
         self.lbl_mesh_definition.setWordWrap(True)
         self.lbl_mesh_definition.setStyleSheet(SECONDARY_INFO_STYLE)
-        form.addRow("Mode:", self.cmb_mesh_mode)
-        form.addRow(self.lbl_mesh_definition)
-        layout.addWidget(group)
+        layout.addWidget(self.lbl_mesh_definition)
 
         self.grp_seed, form = self._group("Startup Charge Refinement")
         self.cmb_seed_mode = QComboBox()
@@ -910,7 +1217,7 @@ class Tab2D(QWidget):
         )
         for field, label in labels:
             check = QCheckBox(label)
-            check.setChecked(field in ("p", "rho", "T", "U", "alpha.c4"))
+            check.setChecked(field == "p")
             self.output_checks[field] = check
             form.addRow(field + ":", check)
         layout.addWidget(group)
@@ -941,33 +1248,103 @@ class Tab2D(QWidget):
 
     def _build_info_panel(self) -> QFrame:
         frame = QFrame()
-        frame.setFixedHeight(INFO_PANEL_HEIGHT)
+        frame.setObjectName("cylindrical2dInfoPanel")
         frame.setStyleSheet(
-            "background:#eef2f6; border:1px solid #c7d0da; border-radius:4px;"
+            "QFrame#cylindrical2dInfoPanel { background:transparent; border:none; }"
         )
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(3)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         title = QLabel("Info")
-        title.setStyleSheet(INFO_TITLE_STYLE)
+        title.setObjectName("cylindrical2dInfoHeader")
+        # Match native QGroupBox title chrome used by Direct Charge / Setup groups.
+        title.setStyleSheet(
+            "QLabel#cylindrical2dInfoHeader {"
+            " background:palette(window); border:1px solid #c7d0da;"
+            " padding:3px 7px; font-weight:bold; font-size:9pt; color:#333;"
+            "}"
+        )
         layout.addWidget(title)
-        layout.addSpacing(3)
-        self.lbl_info_total = QLabel("Total computational cells: —")
-        self.lbl_info_grid = QLabel("Base grid: —")
-        self.lbl_info_charge = QLabel("Charge size/radius: —")
-        self.lbl_info_resolution = QLabel("Planned charge resolution: —")
-        self.lbl_info_actual = QLabel("")
-        for label in (
-            self.lbl_info_total,
-            self.lbl_info_grid,
-            self.lbl_info_charge,
-            self.lbl_info_resolution,
-            self.lbl_info_actual,
+        self.lbl_info_header = title
+
+        body = QFrame()
+        body.setObjectName("cylindrical2dInfoBody")
+        body.setStyleSheet(
+            "QFrame#cylindrical2dInfoBody {"
+            " background:palette(window); border:1px solid #c7d0da;"
+            " border-top:none;"
+            "}"
+        )
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(7, 4, 7, 4)
+        body_layout.setSpacing(2)
+        rows = QFormLayout()
+        rows.setContentsMargins(0, 0, 0, 0)
+        rows.setHorizontalSpacing(10)
+        rows.setVerticalSpacing(2)
+        label_style = INFO_ROW_STYLE.replace("font-size: 9pt;", "font-size: 9pt; font-weight: bold;")
+        self._info_row_widgets = {}
+        for key, caption in (
+            ("radius_cells", "Radius Cells"),
+            ("height_cells", "Height Cells"),
+            ("cell_size", "Cell Size"),
+            ("base_cell", "Base Cell"),
+            ("finest_cell", "Finest Cell"),
+            ("charge_radius", "Charge Radius"),
+            ("charge_res", "Charge Res."),
+            ("charge_cells", "Charge Cells"),
+            ("total_cells", "Total Cells"),
         ):
-            label.setStyleSheet(INFO_ROW_STYLE)
-            label.setWordWrap(False)
-            layout.addWidget(label)
-        layout.addStretch()
+            label = QLabel(f"{caption}:")
+            value = QLabel("—")
+            label.setObjectName(f"info2d_{key}_label")
+            value.setObjectName(f"info2d_{key}_value")
+            label.setStyleSheet(label_style)
+            value.setStyleSheet(INFO_ROW_STYLE)
+            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            rows.addRow(label, value)
+            self._info_row_widgets[key] = (label, value)
+        body_layout.addLayout(rows)
+        self.lbl_info_warning = QLabel("")
+        self.lbl_info_warning.setObjectName("info2d_warning")
+        self.lbl_info_warning.setWordWrap(True)
+        self.lbl_info_warning.setStyleSheet(WARNING_STYLE)
+        self.lbl_info_warning.hide()
+        body_layout.addWidget(self.lbl_info_warning)
+        body_layout.addStretch()
+        layout.addWidget(body, 1)
+        sample_label = next(iter(self._info_row_widgets.values()))[0]
+        sample_label.ensurePolished()
+        title.ensurePolished()
+        row_h = max(
+            24,
+            sample_label.sizeHint().height(),
+            sample_label.fontMetrics().height() + 8,
+        )
+        margins = body_layout.contentsMargins()
+        body_h = (
+            margins.top()
+            + margins.bottom()
+            + 5 * row_h
+            + 4 * rows.verticalSpacing()
+        )
+        header_h = max(title.sizeHint().height(), title.fontMetrics().height() + 10)
+        frame.setFixedHeight(header_h + body_h)
+
+        # Compatibility names retained for callers while rows are state-driven.
+        self.lbl_radial_cells_title, self.lbl_radial_cells = self._info_row_widgets[
+            "radius_cells"
+        ]
+        self.lbl_vertical_cells_title, self.lbl_vertical_cells = self._info_row_widgets[
+            "height_cells"
+        ]
+        self.lbl_effective_domain = self.lbl_info_warning
+        self.lbl_info_total = self._info_row_widgets["total_cells"][1]
+        self.lbl_info_grid = self._info_row_widgets["base_cell"][1]
+        self.lbl_info_charge = self._info_row_widgets["charge_radius"][1]
+        self.lbl_info_resolution = self._info_row_widgets["charge_res"][1]
+        self.lbl_info_actual = self._info_row_widgets["charge_cells"][1]
+        self.info_body = body
         self.info_frame = frame
         return frame
 
@@ -978,40 +1355,121 @@ class Tab2D(QWidget):
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(4, 4, 4, 4)
         controls = QHBoxLayout()
-        self.cmb_view_mode = QComboBox()
-        self.cmb_view_mode.addItems(["Mirrored View", "Computational Domain View"])
-        self.lbl_mirror_indicator = QLabel(
-            "Mirrored display — computational domain is r ≥ 0"
-        )
-        self.lbl_mirror_indicator.setStyleSheet(SECONDARY_INFO_STYLE)
-        self.cmb_time = QComboBox()
+        self.lbl_time = QLabel("Time:", frame)
+        self.cmb_time = TimeComboBox(frame)
         self.cmb_time.setMinimumWidth(110)
         self.cmb_time.setToolTip(
-            "Simulation time. Cases open at 0. Live follows newest output during exact END."
+            "Simulation time. Cases open at 0. Open this list to pick a later saved time."
         )
         self.cmb_time.addItems(["0"])
-        self.cmb_field = QComboBox()
-        self.cmb_field.addItems(["p", "rho", "T", "U", "alpha.c4", "cellLevel"])
-        self.chk_view_mesh = QCheckBox("Mesh overlay")
-        self.chk_view_probes = QCheckBox("Probe markers")
-        self.chk_view_probes.setChecked(True)
-        self.chk_log_scale = QCheckBox("Log scale")
+        self.lbl_time.hide()
+        self.cmb_time.hide()
+        self._status_caption_host = QWidget(frame)
+        self._status_caption_host.setObjectName("viewportStatusHost")
+        host_layout = QHBoxLayout(self._status_caption_host)
+        host_layout.setContentsMargins(0, 0, 0, 0)
+        host_layout.setSpacing(8)
+        host_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._status_caption_host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.btn_fit = QPushButton("Fit")
-        controls.addWidget(self.cmb_view_mode)
-        controls.addWidget(self.lbl_mirror_indicator, 1)
-        controls.addWidget(QLabel("Time:"))
-        controls.addWidget(self.cmb_time)
-        controls.addWidget(QLabel("Field:"))
-        controls.addWidget(self.cmb_field)
-        controls.addWidget(self.chk_view_mesh)
-        controls.addWidget(self.chk_view_probes)
-        controls.addWidget(self.chk_log_scale)
-        controls.addWidget(self.btn_fit)
+        controls.addWidget(self._status_caption_host, 1)
+        controls.addWidget(self.btn_fit, 0)
         layout.addLayout(controls)
         self.viewer = AxisymmetricViewerWidget()
         self.viewer.setMinimumHeight(120)
         layout.addWidget(self.viewer, 1)
         return frame
+
+    def embed_status_caption(self, *widgets) -> None:
+        """Place the Ready/status caption on the Fit row, left-aligned."""
+        layout = self._status_caption_host.layout()
+        for widget in widgets:
+            if widget is None:
+                continue
+            layout.addWidget(widget, 0)
+            if isinstance(widget, QLabel):
+                widget.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+    def _build_solver_controls(self) -> QGroupBox:
+        group = QGroupBox("Solver Controls")
+        group.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        grid = QGridLayout(group)
+        grid.setContentsMargins(*GROUP_MARGINS)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(FORM_ROW_SPACING)
+        grid.setAlignment(Qt.AlignTop)
+        self.spin_max_co = self._double(0.5, 1e-6, 10.0, 3)
+        self.spin_max_co.setFixedWidth(self.spin_max_co.minimumSizeHint().width() * 2)
+        self.spin_end_time = self._double(1e-3, 1e-12, 1e6, 9)
+        self.spin_delta_t = self._double(1e-8, 1e-15, 1.0, 12)
+        self.spin_delta_t.setFixedWidth(
+            max(self.spin_delta_t.sizeHint().width(), self.spin_delta_t.minimumSizeHint().width())
+            * 2
+        )
+        self.chk_adjust = QCheckBox()
+        self.chk_adjust.setChecked(True)
+        self.cmb_write_control = QComboBox()
+        self.cmb_write_control.addItem("RunTime", "adjustableRunTime")
+        self.cmb_write_control.addItem("timeStep", "timeStep")
+        self.cmb_write_control.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.cmb_write_control.setMaximumWidth(self.cmb_write_control.sizeHint().width())
+        self.spin_write_time = self._double(0.001, 1e-12, 1e6, 9)
+        self.spin_write_steps = self._int(100, 1)
+        self.spin_cores = self._int(1, 1, 1024)
+        time_row = QWidget()
+        time_layout = QHBoxLayout(time_row)
+        time_layout.setContentsMargins(0, 0, 0, 0)
+        time_layout.setSpacing(12)
+        time_layout.addWidget(
+            self._solver_field(
+                "End Time:",
+                self._with_unit(self.spin_end_time, "s", stretch=False),
+                stretch=False,
+            ),
+            0,
+        )
+        time_layout.addWidget(
+            self._solver_field(
+                "Initial time step:",
+                self._with_unit(self.spin_delta_t, "s", stretch=False),
+                stretch=False,
+            ),
+            0,
+        )
+        time_layout.addStretch(1)
+        grid.addWidget(time_row, 0, 0, 1, 2)
+        cfl_row = QWidget()
+        cfl_layout = QHBoxLayout(cfl_row)
+        cfl_layout.setContentsMargins(0, 0, 0, 0)
+        cfl_layout.setSpacing(6)
+        lbl_cfl = QLabel("CFL / maxCo:")
+        lbl_cfl.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        lbl_adjust = QLabel("Adjust time step:")
+        lbl_adjust.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        cfl_layout.addWidget(lbl_cfl, 0)
+        cfl_layout.addWidget(self.spin_max_co, 0)
+        cfl_layout.addWidget(lbl_adjust, 0)
+        cfl_layout.addWidget(self.chk_adjust, 0)
+        cfl_layout.addStretch(1)
+        grid.addWidget(cfl_row, 1, 0, 1, 2)
+        grid.addWidget(self._solver_field("Write control:", self.cmb_write_control), 2, 0)
+        self.lbl_write_interval = QLabel("Write interval (time):")
+        self.lbl_write_interval.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self.lbl_write_interval_unit = QLabel("s")
+        interval_row = QWidget()
+        interval_layout = QHBoxLayout(interval_row)
+        interval_layout.setContentsMargins(0, 0, 0, 0)
+        interval_layout.setSpacing(6)
+        interval_layout.addWidget(self.lbl_write_interval, 0)
+        interval_layout.addWidget(self.spin_write_time, 0)
+        interval_layout.addWidget(self.spin_write_steps, 0)
+        interval_layout.addWidget(self.lbl_write_interval_unit, 0)
+        interval_layout.addStretch(1)
+        grid.addWidget(interval_row, 3, 0)
+        grid.addWidget(self._solver_field("Processor cores:", self.spin_cores), 4, 0)
+        self._sync_write_interval_display()
+        self.grp_solver = group
+        return group
 
     def _build_execution_controls(self) -> QWidget:
         page = QWidget()
@@ -1022,41 +1480,140 @@ class Tab2D(QWidget):
         self.btn_initialize = QPushButton("Initialise Model")
         self.btn_exact_end = QPushButton("exact END")
         self.btn_stop = QPushButton("Interrupt")
-        self.btn_log = QPushButton("Open Log")
+        self.btn_log = QPushButton("Open Log", group)
+        self.btn_log.setVisible(False)
         self.btn_run = self.btn_exact_end  # compatibility alias; no separate Run/Resume action
+        self.btn_initialize.setStyleSheet("background-color: #3498db; color: white; padding: 5px;")
+        self.btn_exact_end.setStyleSheet("background-color: #1abc9c; color: white; padding: 4px;")
+        self.btn_stop.setStyleSheet("background-color: #e67e22; color: white; padding: 5px;")
         for button in (self.btn_initialize, self.btn_exact_end, self.btn_stop):
-            button.setFixedHeight(50)
-            button.setMinimumWidth(140)
-            font = button.font()
-            font.setPointSize(ACTION_BUTTON_FONT_PT)
-            font.setBold(True)
-            button.setFont(font)
-        self.btn_initialize.setStyleSheet("background:#3498db;color:white;border-radius:6px;")
-        self.btn_exact_end.setStyleSheet("background:#2ecc71;color:white;border-radius:6px;")
-        self.btn_stop.setStyleSheet("background:#e67e22;color:white;border-radius:6px;")
-        gl.addWidget(self.btn_initialize)
-        gl.addWidget(self.btn_exact_end)
-        gl.addWidget(self.btn_stop)
-        gl.addWidget(self.btn_log)
+            button.setMinimumWidth(198)
+        actions = QWidget()
+        actions.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Maximum)
+        v = QVBoxLayout(actions)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(self.btn_initialize)
+        v.addWidget(self.btn_exact_end)
+        v.addWidget(self.btn_stop)
         self.lbl_state = QLabel("State: Draft")
-        gl.addWidget(self.lbl_state)
+        self.lbl_state.setWordWrap(True)
+        self.lbl_state.setMaximumWidth(198)
+        self.lbl_state.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        v.addWidget(self.lbl_state)
+        self.chk_log_scale = QCheckBox("Log scale")
+        v.addWidget(self.chk_log_scale)
+        v.addStretch()
+        gl.addWidget(actions, 0, Qt.AlignTop)
+        gl.addWidget(self._build_field_selector(), 0, Qt.AlignTop)
+        self.grp_sim = group
         layout.addWidget(group)
+        layout.addWidget(self._build_solver_controls())
+        layout.addWidget(self._build_view_display_controls())
         layout.addStretch()
+        self._equalize_execution_group_heights()
         return page
 
+    def _build_view_display_controls(self) -> QWidget:
+        box = QGroupBox("View")
+        box.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        layout = QVBoxLayout(box)
+        layout.setSpacing(4)
+        self.cmb_view_mode = QComboBox()
+        self.cmb_view_mode.addItems(["Mirrored View", "Computational Domain View"])
+        self.cmb_view_mode.hide()
+        self.lbl_mirror_indicator = QLabel(
+            "Mirrored display — computational domain is r ≥ 0"
+        )
+        self.lbl_mirror_indicator.setStyleSheet(SECONDARY_INFO_STYLE)
+        self.lbl_mirror_indicator.setWordWrap(True)
+        self.lbl_mirror_indicator.hide()
+        self.chk_view_mirror = QCheckBox("Mirrored View")
+        self.chk_view_mirror.setChecked(True)
+        self.chk_view_mesh = QCheckBox("Mesh overlay")
+        self.chk_view_probes = QCheckBox("Probe markers")
+        self.chk_view_probes.setChecked(True)
+        layout.addWidget(self.chk_view_mirror)
+        layout.addWidget(self.chk_view_mesh)
+        layout.addWidget(self.chk_view_probes)
+        layout.addWidget(self.cmb_view_mode)
+        layout.addWidget(self.lbl_mirror_indicator)
+        layout.addStretch()
+        self.grp_view = box
+        return box
+
+    def _build_field_selector(self) -> QWidget:
+        box = QWidget()
+        box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(12, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.setAlignment(Qt.AlignTop)
+        self.cmb_field = QComboBox(box)
+        self.cmb_field.addItems([field for field, _label in VIEW_FIELD_OPTIONS])
+        self.cmb_field.hide()
+        self._field_group = QButtonGroup(box)
+        self._field_group.setExclusive(True)
+        self._field_radios: Dict[str, QRadioButton] = {}
+        for field, label in VIEW_FIELD_OPTIONS:
+            radio = QRadioButton(label)
+            self._field_group.addButton(radio)
+            self._field_radios[field] = radio
+            layout.addWidget(radio)
+        self._field_radios["p"].setChecked(True)
+        return box
+
+    def _ensure_view_field_option(self, field: str) -> None:
+        if self.cmb_field.findText(field) < 0:
+            self.cmb_field.addItem(field)
+        if field in self._field_radios:
+            return
+        radio = QRadioButton(field)
+        self._field_group.addButton(radio)
+        self._field_radios[field] = radio
+        self._field_radios[field].toggled.connect(self._on_field_radio_toggled)
+        self.cmb_field.parentWidget().layout().addWidget(radio)
+
+    def _on_field_radio_toggled(self, checked: bool) -> None:
+        if not checked:
+            return
+        radio = self.sender()
+        for field, widget in self._field_radios.items():
+            if widget is radio:
+                if self.cmb_field.currentText() != field:
+                    self.cmb_field.setCurrentText(field)
+                return
+
+    def _sync_field_radios_from_combo(self, field: str) -> None:
+        radio = self._field_radios.get(str(field or "").strip())
+        if radio is None or radio.isChecked():
+            return
+        radio.blockSignals(True)
+        radio.setChecked(True)
+        radio.blockSignals(False)
+
     def _connect_signals(self) -> None:
-        self.cmb_source.currentTextChanged.connect(self._apply_enablement)
+        self.cmb_source.currentTextChanged.connect(self._on_source_changed)
+        self.btn_edit_remap.clicked.connect(self._open_remap_from_dialog)
         self.cmb_shape.currentTextChanged.connect(self._apply_enablement)
         self.cmb_mesh_mode.currentTextChanged.connect(self._apply_enablement)
+        self.cmb_mesh_mode.currentTextChanged.connect(self._sync_mesh_mode_radios)
+        self.rad_fixed_mesh.toggled.connect(self._on_mesh_mode_radio_toggled)
+        self.rad_dyn_mesh.toggled.connect(self._on_mesh_mode_radio_toggled)
+        self.btn_mesh_amr.clicked.connect(self._open_mesh_amr_dialog)
         self.cmb_seed_mode.currentTextChanged.connect(self._apply_enablement)
         self.cmb_write_control.currentTextChanged.connect(self._apply_enablement)
         self.cmb_material.currentTextChanged.connect(self._on_material_changed)
         self.chk_begin_unrefine.toggled.connect(self._apply_enablement)
         self.chk_balancing.toggled.connect(self._apply_enablement)
         self.cmb_view_mode.currentTextChanged.connect(self._on_view_changed)
+        self.chk_view_mirror.toggled.connect(self._on_mirror_checkbox_toggled)
         self.cmb_time.currentTextChanged.connect(self._on_time_selector_changed)
+        self.cmb_time.popup_requested.connect(self._ensure_time_catalog)
         self.viewer.times_changed.connect(self._on_viewer_times_changed)
         self.cmb_field.currentTextChanged.connect(self.viewer.set_field)
+        self.cmb_field.currentTextChanged.connect(self._sync_field_radios_from_combo)
+        for radio in self._field_radios.values():
+            radio.toggled.connect(self._on_field_radio_toggled)
         self.chk_view_mesh.toggled.connect(self._on_mesh_overlay_toggled)
         self.chk_view_probes.toggled.connect(self._on_probe_view_toggled)
         self.chk_log_scale.toggled.connect(self._on_log_scale_toggled)
@@ -1071,6 +1628,7 @@ class Tab2D(QWidget):
 
         view_only = {
             self.cmb_view_mode,
+            self.chk_view_mirror,
             self.cmb_time,
             self.cmb_field,
             self.chk_view_mesh,
@@ -1121,14 +1679,15 @@ class Tab2D(QWidget):
         self.lbl_length_title.setVisible(cylinder)
         self.grp_seed.setEnabled(direct and dynamic)
         self.grp_amr.setEnabled(dynamic)
+        self.btn_mesh_amr.setEnabled(dynamic)
+        if not dynamic:
+            self._mesh_dialog.hide()
         self.spin_seed_level.setEnabled(self.cmb_seed_mode.currentText() == SEED_MODE_MANUAL)
         self.spin_seed_target.setEnabled(self.cmb_seed_mode.currentText() == SEED_MODE_AUTO)
         self.spin_seed_min.setEnabled(self.cmb_seed_mode.currentText() == SEED_MODE_AUTO)
         self.spin_seed_max.setEnabled(self.cmb_seed_mode.currentText() == SEED_MODE_AUTO)
         self.txt_source_time.setEnabled(self.cmb_source_time_mode.currentText() == "specific")
-        time_write = self.cmb_write_control.currentText() == "adjustableRunTime"
-        self.spin_write_time.setEnabled(time_write)
-        self.spin_write_steps.setEnabled(not time_write)
+        self._sync_write_interval_display()
         self.spin_begin_unrefine.setEnabled(self.chk_begin_unrefine.isChecked())
         self.spin_balance_interval.setEnabled(self.chk_balancing.isChecked())
         self.lbl_mesh_definition.setText(
@@ -1137,6 +1696,105 @@ class Tab2D(QWidget):
             else "Startup charge refinement and moving-wave runtime AMR are independent."
         )
         self._refresh_derived()
+        if not self._defer_viewer_preview:
+            self._apply_info_mode_visibility()
+
+    def _on_source_changed(self, source: str) -> None:
+        """Use this session's latest 1D run when the user selects From 1D."""
+        self.cmb_source_time_mode.setCurrentText("latest")
+        self.txt_source_time.setEditText("")
+        if (
+            source == REMAP_SOURCE
+            and not self._loading
+            and self._last_1d_case_dir
+            and os.path.isdir(self._last_1d_case_dir)
+        ):
+            self._remap_from_last_1d = True
+            self.apply_last_1d_remap_default()
+        self._apply_enablement()
+
+    def set_source_cases_root(self, path: str) -> None:
+        """Work folder that the From-1D browse dialog opens in."""
+        self._source_cases_root = os.path.normpath(path) if path else ""
+        self.apply_last_1d_remap_default()
+
+    def apply_last_1d_remap_default(self) -> None:
+        """Fill Remap from the newest 1D run unless the user picked another case."""
+        if not self._remap_from_last_1d:
+            return
+        latest = self._last_1d_case_dir or latest_case_1d_dir(self._source_cases_root)
+        if latest:
+            self._set_remap_case_path(latest, from_last_1d=True)
+
+    def set_last_1d_case(self, path: str) -> None:
+        """Remember the 1D case that just started and refresh the Remap default."""
+        if not path:
+            return
+        self._last_1d_case_dir = os.path.normpath(path)
+        self.apply_last_1d_remap_default()
+
+    def _set_remap_case_path(self, path: str, *, from_last_1d: bool) -> None:
+        path = os.path.normpath(path) if path else ""
+        self._remap_case_path = path
+        self._remap_from_last_1d = bool(from_last_1d)
+        if from_last_1d:
+            self._remap_kind = RemapFromDialog.CURRENT_1D
+        if path:
+            if from_last_1d:
+                self.txt_source_case.setText("Current 1D model")
+            else:
+                self.txt_source_case.setText(os.path.basename(path))
+            self.txt_source_case.setToolTip(path)
+        else:
+            self.txt_source_case.setText("")
+            self.txt_source_case.setToolTip("")
+
+    def _current_1d_remap_path(self) -> str:
+        return self._last_1d_case_dir or latest_case_1d_dir(self._source_cases_root)
+
+    def _open_remap_from_dialog(self) -> None:
+        if self.cmb_source.currentText() != REMAP_SOURCE:
+            return
+        current_1d = self._current_1d_remap_path()
+        dialog = RemapFromDialog(
+            self,
+            current_kind=self._remap_kind,
+            has_current_1d=bool(current_1d and os.path.isdir(current_1d)),
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        self._apply_remap_from_choice(dialog.selected_kind())
+
+    def _apply_remap_from_choice(self, kind: str) -> None:
+        if kind == RemapFromDialog.CURRENT_1D:
+            self._remap_from_last_1d = True
+            self.apply_last_1d_remap_default()
+            if not self._loading:
+                self._on_model_changed()
+            return
+        chosen = self._pick_results_path(kind)
+        if not chosen:
+            return
+        self._remap_kind = kind
+        self._set_remap_case_path(chosen, from_last_1d=False)
+        if not self._loading:
+            self._on_model_changed()
+
+    def _pick_results_path(self, kind: str) -> str:
+        start = getattr(self, "_source_cases_root", "") or ""
+        if kind == RemapFromDialog.FILE_2D:
+            caption = "Select 2D results file"
+        else:
+            caption = "Select 1D results file"
+        path, _filter = QFileDialog.getOpenFileName(
+            self,
+            caption,
+            start,
+            "OpenFOAM (case.foam);;All files (*)",
+        )
+        if not path:
+            return ""
+        return case_dir_from_picked_path(path)
 
     def _on_model_changed(self, *_args) -> None:
         if self._loading:
@@ -1159,12 +1817,33 @@ class Tab2D(QWidget):
                 else:
                     self._clear_control_undefined(key)
         self.mark_stale()
+        if self.sender() in (
+            self.cmb_source,
+            self.cmb_shape,
+            self.cmb_mesh_mode,
+            self.cmb_seed_mode,
+            self.cmb_write_control,
+            self.chk_begin_unrefine,
+            self.chk_balancing,
+        ):
+            return
         self._refresh_derived()
+
+    def _on_mirror_checkbox_toggled(self, checked: bool) -> None:
+        self.cmb_view_mode.setCurrentText(
+            "Mirrored View" if checked else "Computational Domain View"
+        )
 
     def _on_view_changed(self, text: str) -> None:
         mirrored = text == "Mirrored View"
-        self.lbl_mirror_indicator.setVisible(mirrored)
+        if self.chk_view_mirror.isChecked() != mirrored:
+            self.chk_view_mirror.blockSignals(True)
+            self.chk_view_mirror.setChecked(mirrored)
+            self.chk_view_mirror.blockSignals(False)
         self.viewer.set_mirrored_view(mirrored)
+
+    def _ensure_time_catalog(self) -> None:
+        self.viewer.ensure_time_catalog()
 
     def _on_viewer_times_changed(self, labels, selected: str, live_follow: bool) -> None:
         """Keep the Time combo synchronized without mutating the selection."""
@@ -1242,11 +1921,16 @@ class Tab2D(QWidget):
                 self.lbl_vertical_cells.setText(str(domain.vertical_cells))
                 if domain.adjusted:
                     self.lbl_effective_domain.setText(
-                        f"Requested R×H {domain.requested_radius:.6g}×{domain.requested_height:.6g} m; "
-                        f"effective {domain.effective_radius:.6g}×{domain.effective_height:.6g} m."
+                        "Warning: Effective domain differs from requested."
+                    )
+                    self.lbl_effective_domain.setToolTip(
+                        f"Requested R×H {domain.requested_radius:.6g}×"
+                        f"{domain.requested_height:.6g} m; effective "
+                        f"{domain.effective_radius:.6g}×{domain.effective_height:.6g} m."
                     )
                 else:
-                    self.lbl_effective_domain.setText("Requested and effective domain match.")
+                    self.lbl_effective_domain.setText("")
+                    self.lbl_effective_domain.setToolTip("")
             charge = physical_charge_geometry(inputs)
             radius = charge.radius_m if charge.shape == "Sphere" else charge.cylinder_radius_m
             self.lbl_charge_r.setText(f"{radius:.6g} m")
@@ -1263,7 +1947,7 @@ class Tab2D(QWidget):
             else:
                 self.lbl_seed_plan.setText("Disabled for From 1D mapping.")
             if domain and not self.viewer.is_simulating:
-                self.viewer.update_axisymmetric_preview(
+                preview = (
                     domain.effective_radius,
                     domain.effective_height,
                     {
@@ -1286,6 +1970,10 @@ class Tab2D(QWidget):
                     },
                     [(p.radius, p.height) for p in inputs.probes],
                 )
+                if self._defer_viewer_preview:
+                    self._pending_setup_preview = preview
+                else:
+                    self.viewer.update_axisymmetric_preview(*preview)
             if not self.is_imported_mode:
                 self.set_simulation_state(
                     SimulationState2D.VALIDATED
@@ -1293,116 +1981,216 @@ class Tab2D(QWidget):
                     else self._state
                 )
         except Exception as exc:
-            import sys
+            # Timer/preview refresh: log without flooding the user with dialogs.
+            from ggui_logging import log_operation
 
-            print(f"[2D Setup Preview] {exc}", file=sys.stderr)
+            import logging
+
+            log_operation(
+                "tab_2d",
+                "setup_preview_refresh",
+                case_dir=getattr(self, "active_case_dir", None),
+                exc=exc,
+                level=logging.ERROR,
+            )
         self._refresh_info()
+
+    @staticmethod
+    def _format_info_length(value: float) -> str:
+        value = float(value)
+        return f"{value:.3e} m" if 0.0 < abs(value) < 1.0e-4 else f"{value:.5f} m"
+
+    @staticmethod
+    def _fixed_direct_charge_cells(domain, inputs, charge) -> int:
+        """Exact fixed-grid cell-centre selection used by setFields geometry."""
+        from generator_2d import WEDGE_HALF_ANGLE_DEG
+
+        dx = float(domain.cell_size)
+        radial_cells = int(domain.radial_cells)
+        height_cells = int(domain.vertical_cells)
+        cos_angle = math.cos(math.radians(WEDGE_HALF_ANGLE_DEG))
+        centre_h = float(inputs.height_of_burst)
+        radius = (
+            float(charge.radius_m)
+            if charge.shape == "Sphere"
+            else float(charge.cylinder_radius_m)
+        )
+        tol = 1.0e-12
+        radial_centres = []
+        for i in range(radial_cells):
+            inner = i * dx
+            outer = (i + 1) * dx
+            # blockMesh's wedge cells are trapezoidal annular sectors.  Their
+            # volume centroid is the difference of the two similar triangles.
+            radial = (
+                (2.0 * cos_angle / 3.0)
+                * ((outer**3 - inner**3) / (outer**2 - inner**2))
+            )
+            if radial > radius + tol:
+                break
+            radial_centres.append(radial)
+        if charge.shape == "Cylinder":
+            radial_count = len(radial_centres)
+            half_length = 0.5 * float(charge.length_m)
+            low = max(
+                0, math.ceil((centre_h - half_length) / dx - 0.5 - tol)
+            )
+            high = min(
+                height_cells - 1,
+                math.floor((centre_h + half_length) / dx - 0.5 + tol),
+            )
+            height_count = max(0, high - low + 1)
+            return radial_count * height_count
+
+        total = 0
+        for radial in radial_centres:
+            remaining_sq = radius * radius - radial * radial
+            half_height = math.sqrt(max(0.0, remaining_sq))
+            low = max(0, math.ceil((centre_h - half_height) / dx - 0.5 - tol))
+            high = min(
+                height_cells - 1,
+                math.floor((centre_h + half_height) / dx - 0.5 + tol),
+            )
+            if high >= low:
+                total += high - low + 1
+        return total
+
+    def _set_info_rows(self, rows, warning: str = "", warning_detail: str = "") -> None:
+        values = dict(rows)
+        for key, (label, value) in self._info_row_widgets.items():
+            visible = key in values
+            label.setVisible(visible)
+            value.setVisible(visible)
+            if visible:
+                value.setText(str(values[key]))
+        self.lbl_info_warning.setText(warning)
+        self.lbl_info_warning.setToolTip(warning_detail)
+        self.lbl_info_warning.setVisible(bool(warning))
+
+    def _info_rows_for_state(self, inputs, result):
+        domain = result.domain
+        if domain is None:
+            return []
+        direct = inputs.initialization_source == DIRECT_SOURCE
+        dynamic = inputs.mesh_mode == DYNAMIC_MESH
+        initialized = self._state in (
+            SimulationState2D.INITIALIZED,
+            SimulationState2D.RUNNING,
+            SimulationState2D.INTERRUPTED,
+            SimulationState2D.COMPLETED,
+        )
+        actual_total = (
+            int(self._actual_cell_count)
+            if initialized and self._actual_cell_count is not None
+            else None
+        )
+
+        if not direct:
+            rows = [
+                ("radius_cells", f"{domain.radial_cells:,}"),
+                ("height_cells", f"{domain.vertical_cells:,}"),
+                ("cell_size", self._format_info_length(domain.cell_size)),
+            ]
+            if not dynamic:
+                rows.append(("total_cells", f"{domain.total_cells:,}"))
+            elif actual_total is not None:
+                rows = [
+                    ("base_cell", self._format_info_length(domain.cell_size)),
+                    ("total_cells", f"{actual_total:,}"),
+                ]
+            else:
+                rows = [("base_cell", self._format_info_length(domain.cell_size))]
+            return rows
+
+        charge = result.charge
+        if charge is None:
+            return []
+        radius = (
+            charge.radius_m if charge.shape == "Sphere" else charge.cylinder_radius_m
+        )
+        if not dynamic:
+            charge_cells = (
+                self._initialized_charge_cell_count
+                if initialized and self._initialized_charge_cell_count is not None
+                else self._fixed_direct_charge_cells(domain, inputs, charge)
+            )
+            return [
+                ("radius_cells", f"{domain.radial_cells:,}"),
+                ("height_cells", f"{domain.vertical_cells:,}"),
+                ("charge_radius", self._format_info_length(radius)),
+                ("charge_cells", f"{int(charge_cells):,}"),
+                (
+                    "total_cells",
+                    f"{actual_total if actual_total is not None else domain.total_cells:,}",
+                ),
+            ]
+
+        level = result.seed_plan.level_effective if result.seed_plan else 0
+        finest = float(domain.cell_size) / (2 ** max(0, int(level)))
+        charge_resolution = (2.0 * float(radius)) / max(finest, 1.0e-15)
+        rows = [
+            ("finest_cell", self._format_info_length(finest)),
+            ("charge_radius", self._format_info_length(radius)),
+            ("charge_res", f"{charge_resolution:.2f} cells/D"),
+        ]
+        if not initialized:
+            rows.insert(0, ("base_cell", self._format_info_length(domain.cell_size)))
+            return rows
+        charge_cells = self._initialized_charge_cell_count
+        rows.extend(
+            [
+                (
+                    "charge_cells",
+                    f"{int(charge_cells):,}" if charge_cells is not None else "—",
+                ),
+                (
+                    "total_cells",
+                    f"{actual_total:,}" if actual_total is not None else "—",
+                ),
+            ]
+        )
+        return rows
 
     def _refresh_info(self) -> None:
         try:
-            if self.is_imported_mode and self._imported_case is not None:
-                ext = self._imported_case
-                self.lbl_info_total.setText(
-                    f"Imported working case: {os.path.basename(ext.active_case_path)}"
-                )
-                rc = (ext.mapping.get("radial_cells").displayed_value
-                      if ext.mapping and ext.mapping.get("radial_cells") else None)
-                vc = (ext.mapping.get("vertical_cells").displayed_value
-                      if ext.mapping and ext.mapping.get("vertical_cells") else None)
-                if rc is not None and vc is not None:
-                    self.lbl_info_grid.setText(
-                        f"Base grid: {int(rc)} radial × {int(vc)} vertical"
-                    )
-                else:
-                    self.lbl_info_grid.setText(
-                        f"Mode: {ext.lifecycle_label} | evidence: "
-                        f"{ext.classification.evidence.source}"
-                    )
-                cr = None
-                if ext.mapping and ext.mapping.get("charge_radius"):
-                    cr = ext.mapping.get("charge_radius").displayed_value
-                centre = None
-                if ext.mapping and ext.mapping.get("charge_centre"):
-                    centre = ext.mapping.get("charge_centre").displayed_value
-                mat = None
-                if ext.mapping and ext.mapping.get("material_name"):
-                    mat = ext.mapping.get("material_name").displayed_value
-                self.lbl_info_charge.setText(
-                    f"Charge: {mat or '—'} | r={cr if cr is not None else '—'} m | "
-                    f"centre={centre if centre is not None else '—'}"
-                )
-                self.lbl_info_resolution.setText(
-                    f"Source unchanged | R={ext.radius_m if ext.radius_m is not None else '—'} "
-                    f"H={ext.height_m if ext.height_m is not None else '—'}"
-                )
-                if ext.cell_count is not None:
-                    owner = os.path.basename(os.path.dirname(ext.mesh_owner_path)) if ext.mesh_owner_path else ""
-                    self.lbl_info_actual.setText(
-                        f"Actual current cells: {ext.cell_count:,} "
-                        f"({ext.cell_count_source}"
-                        + (f" / {owner}" if owner else "")
-                        + ")"
-                    )
-                else:
-                    self.lbl_info_actual.setText(
-                        "Actual current cells: (initialise to generate mesh)"
-                    )
-                return
             inputs = self.get_case_inputs()
             result = validate_case_inputs_2d(inputs)
-            if not result.domain:
-                return
-            domain = result.domain
-            self.lbl_info_total.setText(
-                f"{'Estimated cells before initialization' if inputs.mesh_mode == DYNAMIC_MESH else 'Total computational cells'}: "
-                f"{domain.total_cells:,}"
-            )
-            self.lbl_info_grid.setText(
-                f"Base grid: {domain.radial_cells} radial × {domain.vertical_cells} vertical"
-            )
-            if result.charge:
-                charge = result.charge
-                radius = charge.radius_m if charge.shape == "Sphere" else charge.cylinder_radius_m
-                self.lbl_info_charge.setText(
-                    f"Charge size/radius: {2 * radius:.5g} m diameter / {radius:.5g} m radius"
+            warning = ""
+            detail = ""
+            if result.domain is not None and result.domain.adjusted:
+                warning = "Warning: Effective domain differs from requested."
+                detail = (
+                    f"Requested R×H {result.domain.requested_radius:.6g}×"
+                    f"{result.domain.requested_height:.6g} m; effective "
+                    f"{result.domain.effective_radius:.6g}×"
+                    f"{result.domain.effective_height:.6g} m."
                 )
-                level = result.seed_plan.level_effective if result.seed_plan else 0
-                resolution = charge.d_min_m / (inputs.cell_size / (2**level))
-                self.lbl_info_resolution.setText(
-                    f"Planned {'startup ' if result.seed_plan else ''}charge resolution: {resolution:.2f} cells"
-                )
-            else:
-                self.lbl_info_charge.setText("Charge size/radius: mapped source state")
-                self.lbl_info_resolution.setText(
-                    f"Planned target resolution: {inputs.cell_size:.6g} m"
-                )
-            source = getattr(self.viewer, "_cell_count_source", None)
-            count_time = getattr(self.viewer, "_cell_count_time", None)
-            if (
-                self._actual_cell_count is not None
-                and self._state
-                in (
-                    SimulationState2D.INITIALIZED,
-                    SimulationState2D.RUNNING,
-                    SimulationState2D.INTERRUPTED,
-                    SimulationState2D.COMPLETED,
-                )
-            ):
-                suffix = ""
-                if source and source != "none":
-                    if count_time is not None and source == "time_polyMesh":
-                        suffix = f" (measured at t={count_time:.6g} s)"
-                    elif source == "constant_polyMesh":
-                        suffix = " (initialized mesh)"
-                    elif source == "vtk_internalMesh":
-                        suffix = " (loaded mesh)"
-                self.lbl_info_actual.setText(
-                    f"Actual current cells: {self._actual_cell_count:,}{suffix}"
-                )
-            else:
-                self.lbl_info_actual.setText("")
+            self._set_info_rows(self._info_rows_for_state(inputs, result), warning, detail)
         except Exception:
-            self.lbl_info_total.setText("Total computational cells: —")
+            self._set_info_rows([])
+
+    def _apply_info_mode_visibility(self) -> None:
+        if not hasattr(self, "info_frame"):
+            return
+        self._refresh_info()
+
+    def _flush_setup_preview(self) -> None:
+        preview = self._pending_setup_preview
+        self._pending_setup_preview = None
+        if preview is not None and not self.viewer.is_simulating:
+            self.viewer.update_axisymmetric_preview(*preview)
+        self._apply_info_mode_visibility()
+
+    def replace_probes(self, probes) -> None:
+        """Replace 2D probe table from Time History Locations."""
+        self.tbl_probes.setRowCount(0)
+        for probe in probes or ():
+            row = self.tbl_probes.rowCount()
+            self.tbl_probes.insertRow(row)
+            self.tbl_probes.setItem(row, 0, QTableWidgetItem(str(probe.name)))
+            self.tbl_probes.setItem(row, 1, QTableWidgetItem(f"{float(probe.radius):.6g}"))
+            self.tbl_probes.setItem(row, 2, QTableWidgetItem(f"{float(probe.height):.6g}"))
+        self.mark_stale()
 
     def _add_probe(self) -> None:
         row = self.tbl_probes.rowCount()
@@ -1431,6 +2219,36 @@ class Tab2D(QWidget):
             except (AttributeError, ValueError):
                 continue
         return tuple(probes)
+
+    def apply_output_file_options(self, dim2d) -> None:
+        """Apply selected 2D outputs without changing the shared write cadence."""
+        self._keep_openfoam_time_folders = bool(dim2d.keep_openfoam_time_folders)
+        self._cycle_write = int(dim2d.cycle_write)
+        g, v = dim2d.gauges, dim2d.vtk
+        vtk_pairs = (
+            ("p", v.pressure),
+            ("rho", v.density),
+            ("T", v.temperature),
+            ("U", v.velocity),
+            ("alpha.c4", v.mass_fractions),
+            ("rhoE", v.energy),
+        )
+        self._vtk_fields = tuple(field for field, on in vtk_pairs if on)
+        pairs = (
+            ("p", g.pressure or v.pressure),
+            ("rho", g.density or v.density),
+            ("T", g.temperature or v.temperature),
+            ("U", g.velocity or v.velocity),
+            ("alpha.c4", g.mass_fractions or v.mass_fractions),
+            ("rhoE", g.energy or v.energy),
+        )
+        self._output_option_fields = tuple(field for field, on in pairs if on)
+        for field, on in pairs:
+            if field in self.output_checks:
+                self.output_checks[field].setChecked(bool(on))
+        self._enable_impulse = bool(g.impulse)
+        self._enable_dynamic_pressure = bool(g.dynamic_pressure)
+        self._output_remap_data = bool(getattr(dim2d, "output_remap_data", False))
 
     def get_case_inputs(self) -> CaseInputs2D:
         name = self.cmb_material.currentText()
@@ -1471,9 +2289,9 @@ class Tab2D(QWidget):
             cell_size = float(self.spin_cell.value())
 
         mapping = MappingSource2D(
-            case_path=self.txt_source_case.currentText().strip(),
-            time_mode=self.cmb_source_time_mode.currentText(),
-            specific_time=self.txt_source_time.currentText().strip(),
+            case_path=self._remap_case_path or self.txt_source_case.text().strip(),
+            time_mode="latest",
+            specific_time="",
             mapped_radius=self.spin_mapped_radius.value(),
             source_resolution=self.spin_source_resolution.value(),
         )
@@ -1493,17 +2311,18 @@ class Tab2D(QWidget):
             material_props=props,
             p_atm=self.spin_pressure.value(),
             t_atm=self.spin_temperature.value(),
-            outer_boundary=self.cmb_outer.currentText(),
-            top_boundary=self.cmb_top.currentText(),
-            bottom_boundary=self.cmb_bottom.currentText(),
+            outer_boundary=self._combo_stored_value(self.cmb_outer),
+            top_boundary=self._combo_stored_value(self.cmb_top),
+            bottom_boundary=self._combo_stored_value(self.cmb_bottom),
             max_co=self.spin_max_co.value(),
             end_time_s=self.spin_end_time.value(),
             delta_t=self.spin_delta_t.value(),
             adjust_time_step=self.chk_adjust.isChecked(),
-            write_control_type=self.cmb_write_control.currentText(),
+            write_control_type=self._combo_stored_value(self.cmb_write_control),
             write_interval_time=self.spin_write_time.value(),
             write_interval_steps=self.spin_write_steps.value(),
-            cycle_write=self.spin_cycle_write.value(),
+            cycle_write=self._cycle_write,
+            keep_openfoam_time_folders=self._keep_openfoam_time_folders,
             cores=self.spin_cores.value(),
             mesh_mode=self.cmb_mesh_mode.currentText(),
             charge_seed_mode=self.cmb_seed_mode.currentText(),
@@ -1536,8 +2355,19 @@ class Tab2D(QWidget):
             mapping=mapping,
             probes=self._probes(),
             output_fields=tuple(
-                field for field, check in self.output_checks.items() if check.isChecked()
+                dict.fromkeys(
+                    [
+                        field
+                        for field, check in self.output_checks.items()
+                        if check.isChecked()
+                    ]
+                    + list(self._output_option_fields)
+                )
             ),
+            vtk_fields=tuple(self._vtk_fields),
+            enable_impulse=bool(getattr(self, "_enable_impulse", True)),
+            enable_dynamic_pressure=bool(getattr(self, "_enable_dynamic_pressure", False)),
+            output_remap_data=bool(getattr(self, "_output_remap_data", False)),
             mirrored_view=self.cmb_view_mode.currentText() == "Mirrored View",
             show_mesh=self.chk_view_mesh.isChecked(),
             show_probes=self.chk_view_probes.isChecked(),
@@ -1576,7 +2406,6 @@ class Tab2D(QWidget):
                 (self.spin_delta_t, "delta_t"),
                 (self.spin_write_time, "write_interval_time"),
                 (self.spin_write_steps, "write_interval_steps"),
-                (self.spin_cycle_write, "cycle_write"),
                 (self.spin_cores, "cores"),
                 (self.spin_seed_level, "charge_refinement_level"),
                 (self.spin_seed_target, "charge_seed_target_cells"),
@@ -1611,7 +2440,16 @@ class Tab2D(QWidget):
                     continue
                 if key == "material_name" and not values[key]:
                     continue
-                widget.setCurrentText(str(values[key]))
+                stored = str(values[key])
+                if widget in (
+                    self.cmb_outer,
+                    self.cmb_top,
+                    self.cmb_bottom,
+                    self.cmb_write_control,
+                ):
+                    self._set_combo_stored_value(widget, stored)
+                else:
+                    widget.setCurrentText(stored)
             checks = (
                 (self.chk_adjust, "adjust_time_step"),
                 (self.chk_dump_level, "dump_level"),
@@ -1637,9 +2475,12 @@ class Tab2D(QWidget):
                     else "Computational Domain View"
                 )
             if mapping:
-                self.txt_source_case.setEditText(str(mapping.get("case_path", "")))
-                self.cmb_source_time_mode.setCurrentText(str(mapping.get("time_mode", "latest")))
-                self.txt_source_time.setEditText(str(mapping.get("specific_time", "")))
+                loaded_case = str(mapping.get("case_path", "") or "").strip()
+                if loaded_case:
+                    self._remap_kind = RemapFromDialog.FILE_1D
+                    self._set_remap_case_path(loaded_case, from_last_1d=False)
+                self.cmb_source_time_mode.setCurrentText("latest")
+                self.txt_source_time.setEditText("")
                 if mapping.get("mapped_radius") is not None:
                     self.spin_mapped_radius.setValue(float(mapping.get("mapped_radius", 0.5)))
                 if mapping.get("source_resolution") is not None:
@@ -1659,6 +2500,23 @@ class Tab2D(QWidget):
                 selected = set(values.get("output_fields", ()))
                 for field, check in self.output_checks.items():
                     check.setChecked(field in selected)
+                self._output_option_fields = tuple(
+                    field for field in selected if field not in self.output_checks
+                )
+            if "vtk_fields" in values:
+                self._vtk_fields = tuple(values.get("vtk_fields") or ())
+            if "cycle_write" in values:
+                self._cycle_write = int(values["cycle_write"])
+            if "keep_openfoam_time_folders" in values:
+                self._keep_openfoam_time_folders = bool(
+                    values["keep_openfoam_time_folders"]
+                )
+            if "enable_impulse" in values:
+                self._enable_impulse = bool(values["enable_impulse"])
+            if "enable_dynamic_pressure" in values:
+                self._enable_dynamic_pressure = bool(values["enable_dynamic_pressure"])
+            if "output_remap_data" in values:
+                self._output_remap_data = bool(values["output_remap_data"])
         finally:
             if manage_loading:
                 self._loading = False
@@ -1666,6 +2524,7 @@ class Tab2D(QWidget):
         if clear_imported:
             self._active_case_dir = None
             self._actual_cell_count = None
+            self._initialized_charge_cell_count = None
             self.clear_imported_case()
             self.set_simulation_state(SimulationState2D.DRAFT)
             self._apply_enablement()
@@ -1690,6 +2549,88 @@ class Tab2D(QWidget):
 
     def _prepare_transfer_requested(self) -> None:
         self.sig_request_prepare_transfer.emit()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._execution_pane_opening_applied:
+            return
+        QTimer.singleShot(0, self._apply_execution_pane_opening_height_once)
+
+    def _group_required_height(self, box: QWidget) -> int:
+        """Tight height that keeps every visible child unclipped."""
+        saved_min = box.minimumHeight()
+        box.setMinimumHeight(0)
+        box.ensurePolished()
+        if box.layout() is not None:
+            box.layout().activate()
+        hint = max(box.sizeHint().height(), box.minimumSizeHint().height())
+        bottom = 0
+        for child in box.findChildren(QWidget):
+            if not child.isVisibleTo(box) or child.size().isEmpty():
+                continue
+            if any(
+                grandchild.isVisibleTo(child)
+                for grandchild in child.findChildren(QWidget)
+            ):
+                continue
+            bottom = max(bottom, child.mapTo(box, QPoint(0, child.height())).y())
+        frame_bottom = 4
+        if box.height() > 0:
+            frame_bottom = max(frame_bottom, box.height() - box.contentsRect().bottom())
+        box.setMinimumHeight(saved_min)
+        if bottom <= 0:
+            return hint
+        return max(hint, bottom + frame_bottom)
+
+    def _equalize_execution_group_heights(self) -> int:
+        """Give Simulation / Solver / View the same content-driven height."""
+        groups = [
+            box
+            for box in (
+                getattr(self, "grp_sim", None),
+                getattr(self, "grp_solver", None),
+                getattr(self, "grp_view", None),
+            )
+            if box is not None
+        ]
+        if not groups:
+            return 0
+        height = max(self._group_required_height(box) for box in groups)
+        for box in groups:
+            box.setMinimumHeight(height)
+        return height
+
+    def _execution_pane_preferred_height(self) -> int:
+        """Compact Execution Controls tab: shared group height + tab chrome."""
+        self._equalize_execution_group_heights()
+        page = getattr(self, "_exec_scroll", None)
+        page = page.widget() if page is not None else None
+        if page is not None:
+            page.ensurePolished()
+            page_h = max(page.minimumSizeHint().height(), page.sizeHint().height())
+        else:
+            page_h = 0
+        tab_h = self.ctrl_tabs.tabBar().sizeHint().height()
+        style = self.ctrl_tabs.style()
+        frame = style.pixelMetric(QStyle.PM_DefaultFrameWidth, None, self.ctrl_tabs)
+        tab_base = style.pixelMetric(QStyle.PM_TabBarBaseHeight, None, self.ctrl_tabs)
+        return max(
+            EXECUTION_AREA_MIN_HEIGHT,
+            page_h + tab_h + (frame * 2) + tab_base + 24,
+        )
+
+    def _apply_execution_pane_opening_height_once(self) -> None:
+        if self._execution_pane_opening_applied:
+            return
+        self._execution_pane_opening_applied = True
+        self._apply_execution_pane_opening_height()
+
+    def _apply_execution_pane_opening_height(self) -> None:
+        height = self._execution_pane_preferred_height()
+        sizes = self._right_v_splitter.sizes()
+        total = sum(sizes) or (600 + height)
+        self._right_v_splitter.setSizes([max(50, total - height), height])
+        self._2d_exec_splitter_sizes = list(self._right_v_splitter.sizes())
 
     def _on_2d_exec_splitter_moved(self, _pos: int = 0, _index: int = 0) -> None:
         self._2d_exec_splitter_sizes = list(self._right_v_splitter.sizes())

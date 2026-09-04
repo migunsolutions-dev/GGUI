@@ -45,28 +45,8 @@ class StartupMeshWarning:
         return f"{self.message} Consequence: {self.consequence}"
 
 
-def smallest_charge_dimension_m(charge_shape: str, dims: Dict[str, float]) -> Tuple[float, str]:
-    """Return (d_min, binding_dimension_name) per architecture §12 / §16."""
-    shape = (charge_shape or "Sphere").strip()
-    if shape == "Cuboid":
-        if "length" in dims and "width" in dims and "height" in dims:
-            L, W, H = float(dims["length"]), float(dims["width"]), float(dims["height"])
-            d_min = min(L, W, H)
-            name = "min_edge"
-        else:
-            s = float(dims.get("side", 0.1))
-            d_min = s
-            name = "cube_side"
-        return max(d_min, 1e-12), name
-    if shape == "Cylinder":
-        r = float(dims.get("radius", 0.05))
-        length = float(dims.get("length", 0.1))
-        d_diam = 2.0 * r
-        if d_diam <= length + 1e-12:
-            return max(d_diam, 1e-12), "diameter"
-        return max(length, 1e-12), "length"
-    r = float(dims.get("radius", 0.05))
-    return max(2.0 * r, 1e-12), "diameter"
+# Canonical implementation lives in charge_seed_plan (shared physics/planning).
+from charge_seed_plan import smallest_charge_dimension_m  # noqa: F401
 
 
 def recommended_auto_seed_level(

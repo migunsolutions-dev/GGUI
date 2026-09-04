@@ -255,6 +255,9 @@ def _parse_controlDict(case_dir: str, out: Dict[str, Any]) -> None:
     iv = _int_val(text, "cycleWrite")
     if iv is not None:
         out["cycle_write"] = iv
+        # Existing OpenFOAM cases predate the explicit retention checkbox and
+        # therefore retain their historical native-folder behavior.
+        out["keep_openfoam_time_folders"] = True
     # Detect post-processing function objects (impulse / overpressure / fieldMinMax).
     # If any are present, flip enable_post_processing ON so a regenerated case keeps them.
     has_pp = any(
@@ -963,7 +966,7 @@ def _detect_material(out: Dict[str, Any]) -> None:
 # Keys that have a current GUI widget and are filled by Open when present in case.
 UI_FIELD_KEYS = [
     "min_point", "max_point", "cell_size", "boundaries",
-    "cfl_value", "end_time_s", "delta_t", "write_control_type", "write_interval_time", "write_interval_steps", "cycle_write",
+    "cfl_value", "end_time_s", "delta_t", "write_control_type", "write_interval_time", "write_interval_steps", "cycle_write", "keep_openfoam_time_folders",
     "material_name", "custom_material_props",
     "charge_shape", "mass_kg", "rho_charge", "charge_radius", "charge_lbyd", "charge_length", "charge_width", "charge_height", "charge_center",
     "initiation_point", "ignition_mode",

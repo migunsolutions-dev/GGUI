@@ -3,7 +3,14 @@ import math
 from typing import Dict, Tuple
 
 from base_generator import BaseGenerator
-from models import CaseInputs1D, RecommendedParams1D
+from models import (
+    BOUNDARY_1D_REFLECT,
+    BOUNDARY_1D_RIGHT_OPTIONS,
+    BOUNDARY_1D_TRANSMIT,
+    CaseInputs1D,
+    RecommendedParams1D,
+)
+from output_options import extra_function_objects
 
 class Generator1D(BaseGenerator):
     """
@@ -43,36 +50,47 @@ class Generator1D(BaseGenerator):
         
         return case_dir
 
+    @staticmethod
+    def _right_boundary(inputs: CaseInputs1D) -> str:
+        kind = str(getattr(inputs, "right_boundary", BOUNDARY_1D_TRANSMIT) or BOUNDARY_1D_TRANSMIT)
+        return kind if kind in BOUNDARY_1D_RIGHT_OPTIONS else BOUNDARY_1D_TRANSMIT
+
     def write_initial_conditions(self, case_dir: str, inputs: CaseInputs1D) -> None:
         # Write to 0.orig so Allrun's "cp -r 0.orig 0" restores initial conditions (same as 3D flow).
         zero_dir = os.path.join(case_dir, "0.orig")
         rho_air = 1.225
         patches = ["origin", "outlet", "axis", "outerCone", "wedgeFront", "wedgeBack"]
+        right = self._right_boundary(inputs)
 
-        # Outlet: pressureWaveTransmissive for p (like mappedBuilding3D) minimizes reflections; zeroGradient for U.
-        # If blastFoam does not support pressureWaveTransmissive, fall back to advective for p.
         def scalar_bcs(name, val):
             lines = ["boundaryField", "{"]
             for pch in patches:
-                if pch.startswith("wedge"): lines.append(f"    {pch} {{ type wedge; }}")
+                if pch.startswith("wedge"):
+                    lines.append(f"    {pch} {{ type wedge; }}")
                 elif pch in ("axis", "outerCone", "origin"):
                     lines.append(f"    {pch} {{ type symmetry; }}")
-                else:
-                    if name == "p" and pch == "outlet":
-                        lines.append(f"    {pch} {{ type pressureWaveTransmissive; value uniform {inputs.p_atm}; }}")
+                elif pch == "outlet":
+                    if right == BOUNDARY_1D_TRANSMIT and name == "p":
+                        lines.append(
+                            f"    {pch} {{ type pressureWaveTransmissive; value uniform {inputs.p_atm}; }}"
+                        )
                     else:
                         lines.append(f"    {pch} {{ type zeroGradient; }}")
+                else:
+                    lines.append(f"    {pch} {{ type zeroGradient; }}")
             lines.append("}\n")
             return "\n".join(lines)
 
         def vector_bcs():
             lines = ["boundaryField", "{"]
             for pch in patches:
-                if pch.startswith("wedge"): lines.append(f"    {pch} {{ type wedge; }}")
+                if pch.startswith("wedge"):
+                    lines.append(f"    {pch} {{ type wedge; }}")
                 elif pch in ("axis", "outerCone", "origin"):
                     lines.append(f"    {pch} {{ type symmetry; }}")
+                elif pch == "outlet" and right == BOUNDARY_1D_REFLECT:
+                    lines.append(f"    {pch} {{ type slip; }}")
                 else:
-                    # Outlet: zeroGradient like mappedBuilding3D (allows outflow without reflection)
                     lines.append(f"    {pch} {{ type zeroGradient; }}")
             lines.append("}\n")
             return "\n".join(lines)
@@ -161,8 +179,10 @@ air
 
         wedge_half = math.radians(inputs.wedge_angle_deg) / 2.0
         cone_half = math.radians(inputs.cone_half_angle_deg)
-        # Small theta so axis face has finite area; axis_epsilon is a small number (e.g. 1e-3 rad)
-        axis_eps = max(1e-9, min(float(inputs.axis_epsilon), cone_half * 0.5))
+        # Axis face length is r*sin(θ)*Δφ. Thin wedges + tiny θ freeze CFL at the origin.
+        requested_eps = max(1e-9, float(inputs.axis_epsilon))
+        min_axis_eps = min(0.10, cone_half * 0.45)
+        axis_eps = min(max(requested_eps, min_axis_eps), cone_half * 0.5)
 
         # Spherical wedge: vertices on spheres r=const so rotateFields produces a sphere (not a cylinder).
         # x = r*cos(theta), y = r*sin(theta)*cos(phi), z = r*sin(theta)*sin(phi); axis = x, theta from axis.
@@ -191,8 +211,9 @@ air
         mesh.append(");\nblocks\n(")
         mesh.append(f"    hex (0 3 2 1 4 7 6 5) (1 1 {n_r}) simpleGrading (1 1 1)")
         mesh.append(");\nedges\n(\n);\nboundary\n(")
+        outlet_type = "wall" if self._right_boundary(inputs) == BOUNDARY_1D_REFLECT else "patch"
         mesh.append("    origin     { type symmetry; faces ((4 7 6 5)); }")
-        mesh.append("    outlet     { type patch;    faces ((0 3 2 1)); }")
+        mesh.append(f"    outlet     {{ type {outlet_type};    faces ((0 3 2 1)); }}")
         mesh.append("    axis       { type symmetry; faces ((0 4 7 3)); }")
         mesh.append("    outerCone  { type symmetry; faces ((1 2 6 5)); }")
         mesh.append("    wedgeFront { type wedge;    faces ((0 1 5 4)); }")
@@ -244,6 +265,40 @@ regions ( sphereToCell {{ centre (0 0 0); radius {float(charge_radius):.10g}; fi
         # Safety end time so run does not end before shock can reach target (slow shock ~300 m/s, *2 margin)
         safe_end_time = (target_radius / 300.0) * 2.0
         end_time = max(float(inputs.end_time_s), safe_end_time)
+        # write_interval_s <= 0: one field dump at endTime. Probes still stream the 1D graph.
+        user_write = float(inputs.write_interval_s)
+        field_write_interval = user_write if user_write > 0.0 else end_time
+        probe_steps = max(1, int(inputs.probe_write_interval_steps))
+        foam_fields = tuple(getattr(inputs, "probe_fields", ("p",)) or ("p",))
+        if "p" not in foam_fields:
+            foam_fields = ("p",) + foam_fields
+        fields_txt = " ".join(foam_fields)
+        extras = extra_function_objects(
+            p_atm=float(inputs.p_atm),
+            impulse=bool(getattr(inputs, "enable_impulse", False)) or "impulse" in foam_fields,
+            overpressure=False,
+            dynamic_pressure=bool(getattr(inputs, "enable_dynamic_pressure", False)),
+            peaks=False,
+        )
+        gauges_block = ""
+        user_gauges = tuple(getattr(inputs, "gauge_locations", ()) or ())
+        if user_gauges:
+            gauge_pts = []
+            for radius, _label in user_gauges:
+                r_i = max(r_min + 1e-7, min(float(radius), r_max_val - 1e-7))
+                v = vtx_spherical(r_i, theta_mid, 0.0)
+                gauge_pts.append(f"            ({v[0]:.6g} {v[1]:.6g} {v[2]:.6g})")
+            gauges_block = f"""
+    gauges1d
+    {{
+        type            probes;
+        libs            ("libfieldFunctionObjects.so");
+        fields          ({fields_txt});
+        writeControl    timeStep;
+        writeInterval   {probe_steps};
+        probeLocations  ( {os.linesep.join(gauge_pts)} );
+    }}
+"""
 
         cd = self._foam_header("controlDict", "dictionary", "system") + f"""
 application     blastFoam;
@@ -256,30 +311,30 @@ adjustTimeStep  yes;
 maxCo           {float(rec.maxCo):.10g};
 maxDeltaT       {float(rec.maxDeltaT):.10g};
 writeControl    runTime;
-writeInterval   {float(inputs.write_interval_s):.10g};
-purgeWrite      0;
+writeInterval   {field_write_interval:.10g};
+purgeWrite      1;
 writeFormat     ascii;
 writePrecision  6;
 writeCompression off;
 runTimeModifiable true;
 functions
 {{
-    probes1d
+{extras}    probes1d
     {{
         type            probes;
         libs            ("libfieldFunctionObjects.so");
-        fields          (p);
+        fields          ({fields_txt});
         writeControl    timeStep;
-        writeInterval   {inputs.probe_write_interval_steps};
+        writeInterval   {probe_steps};
         probeLocations  ( {os.linesep.join(probe_points)} );
     }}
-    watchdog_probe
+{gauges_block}    watchdog_probe
     {{
         type            probes;
         libs            ("libfieldFunctionObjects.so");
         fields          (p);
         writeControl    timeStep;
-        writeInterval   1;
+        writeInterval   {probe_steps};
         probeLocations  ( {watchdog_point} );
     }}
 }}

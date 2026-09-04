@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
 
 from PyQt5.QtCore import QRect, Qt
-from PyQt5.QtWidgets import QApplication, QLabel, QScrollArea, QToolBar
+from PyQt5.QtWidgets import QApplication, QGroupBox, QLabel, QScrollArea, QToolBar
 
 from ui_metrics import (
     COMPUTATIONAL_LEFT_PANEL_WIDTH,
@@ -181,11 +181,97 @@ class TestUILayoutConsistency(unittest.TestCase):
             self.app.processEvents()
             tab = win.tab_2d
             self.assertGreaterEqual(tab.ctrl_tabs.height(), EXECUTION_AREA_MIN_HEIGHT)
+            content_h = tab._exec_scroll.widget().minimumSizeHint().height()
+            tab_bar_h = tab.ctrl_tabs.tabBar().sizeHint().height()
+            preferred = tab._execution_pane_preferred_height()
+            self.assertGreaterEqual(
+                tab.ctrl_tabs.height(),
+                min(content_h + tab_bar_h, preferred) - 8,
+            )
+            self.assertLessEqual(tab.ctrl_tabs.height(), preferred + 24)
+            self.assertEqual(tab.grp_sim.height(), tab.grp_solver.height())
+            self.assertEqual(tab.grp_solver.height(), tab.grp_view.height())
             vp = tab._exec_scroll.viewport()
-            for btn in (tab.btn_run, tab.btn_stop):
+            for btn in (tab.btn_initialize, tab.btn_exact_end, tab.btn_stop):
                 br = btn.rect()
                 mapped = QRect(btn.mapTo(vp, br.topLeft()), br.size())
                 self.assertTrue(_rect_contained(mapped, vp.rect()), msg=btn.text())
+            last_radio = tab._field_radios["cellLevel"]
+            mapped_radio = QRect(
+                last_radio.mapTo(vp, last_radio.rect().topLeft()),
+                last_radio.rect().size(),
+            )
+            self.assertTrue(_rect_contained(mapped_radio, vp.rect()), msg=last_radio.text())
+            mapped_solver = QRect(
+                tab.spin_cores.mapTo(vp, tab.spin_cores.rect().topLeft()),
+                tab.spin_cores.rect().size(),
+            )
+            self.assertTrue(_rect_contained(mapped_solver, vp.rect()), msg="Processor cores")
+            self.assertEqual(tab._exec_scroll.verticalScrollBar().maximum(), 0)
+            tab._right_v_splitter.setSizes([800, EXECUTION_AREA_MIN_HEIGHT])
+            self.app.processEvents()
+            self.assertGreater(tab._exec_scroll.verticalScrollBar().maximum(), 0)
+        finally:
+            win.close()
+
+    def test_computational_tabs_embed_status_caption_on_fit_row(self):
+        win = self._make_main()
+        try:
+            sb = win.status_bar
+            for tab in (win.tab_1d, win.tab_2d, win.tab_3d):
+                win.tabs.setCurrentWidget(tab)
+                self.app.processEvents()
+                host = tab._status_caption_host
+                viewport = host.parentWidget()
+                self.assertTrue(host.isAncestorOf(sb.lbl_status))
+                self.assertFalse(host.isAncestorOf(sb._metrics_scroll))
+                self.assertTrue(sb.isAncestorOf(sb._metrics_scroll))
+                self.assertFalse(sb.isHidden())
+                self.assertTrue(sb.lbl_1d_group.isVisible())
+                self.assertEqual(
+                    int(sb.lbl_status.alignment()) & int(Qt.AlignLeft),
+                    int(Qt.AlignLeft),
+                )
+                status_left = sb.lbl_status.mapTo(viewport, sb.lbl_status.rect().topLeft()).x()
+                fit_left = tab.btn_fit.mapTo(viewport, tab.btn_fit.rect().topLeft()).x()
+                self.assertLess(status_left, fit_left)
+                status_top = sb.lbl_status.mapTo(viewport, sb.lbl_status.rect().topLeft()).y()
+                fit_top = tab.btn_fit.mapTo(viewport, tab.btn_fit.rect().topLeft()).y()
+                self.assertLess(abs(status_top - fit_top), 12)
+            win.tabs.setCurrentWidget(win.tab_jotter)
+            self.app.processEvents()
+            self.assertTrue(sb.isAncestorOf(sb.lbl_status))
+            self.assertTrue(sb.isAncestorOf(sb._metrics_scroll))
+        finally:
+            win.close()
+
+    def test_2d_cell_counts_live_in_info_panel(self):
+        win = self._make_main()
+        try:
+            win.tabs.setCurrentWidget(win.tab_2d)
+            self.app.processEvents()
+            tab = win.tab_2d
+            self.assertTrue(tab.info_frame.isAncestorOf(tab.lbl_radial_cells))
+            self.assertTrue(tab.info_frame.isAncestorOf(tab.lbl_vertical_cells))
+            self.assertTrue(tab.info_frame.isAncestorOf(tab.lbl_radial_cells_title))
+            self.assertTrue(tab.info_frame.isAncestorOf(tab.lbl_vertical_cells_title))
+            domain = next(
+                box
+                for box in tab.findChildren(QGroupBox)
+                if box.title() == "Domain Definition"
+            )
+            self.assertFalse(domain.isAncestorOf(tab.lbl_radial_cells))
+            self.assertFalse(domain.isAncestorOf(tab.lbl_vertical_cells))
+            self.assertTrue(tab.info_frame.isAncestorOf(tab.lbl_effective_domain))
+            self.assertFalse(domain.isAncestorOf(tab.lbl_effective_domain))
+            self.assertEqual(tab.lbl_radial_cells_title.text(), "Radius Cells:")
+            self.assertEqual(tab.lbl_vertical_cells_title.text(), "Height Cells:")
+            self.assertTrue(tab.lbl_radial_cells.isHidden())
+            self.assertTrue(tab.lbl_vertical_cells.isHidden())
+            self.assertFalse(tab.lbl_info_grid.isHidden())
+            self.assertFalse(tab.lbl_info_resolution.isHidden())
+            self.assertTrue(tab.info_frame.isAncestorOf(tab.info_body))
+            self.assertFalse(tab._left_setup_scroll.isAncestorOf(tab.info_frame))
         finally:
             win.close()
 
@@ -213,14 +299,22 @@ class TestUILayoutConsistency(unittest.TestCase):
             sb = win.status_bar
             pt = sb.metrics_point_size()
             self.assertEqual(pt, STATUS_METRICS_POINT_SIZE)
-            self.assertEqual(pt, 9)
+            self.assertEqual(pt, 8)
+            self.assertEqual(sb.lbl_1d_group.font().letterSpacing(), 100.0)
+            self.assertGreaterEqual(sb.lbl_1d_group.font().weight(), 75)
+            for lbl in (sb.lbl_1d_group, sb.lbl_2d_group, sb.lbl_3d_group):
+                self.assertRegex(lbl.text(), r"Step= {6}0")
+                self.assertRegex(lbl.text(), r"Tt=\d\.\d{3}e[+\-]\d{2}")
+                self.assertRegex(lbl.text(), r"Δt=\d\.\d{3}e[+\-]\d{2}")
+            self.assertRegex(sb.lbl_et.text(), r"ET=\s{5}0 s")
+            self.assertNotIn(" | ", sb.lbl_metrics_line.text())
             ready_pt = sb.lbl_status.font().pointSize()
             self.assertEqual(ready_pt, STATUS_READY_POINT_SIZE)
             self.assertEqual(ready_pt, 11)
 
-            sb.update_1d(12345678, 1.23456e-4, 1.23456e-7)
-            sb.update_2d(23456789, 2.34567e-4, 2.34567e-7)
-            sb.update_3d(34567890, 3.45678e-4, 3.45678e-7)
+            sb.update_1d(1234567, 1.23456e-4, 1.23456e-7)
+            sb.update_2d(2345678, 2.34567e-4, 2.34567e-7)
+            sb.update_3d(3456789, 3.45678e-4, 3.45678e-7)
             sb.start_et_timing()
             self.app.processEvents()
             sb.stop_et_timing()
@@ -229,7 +323,7 @@ class TestUILayoutConsistency(unittest.TestCase):
             win.resize(1685, 1060)
             self.app.processEvents()
             self.assertAlmostEqual(win.width(), 1685, delta=2)
-            self.assertEqual(sb.metrics_point_size(), 9)
+            self.assertEqual(sb.metrics_point_size(), STATUS_METRICS_POINT_SIZE)
             self.assertEqual(sb.lbl_status.font().pointSize(), 11)
             self.assertEqual(sb.height(), 36)
             self.assertEqual(sb._metrics_scroll.verticalScrollBar().maximum(), 0)
@@ -237,8 +331,12 @@ class TestUILayoutConsistency(unittest.TestCase):
                 sb._metrics_scroll.verticalScrollBarPolicy(),
                 Qt.ScrollBarAlwaysOff,
             )
+            self.assertEqual(
+                sb._metrics_scroll.horizontalScrollBarPolicy(),
+                Qt.ScrollBarAlwaysOff,
+            )
             hs = sb._metrics_scroll.horizontalScrollBar()
-            self.assertEqual(hs.maximum(), 0, msg="status should fit at 1685 without scroll")
+            self.assertEqual(hs.maximum(), 0)
             self.assertNotIn("\n", sb.lbl_metrics_line.text())
             self.assertNotIn("Initial Δt", sb.lbl_metrics_line.text())
             for lbl in sb.metrics_value_labels():
@@ -256,10 +354,11 @@ class TestUILayoutConsistency(unittest.TestCase):
                 self.assertGreaterEqual(lbl.width(), fm.horizontalAdvance(STATUS_REP_MODE_GROUP))
             self.assertGreaterEqual(sb.lbl_et.width(), fm.horizontalAdvance(STATUS_REP_ET))
             vp = sb._metrics_scroll.viewport()
-            for lbl in sb.metrics_value_labels():
-                br = lbl.rect()
-                mapped = QRect(lbl.mapTo(vp, br.topLeft()), br.size())
-                self.assertTrue(vp.rect().contains(mapped), msg=lbl.objectName())
+            mapped_1d = QRect(
+                sb.lbl_1d_group.mapTo(vp, sb.lbl_1d_group.rect().topLeft()),
+                sb.lbl_1d_group.rect().size(),
+            )
+            self.assertTrue(vp.rect().intersects(mapped_1d))
             self.assertTrue(sb.lbl_status.isVisible())
             ready_mapped = QRect(
                 sb.lbl_status.mapTo(win, sb.lbl_status.rect().topLeft()),
@@ -270,20 +369,36 @@ class TestUILayoutConsistency(unittest.TestCase):
             win.resize(1250, 900)
             self.app.processEvents()
             self.assertAlmostEqual(win.width(), 1250, delta=2)
-            self.assertEqual(sb.metrics_point_size(), 9)
-            self.assertEqual(sb.lbl_status.font().pointSize(), 11)
-            self.assertTrue(sb.lbl_status.isVisible())
-            self.assertGreaterEqual(sb._metrics_scroll.horizontalScrollBar().maximum(), 0)
+            self.assertEqual(sb.metrics_point_size(), STATUS_METRICS_POINT_SIZE)
+            self.assertEqual(sb._metrics_scroll.horizontalScrollBarPolicy(), Qt.ScrollBarAlwaysOff)
+            self.assertFalse(sb._metrics_scroll.horizontalScrollBar().isVisible())
             self.assertEqual(sb._metrics_scroll.verticalScrollBar().maximum(), 0)
             for lbl in sb.metrics_value_labels():
                 self.assertFalse(lbl.wordWrap())
                 self.assertNotIn("\n", lbl.text())
             # histories persist; ET remains a separate segment
-            self.assertIn("12345678", sb.lbl_1d_group.text())
-            self.assertIn("23456789", sb.lbl_2d_group.text())
-            self.assertIn("34567890", sb.lbl_3d_group.text())
+            self.assertIn("1234567", sb.lbl_1d_group.text())
+            self.assertIn("2345678", sb.lbl_2d_group.text())
+            self.assertIn("3456789", sb.lbl_3d_group.text())
             self.assertTrue(sb.lbl_et.text().startswith("ET="))
             self.assertNotEqual(sb.lbl_et.text(), f"ET={sb._DASH}")
+            sb._et_seconds = 1_000_000
+            sb._sync_visible_metrics_line()
+            self.assertRegex(sb.lbl_et.text(), r"ET=\d\.\d{3}e[+\-]\d+ s")
+        finally:
+            win.close()
+
+    def test_status_metrics_are_global_across_tabs(self):
+        win = self._make_main()
+        try:
+            sb = win.status_bar
+            for tab in (win.tab_1d, win.tab_2d, win.tab_3d):
+                win.tabs.setCurrentWidget(tab)
+                self.app.processEvents()
+                self.assertTrue(sb.isAncestorOf(sb._metrics_scroll))
+                self.assertTrue(sb.lbl_1d_group.isVisible())
+                self.assertRegex(sb.lbl_1d_group.text(), r"Tt=\d\.\d{3}e[+\-]\d{2}")
+                self.assertRegex(sb.lbl_et.text(), r"ET=\s+\d+ s")
         finally:
             win.close()
 

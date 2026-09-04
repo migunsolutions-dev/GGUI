@@ -20,6 +20,7 @@ from charge_capture import CAPTURE_CELL_SAFETY, auto_charge_capture_radius_m
 from material_catalog import jwl_parameters
 from material_validation import validate_required_values
 from models_2d import CaseInputs2D
+from output_options import REMAP_2D_FILENAME, extra_function_objects
 from path_utils import win_to_wsl_path
 
 
@@ -452,6 +453,28 @@ snGradSchemes { default corrected; }
         # dynamicMeshDict Switch ``refineProbes`` (errorEstimator), which marks
         # cells at existing ``probes`` / ``blastProbes`` function-object locations.
         # There is no supported controlDict function type ``refineProbes``.
+        probe_fields = list(inputs.output_fields) if inputs.output_fields else ["p"]
+        if bool(getattr(inputs, "enable_impulse", False)) and "impulse" not in probe_fields:
+            probe_fields.append("impulse")
+        if bool(getattr(inputs, "enable_dynamic_pressure", False)) and "dynamicPressure" not in probe_fields:
+            probe_fields.append("dynamicPressure")
+        extras = extra_function_objects(
+            p_atm=float(inputs.p_atm),
+            impulse=bool(getattr(inputs, "enable_impulse", False)) or "impulse" in probe_fields,
+            overpressure=False,
+            dynamic_pressure=bool(getattr(inputs, "enable_dynamic_pressure", False)),
+            peaks=False,
+        )
+        remap_block = ""
+        if bool(getattr(inputs, "output_remap_data", False)):
+            remap_block = """    remapDump
+    {
+        type            writeObjects;
+        libs            ("libutilityFunctionObjects.so");
+        objects         (p U rho T alpha.c4);
+        writeControl    onEnd;
+    }
+"""
         probes_block = ""
         if probes:
             probes_block = f"""
@@ -459,7 +482,7 @@ snGradSchemes { default corrected; }
     {{
         type probes;
         libs ("libfieldFunctionObjects.so");
-        fields ({' '.join(inputs.output_fields)});
+        fields ({' '.join(probe_fields)});
         writeControl timeStep;
         writeInterval 1;
         probeLocations
@@ -468,6 +491,11 @@ snGradSchemes { default corrected; }
         );
     }}
 """
+        retained_cycle = (
+            int(inputs.cycle_write)
+            if bool(getattr(inputs, "keep_openfoam_time_folders", False))
+            else 0
+        )
         control = self._foam_header("controlDict", "dictionary", "system") + f"""
 application blastFoam;
 startFrom startTime;
@@ -479,7 +507,7 @@ adjustTimeStep {'yes' if inputs.adjust_time_step else 'no'};
 maxCo {inputs.max_co:.12g};
 writeControl {write_control};
 writeInterval {write_interval};
-purgeWrite {inputs.cycle_write};
+purgeWrite {retained_cycle};
 writeFormat ascii;
 writePrecision 12;
 writeCompression off;
@@ -488,7 +516,7 @@ timePrecision 10;
 runTimeModifiable true;
 functions
 {{
-{probes_block}}}
+{extras}{probes_block}{remap_block}}}
 """
         self._write_text(os.path.join(system, "controlDict"), control)
         decompose = (
@@ -513,10 +541,20 @@ set -e
 {init}
 {decompose}{solver} 2>&1 | tee log.blastFoam
 """
-        allclean = """#!/usr/bin/env bash
+        if bool(getattr(inputs, "output_remap_data", False)):
+            allrun += f"""
+latest=$(ls -1d [0-9]* 0.[0-9]* 2>/dev/null | sort -g | tail -1)
+{{
+  echo '/* GGUI 2D remap snapshot ({REMAP_2D_FILENAME}) */'
+  echo "time            ${{latest:-latest}};"
+  echo 'sourceCase      ".";'
+  echo 'fields          (p rho U T alpha.c4);'
+}} > {REMAP_2D_FILENAME}
+"""
+        allclean = f"""#!/usr/bin/env bash
 cd "$(dirname "$0")" || exit 1
 rm -rf processor* [1-9]* 0.[0-9]* constant/polyMesh postProcessing dynamicCode 2>/dev/null || true
-rm -f log.* *.foam 2>/dev/null || true
+rm -f log.* *.foam {REMAP_2D_FILENAME} 2>/dev/null || true
 rm -rf 0 2>/dev/null || true
 """
         self._write_text(os.path.join(case_dir, "Allrun"), allrun)

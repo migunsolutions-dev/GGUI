@@ -12,19 +12,19 @@ from PyQt5.QtWidgets import QSizePolicy
 
 from openfoam_times_2d import (
     LIVE_FOLLOW_LABEL,
+    TIME_ZERO_LABEL,
     list_numeric_time_entries,
-    match_reader_time_value,
-    pick_opening_time,
+    make_single_time_case_view,
+    opening_time_entry,
     poly_mesh_dir_at_or_before,
+    poly_mesh_dir_for_time_zero,
+    remove_single_time_case_view,
 )
 from viewer_gl import (
-    close_plotter_safely,
     create_embedded_interactor,
-    live_viewer_registry_snapshot,
+    guard_embedded_interactor,
     register_viewer,
     scalar_bar_kwargs,
-    stop_plotter_render_timer,
-    unregister_viewer,
 )
 from viewer_widget import BlastViewerWidget, FieldViewSettings, HAS_PV, pv
 
@@ -193,6 +193,7 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         self._shutdown = False
         self._refresh_busy = False
         self._refresh_pending = False
+        self._preview_busy = False
         self._gui_thread_id: Optional[int] = None
         self._scalar_bar_actor = None
         self._cell_count_source = "none"
@@ -201,10 +202,14 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         self._last_edge_count: Optional[int] = None
         self._last_surface_cells: Optional[int] = None
         self._available_time_entries: List[Tuple[float, str]] = []
-        self._selected_time_label: str = "0"
+        self._times_catalog_loaded: bool = False
+        self._selected_time_label: str = TIME_ZERO_LABEL
         self._selected_time_value: float = 0.0
         self._live_follow: bool = False
         self._resolved_display_time: Optional[float] = None
+        self._of_view_root: Optional[str] = None
+        self._of_view_label: Optional[str] = None
+        self._of_view_case: Optional[str] = None
         super().__init__(parent)
         self._gui_thread_id = int(QThread.currentThreadId()) if QThread.currentThreadId() else None
         self._coalesce_timer = QTimer(self)
@@ -213,7 +218,7 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         self._coalesce_timer.timeout.connect(self._run_coalesced_refresh)
 
     def _init_vtk(self):
-        """2D viewport: no 3D orientation triad; Radius-Height labels only."""
+        """2D viewport: no 3D orientation triad and no overlay captions."""
         if not HAS_PV:
             return
         # Critical: disable pyvistaqt's default 5 Hz auto_update timer.
@@ -234,14 +239,17 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         except Exception:
             pass
         self.plotter_layout.addWidget(interactor)
+        guard_embedded_interactor(interactor, self)
         self._gl_info = register_viewer("AxisymmetricViewerWidget/2D", self, self._plotter)
 
     def set_viewport_active(self, active: bool) -> None:
-        self._viewport_active = bool(active)
-        stop_plotter_render_timer(self._plotter)
+        was_active = bool(self._viewport_active)
+        super().set_viewport_active(active)
         if not active and self._coalesce_timer is not None:
             self._coalesce_timer.stop()
             self._refresh_pending = False
+        elif active and not was_active:
+            QTimer.singleShot(0, self.request_refresh)
 
     def _assert_gui_thread(self) -> bool:
         if self._shutdown or self._plotter is None:
@@ -282,23 +290,19 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         self._refresh_pending = False
         self.refresh_view()
 
+    def release_vtk(self) -> None:
+        self._scalar_bar_actor = None
+        super().release_vtk()
+
     def shutdown_viewer(self) -> None:
         """Stop timers and close VTK while the Qt HWND is still valid."""
         if self._shutdown and self._plotter is None:
             return
-        self._shutdown = True
-        self._viewport_active = False
         self._refresh_pending = False
+        self._discard_of_view_root()
         if self._coalesce_timer is not None:
             self._coalesce_timer.stop()
-        plotter = self._plotter
-        self._plotter = None
-        stop_plotter_render_timer(plotter)
-        close_plotter_safely(plotter, owner="AxisymmetricViewerWidget/2D")
-        unregister_viewer(self)
-        self._dynamic_actors.clear()
-        self._probe_actors = []
-        self._scalar_bar_actor = None
+        super().shutdown_viewer()
 
     def set_mirrored_view(self, mirrored: bool) -> None:
         self.mirrored_view = bool(mirrored)
@@ -325,10 +329,12 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         self._unavailable_field_message = str(message or "")
         self._scalar_bar_actor = None
         self._live_follow = False
-        self._selected_time_label = "0"
+        self._selected_time_label = TIME_ZERO_LABEL
         self._selected_time_value = 0.0
         self._available_time_entries = []
+        self._times_catalog_loaded = False
         self._resolved_display_time = None
+        self._discard_of_view_root()
         if self._plotter and not self._shutdown:
             try:
                 self._plotter.clear()
@@ -366,14 +372,15 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         self._cell_size = cell_size if cell_size is not None and cell_size > 0 else 0.1
         self._scalar_bar_actor = None
         self._dynamic_actors.clear()
-        # Opening always resets to time 0 — never latest, never live-follow.
+        # Opening always resets to time 0. Do not list other saved times here.
         self._live_follow = False
-        entries = list_numeric_time_entries(case_path) if case_path else []
-        self._available_time_entries = list(entries)
-        label, tval = pick_opening_time(entries)
+        self._times_catalog_loaded = False
+        tval, label = opening_time_entry()
         self._selected_time_label = label
         self._selected_time_value = float(tval)
+        self._available_time_entries = [(float(tval), label)]
         self._resolved_display_time = None
+        self._discard_of_view_root()
         self._emit_times_changed()
         if self._plotter and self._assert_gui_thread():
             try:
@@ -397,9 +404,47 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
     def available_time_labels(self) -> List[str]:
         return [label for _, label in self._available_time_entries]
 
+    def ensure_time_catalog(self) -> None:
+        """List saved times only when the user asks (Time popup / later pick)."""
+        if self._times_catalog_loaded:
+            return
+        self._sync_available_times_from_case()
+        self._times_catalog_loaded = True
+
+    def _discard_of_view_root(self) -> None:
+        remove_single_time_case_view(self._of_view_root)
+        self._of_view_root = None
+        self._of_view_label = None
+        self._of_view_case = None
+
+    def _single_time_foam_file(self) -> Optional[str]:
+        """Foam file in a one-time-dir view of the case, or None to use the real case."""
+        case = self.current_case_dir
+        label = self._selected_time_label or TIME_ZERO_LABEL
+        if not case:
+            return None
+        if (
+            self._of_view_root
+            and self._of_view_case == case
+            and self._of_view_label == label
+            and os.path.isdir(self._of_view_root)
+        ):
+            return os.path.join(self._of_view_root, "case.foam")
+        self._discard_of_view_root()
+        try:
+            root = make_single_time_case_view(case, label)
+        except OSError as exc:
+            _LOG.warning("single-time OpenFOAM view not created: %s", exc)
+            return None
+        self._of_view_root = root
+        self._of_view_label = label
+        self._of_view_case = case
+        return os.path.join(root, "case.foam")
+
     def enable_live_follow(self) -> None:
         """Enter live-follow after the user explicitly starts exact END."""
         self._live_follow = True
+        self._discard_of_view_root()
         self._emit_times_changed()
         self.request_refresh()
 
@@ -453,6 +498,7 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         # Refreshing must not change a pinned selection; only grow the Time list.
         if current != previous:
             self._emit_times_changed()
+        self._times_catalog_loaded = True
 
     def set_field(self, name):
         self.current_field = name
@@ -503,113 +549,111 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         self.set_axisymmetric_domain(radius, height)
         if not self._plotter or not HAS_PV or self.is_simulating or self._shutdown:
             return
+        if not getattr(self, "_viewport_active", True):
+            return
         if not self._assert_gui_thread():
             return
-        self._plotter.clear()
-        self._scalar_bar_actor = None
-        r0 = -radius if self.mirrored_view else 0.0
-        domain_points = np.array(
-            [
-                [r0, 0.0, 0.0],
-                [radius, 0.0, 0.0],
-                [radius, height, 0.0],
-                [r0, height, 0.0],
-                [r0, 0.0, 0.0],
-            ]
-        )
-        domain = pv.lines_from_points(domain_points)
-        self._plotter.add_mesh(domain, color="black", line_width=2)
-        self._plotter.add_mesh(
-            pv.Line((0.0, 0.0, 0.0), (0.0, height, 0.0)),
-            color="#2c3e50",
-            line_width=2,
-        )
+        if self._preview_busy:
+            return
+        self._preview_busy = True
+        try:
+            self._plotter.clear()
+            self._scalar_bar_actor = None
+            r0 = -radius if self.mirrored_view else 0.0
+            domain_points = np.array(
+                [
+                    [r0, 0.0, 0.0],
+                    [radius, 0.0, 0.0],
+                    [radius, height, 0.0],
+                    [r0, height, 0.0],
+                    [r0, 0.0, 0.0],
+                ]
+            )
+            domain = pv.lines_from_points(domain_points)
+            self._plotter.add_mesh(domain, color="black", line_width=2)
+            self._plotter.add_mesh(
+                pv.Line((0.0, 0.0, 0.0), (0.0, height, 0.0)),
+                color="#2c3e50",
+                line_width=2,
+            )
 
-        # Planned base grid (optional overlay — not a solver mesh).
-        if charge.get("show_grid"):
-            dx = float(charge.get("cell_size") or 0.0)
-            if dx > 0 and math.isfinite(dx):
-                nr = max(1, int(round(radius / dx)))
-                nz = max(1, int(round(height / dx)))
-                # Cap line count for interactive preview.
-                step_r = max(1, nr // 40)
-                step_z = max(1, nz // 40)
-                for i in range(0, nr + 1, step_r):
-                    x = min(radius, i * dx)
-                    self._plotter.add_mesh(
-                        pv.Line((x, 0.0, 0.0), (x, height, 0.0)),
-                        color="#bdc3c7",
-                        line_width=1,
-                        opacity=0.55,
-                    )
-                    if self.mirrored_view and x > 0:
+            # Planned base grid (optional overlay — not a solver mesh).
+            if charge.get("show_grid"):
+                dx = float(charge.get("cell_size") or 0.0)
+                if dx > 0 and math.isfinite(dx):
+                    nr = max(1, int(round(radius / dx)))
+                    nz = max(1, int(round(height / dx)))
+                    # Cap line count for interactive preview.
+                    step_r = max(1, nr // 40)
+                    step_z = max(1, nz // 40)
+                    for i in range(0, nr + 1, step_r):
+                        x = min(radius, i * dx)
                         self._plotter.add_mesh(
-                            pv.Line((-x, 0.0, 0.0), (-x, height, 0.0)),
+                            pv.Line((x, 0.0, 0.0), (x, height, 0.0)),
                             color="#bdc3c7",
                             line_width=1,
-                            opacity=0.35,
+                            opacity=0.55,
                         )
-                for j in range(0, nz + 1, step_z):
-                    y = min(height, j * dx)
-                    self._plotter.add_mesh(
-                        pv.Line((r0, y, 0.0), (radius, y, 0.0)),
-                        color="#bdc3c7",
-                        line_width=1,
-                        opacity=0.55,
-                    )
+                        if self.mirrored_view and x > 0:
+                            self._plotter.add_mesh(
+                                pv.Line((-x, 0.0, 0.0), (-x, height, 0.0)),
+                                color="#bdc3c7",
+                                line_width=1,
+                                opacity=0.35,
+                            )
+                    for j in range(0, nz + 1, step_z):
+                        y = min(height, j * dx)
+                        self._plotter.add_mesh(
+                            pv.Line((r0, y, 0.0), (radius, y, 0.0)),
+                            color="#bdc3c7",
+                            line_width=1,
+                            opacity=0.55,
+                        )
 
-        # Reflecting bottom / ground marker.
-        self._plotter.add_mesh(
-            pv.Line((r0, 0.0, 0.0), (radius, 0.0, 0.0)),
-            color="#8e44ad",
-            line_width=3,
-        )
-
-        zc = float(charge.get("height", 0.0))
-        cr = float(charge.get("radius", 0.0))
-        points = preview_charge_outline_points(
-            shape=str(charge.get("shape", "Sphere")),
-            height=zc,
-            radius=cr,
-            length=float(charge.get("length", 0.0)),
-            mirrored=self.mirrored_view,
-            reflecting_ground=bool(charge.get("reflecting_ground", False)),
-        )
-        outline = pv.lines_from_points(points, close=True)
-        self._plotter.add_mesh(outline, color="#e74c3c", line_width=3)
-
-        # Detonation point (on axis). Prefer explicit detonation height.
-        det_y = float(charge.get("detonation_height", zc))
-        det_r = max(0.004, min(radius, height) * 0.012)
-        self._plotter.add_mesh(
-            pv.Sphere(radius=det_r, center=(0.0, det_y, 0.0)),
-            color="#e67e22",
-        )
-
-        for r, z in probes:
-            marker = pv.Sphere(
-                radius=max(0.005, min(radius, height) * 0.01),
-                center=(r, z, 0.0),
+            # Reflecting bottom / ground marker.
+            self._plotter.add_mesh(
+                pv.Line((r0, 0.0, 0.0), (radius, 0.0, 0.0)),
+                color="#8e44ad",
+                line_width=3,
             )
-            self._plotter.add_mesh(marker, color="yellow")
-            if self.mirrored_view and r > 0:
-                mirror = pv.Sphere(
+
+            zc = float(charge.get("height", 0.0))
+            cr = float(charge.get("radius", 0.0))
+            points = preview_charge_outline_points(
+                shape=str(charge.get("shape", "Sphere")),
+                height=zc,
+                radius=cr,
+                length=float(charge.get("length", 0.0)),
+                mirrored=self.mirrored_view,
+                reflecting_ground=bool(charge.get("reflecting_ground", False)),
+            )
+            outline = pv.lines_from_points(points, close=True)
+            self._plotter.add_mesh(outline, color="#e74c3c", line_width=3)
+
+            # Detonation point (on axis). Prefer explicit detonation height.
+            det_y = float(charge.get("detonation_height", zc))
+            det_r = max(0.004, min(radius, height) * 0.012)
+            self._plotter.add_mesh(
+                pv.Sphere(radius=det_r, center=(0.0, det_y, 0.0)),
+                color="#e67e22",
+            )
+
+            for r, z in probes:
+                marker = pv.Sphere(
                     radius=max(0.005, min(radius, height) * 0.01),
-                    center=(-r, z, 0.0),
+                    center=(r, z, 0.0),
                 )
-                self._plotter.add_mesh(mirror, color="yellow", opacity=0.45)
-        seed_level = charge.get("seed_level")
-        label = "Setup preview — not solver contours"
-        if seed_level is not None:
-            label += f" | planned seed L{seed_level}"
-        self._plotter.add_text(
-            label,
-            position="upper_left",
-            color="black",
-            font_size=9,
-        )
-        self._add_meridional_bounds(r0, radius, 0.0, height)
-        self._apply_meridional_camera()
+                self._plotter.add_mesh(marker, color="yellow")
+                if self.mirrored_view and r > 0:
+                    mirror = pv.Sphere(
+                        radius=max(0.005, min(radius, height) * 0.01),
+                        center=(-r, z, 0.0),
+                    )
+                    self._plotter.add_mesh(mirror, color="yellow", opacity=0.45)
+            self._add_meridional_bounds(r0, radius, 0.0, height)
+            self._apply_meridional_camera()
+        finally:
+            self._preview_busy = False
 
     def _latest_written_poly_mesh_dir(self, case_dir: str) -> Optional[str]:
         best_time = None
@@ -635,7 +679,13 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         return best_path
 
     def _poly_mesh_for_selected_time(self, case_dir: str) -> Optional[str]:
-        """AMR-aware mesh: latest polyMesh at or before the selected display time."""
+        """AMR-aware mesh for the selected display time.
+
+        Time 0 uses a constant-time path so opening a case does not list every
+        saved result directory.
+        """
+        if abs(float(self._selected_time_value)) <= 1e-15 or self._selected_time_label == TIME_ZERO_LABEL:
+            return poly_mesh_dir_for_time_zero(case_dir)
         return poly_mesh_dir_at_or_before(case_dir, self._selected_time_value)
 
     @staticmethod
@@ -693,18 +743,18 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         except Exception:
             pass
 
+    @staticmethod
+    def _activate_reader_time(reader, time_value: float) -> None:
+        """Select one OpenFOAM time without asking PyVista for every time_values entry."""
+        vtk_reader = getattr(reader, "reader", reader)
+        vtk_reader.UpdateTimeStep(float(time_value))
+
     def _refresh_axisymmetric_result(self) -> None:
         if not self._plotter or not HAS_PV or not self.current_case_dir or self._shutdown:
             return
-        foam_file = os.path.join(self.current_case_dir, "case.foam")
-        if not os.path.exists(foam_file):
-            try:
-                with open(foam_file, "w", encoding="utf-8") as handle:
-                    handle.write("")
-            except OSError:
-                return
         try:
-            self._sync_available_times_from_case()
+            if self._live_follow:
+                self._sync_available_times_from_case()
             mesh_dir = self._poly_mesh_for_selected_time(self.current_case_dir)
             owner_count = self.count_owner_cells(mesh_dir) if mesh_dir else None
             if owner_count is not None:
@@ -717,54 +767,25 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
                 except Exception:
                     pass
 
+            foam_file = None if self._live_follow else self._single_time_foam_file()
+            if not foam_file:
+                foam_file = os.path.join(self.current_case_dir, "case.foam")
+                if not os.path.exists(foam_file):
+                    try:
+                        with open(foam_file, "w", encoding="utf-8") as handle:
+                            handle.write("")
+                    except OSError:
+                        return
+
             reader = pv.POpenFOAMReader(foam_file)
-            if not reader.time_values:
-                self._plotter.clear()
-                self._clear_dynamic_actors()
-                self._unavailable_field_message = (
-                    f"Time {self._selected_time_label} is selected, but no readable "
-                    "OpenFOAM result times are available yet."
-                )
-                self._plotter.add_text(
-                    self._unavailable_field_message,
-                    position="upper_left",
-                    color="red",
-                    font_size=9,
-                )
-                self._add_time_annotation(self._selected_time_value)
-                if not self._shutdown:
-                    self._plotter.render()
-                return
-
-            matched = match_reader_time_value(
-                reader.time_values, self._selected_time_value
-            )
-            if matched is None:
-                self._plotter.clear()
-                self._clear_dynamic_actors()
-                available = ", ".join(f"{float(v):.6g}" for v in reader.time_values[:12])
-                self._unavailable_field_message = (
-                    f"Selected time {self._selected_time_label} is not available in the "
-                    f"case reader (have: {available})."
-                )
-                self._plotter.add_text(
-                    self._unavailable_field_message,
-                    position="upper_left",
-                    color="red",
-                    font_size=9,
-                )
-                self._add_time_annotation(self._selected_time_value)
-                if not self._shutdown:
-                    self._plotter.render()
-                return
-
-            self._last_refresh_time = float(matched)
-            self._resolved_display_time = float(matched)
-            self._cell_count_time = float(matched)
-            reader.set_active_time_value(matched)
+            self._activate_reader_time(reader, self._selected_time_value)
             data = reader.read()
             if self._shutdown:
                 return
+            matched = float(self._selected_time_value)
+            self._last_refresh_time = matched
+            self._resolved_display_time = matched
+            self._cell_count_time = matched
 
             internal_mesh = None
             if isinstance(data, pv.MultiBlock):
@@ -995,15 +1016,6 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         )
         actor = self._plotter.add_mesh(frame, color="#7f8c8d", line_width=1, reset_camera=False)
         self._dynamic_actors.append(actor)
-        # Lower-left domain label; scalar bar is on the right to avoid overlap.
-        text = self._plotter.add_text(
-            f"Radius [{r0:.3g}, {r1:.3g}] m   Height [{y0:.3g}, {y1:.3g}] m",
-            position="lower_left",
-            color="black",
-            font_size=8,
-            shadow=True,
-        )
-        self._dynamic_actors.append(text)
 
     def _apply_meridional_camera(self, force: bool = True) -> None:
         if not self._plotter or self._shutdown:

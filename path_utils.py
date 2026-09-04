@@ -21,23 +21,12 @@ def win_to_wsl_path(win_path: str) -> str:
     - C:\\Users\\... -> /mnt/c/Users/...
     - \\wsl.localhost\\Ubuntu\\home\\... -> /home/...
     - Already Linux (starts with /) -> returned as-is.
+
+    Canonical implementation lives in ``wsl_runtime.to_wsl_path_and_distro``.
     """
-    p = (win_path or "").strip().replace("\\", "/")
-    if not p:
-        return ""
-    if p.startswith("/") and not p.startswith("//"):
-        return p
-    # UNC: \\wsl.localhost\Ubuntu\home\user\case -> /home/user/case
-    if p.startswith("//"):
-        parts = [x for x in p.split("/") if x]
-        if len(parts) >= 3 and parts[0].lower() in ("wsl.localhost", "wsl$"):
-            return "/" + "/".join(parts[2:])
-    # Windows: C:/Users/... -> /mnt/c/Users/...
-    if len(p) >= 2 and p[1] == ":":
-        drive = p[0].lower()
-        rest = p[2:].lstrip("/")
-        return f"/mnt/{drive}/{rest}" if rest else f"/mnt/{drive}"
-    return p
+    from wsl_runtime import win_to_wsl_path as _canonical
+
+    return _canonical(win_path)
 
 
 def get_latest_time_dir(case_dir: str) -> Optional[str]:

@@ -314,11 +314,31 @@ class TabGeneral3D(QWidget):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
         
-        # Viewport (top)
+        # Viewport (top): Ready on the Fit row, same as 1D/2D.
+        viewport = QWidget()
+        viewport.setObjectName("general3dViewport")
+        viewport.setMinimumWidth(0)
+        viewport.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        vp_layout = QVBoxLayout(viewport)
+        vp_layout.setContentsMargins(4, 4, 4, 4)
+        controls = QHBoxLayout()
+        self._status_caption_host = QWidget(viewport)
+        self._status_caption_host.setObjectName("viewportStatusHost")
+        host_layout = QHBoxLayout(self._status_caption_host)
+        host_layout.setContentsMargins(0, 0, 0, 0)
+        host_layout.setSpacing(8)
+        host_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._status_caption_host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.btn_fit = QPushButton("Fit")
+        controls.addWidget(self._status_caption_host, 1)
+        controls.addWidget(self.btn_fit, 0)
+        vp_layout.addLayout(controls)
         self.viewer = BlastViewerWidget()
         self.viewer.setMinimumWidth(0)
         self.viewer.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
-        right_layout.addWidget(self.viewer, stretch=1)
+        self.btn_fit.clicked.connect(self.viewer.reset_camera)
+        vp_layout.addWidget(self.viewer, 1)
+        right_layout.addWidget(viewport, stretch=1)
         
         # Execution Controls (bottom)
         self.ctrl_tabs = QTabWidget()
@@ -351,6 +371,16 @@ class TabGeneral3D(QWidget):
         self._main_splitter = splitter
         self._right_container = right_container
         self._left_column = left_column
+
+    def embed_status_caption(self, *widgets) -> None:
+        """Place the Ready/status caption on the Fit row, left-aligned."""
+        layout = self._status_caption_host.layout()
+        for widget in widgets:
+            if widget is None:
+                continue
+            layout.addWidget(widget, 0)
+            if isinstance(widget, QLabel):
+                widget.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
     def get_computational_left_width(self) -> int:
         sizes = self._main_splitter.sizes()
@@ -807,8 +837,21 @@ class TabGeneral3D(QWidget):
         # Run-mode tradeoffs (default: FAST). Both default OFF so a fresh run is as
         # fast as building3D's hand-tuned Allrun. Loaders flip them ON when an
         # opened case explicitly contains the corresponding constructs.
-        self._enable_post_processing = False  # functions { impulse; overpressure; fieldMinMax; }
+        self._enable_post_processing = True  # screenshot: peak overpressure/impulse on sections/obstacles
         self._fast_run_mode = True            # skip stage_check / log.stageVerification / checkMesh / check_internal_patch
+        self._probe_fields = ("p", "impulse")
+        self._write_volumes = False
+        self._write_surfaces = True
+        self._keep_openfoam_time_folders = False
+        self._cycle_write = 0
+        self._surface_by_time = True
+        self._surface_time_s = 0.001
+        self._surface_steps = 25
+        self._section_fields = ("p", "overpressure", "impulse")
+        self._obstacle_fields = ("p", "overpressure", "impulse")
+        self._volume_fields = ()
+        self._write_arrival = False
+        self._write_obstacle_id = False
         self._obstacle_feature_angle = 120
         self._obstacle_cells_between_levels = 2
         self._obstacle_snap_iter = 100
@@ -981,6 +1024,12 @@ class TabGeneral3D(QWidget):
                 self.spin_remap_oz.setValue(float(self._remap_origin[2]))
             self._remap_time_mode = cfg["remap_time_mode"]
             self._remap_specific_time = cfg["remap_specific_time"]
+
+    def set_remap_origin(self, x: float, y: float, z: float) -> None:
+        self.spin_remap_ox.setValue(float(x))
+        self.spin_remap_oy.setValue(float(y))
+        self.spin_remap_oz.setValue(float(z))
+        self._remap_origin = (float(x), float(y), float(z))
 
     def _on_ignition_mode_changed(self, mode: str) -> None:
         """Show manual initiation point (X,Y,Z) only when Ignition mode is Manual."""
@@ -1584,11 +1633,6 @@ class TabGeneral3D(QWidget):
             "Write results every T seconds of simulation time (adjustableRunTime).\n"
             "Resolution down to 1e-10 s; values like 5e-7 are preserved."
         )
-        self.spin_cycle_write = QSpinBox()
-        self.spin_cycle_write.setRange(0, 1000)
-        self.spin_cycle_write.setValue(0)
-        self.spin_cycle_write.setMaximumWidth(80)
-        self.spin_cycle_write.setToolTip("cycleWrite in controlDict (0 = off).")
         self.lbl_write_interval = self._lbl("Write interval (steps)")
         self.lbl_write_time = self._lbl("Write interval [s]")
 
@@ -1637,7 +1681,6 @@ class TabGeneral3D(QWidget):
         h_time.addWidget(self.spin_write_time)
         f1.addRow(wrap_steps)
         f1.addRow(wrap_time)
-        f1.addRow(self._lbl("cycleWrite"), self.spin_cycle_write)
         self.lbl_initial_dt_display = QLabel("Initial Δt: — s")
         self.lbl_initial_dt_display.setObjectName("initialDtDisplay")
         self.lbl_initial_dt_display.setStyleSheet(SECONDARY_INFO_STYLE)
@@ -1733,7 +1776,7 @@ class TabGeneral3D(QWidget):
     def _on_log_scale_changed(self, checked):
         if self.viewer:
             self.viewer.set_log_scale(checked)
-            self.viewer.refresh_view()
+            self.viewer.force_refresh_view()
 
     def _on_cell_count_updated(self, count: int):
         """Update actual cell count in Initialization Results when a mesh is loaded."""
@@ -1922,6 +1965,49 @@ class TabGeneral3D(QWidget):
         is_time_step = write_control == "timeStep"
         self.wrap_write_steps.setVisible(is_time_step)
         self.wrap_write_time.setVisible(not is_time_step)
+
+    def apply_output_file_options(self, dim3d) -> None:
+        """Apply selected 3D outputs without changing the shared write cadence."""
+        from output_options import COL_GAUGES, COL_OBSTACLES, COL_SECTIONS, COL_VOLUMES
+
+        self._write_volumes = bool(dim3d.write_volumes)
+        self._write_surfaces = bool(dim3d.write_surfaces)
+        self._keep_openfoam_time_folders = bool(dim3d.keep_openfoam_time_folders)
+        self._cycle_write = int(dim3d.cycle_write)
+        self._quantities_3d = dict(dim3d.quantities or {})
+        self._enable_post_processing = bool(dim3d.any_peaks())
+        self._probe_fields = dim3d.fields_for(COL_GAUGES) or ("p",)
+        if "p" not in self._probe_fields:
+            self._probe_fields = ("p",) + self._probe_fields
+        self._section_fields = dim3d.fields_for(COL_SECTIONS)
+        self._obstacle_fields = dim3d.fields_for(COL_OBSTACLES)
+        self._volume_fields = dim3d.fields_for(COL_VOLUMES)
+        self._write_arrival = bool(
+            dim3d.checked("arrival_initial", COL_OBSTACLES)
+            or dim3d.checked("arrival_peak", COL_OBSTACLES)
+        )
+        self._write_obstacle_id = bool(dim3d.checked("obstacle_id", COL_OBSTACLES))
+        self._on_write_control_changed(self.combo_write_control.currentText())
+
+    def _surface_planes_for_case(self):
+        """Enabled 3D sections as VTK cutting-plane tuples for controlDict."""
+        from output_options import section_plane_point
+
+        min_pt = (self.sx1.value(), self.sy1.value(), self.sz1.value())
+        max_pt = (self.sx2.value(), self.sy2.value(), self.sz2.value())
+        planes = []
+        for sec in self.sections:
+            if not getattr(sec, "enabled", True):
+                continue
+            origin = section_plane_point(
+                sec.normal,
+                getattr(sec, "position_m", 0.0),
+                min_pt,
+                max_pt,
+            )
+            nx, ny, nz = (float(sec.normal[0]), float(sec.normal[1]), float(sec.normal[2]))
+            planes.append((str(sec.name or "Section"), origin[0], origin[1], origin[2], nx, ny, nz))
+        return tuple(planes)
 
     def _on_mesh_mode_changed(self):
         """Dyn Mesh: enable Wave AMR level and charge-seed Advanced controls. Fixed Mesh: disable them."""
@@ -3294,7 +3380,7 @@ class TabGeneral3D(QWidget):
         elif key == "write_interval_steps":
             self.spin_write.setValue(100)
         elif key == "cycle_write":
-            self.spin_cycle_write.setValue(0)
+            self._cycle_write = 0
         elif key == "material_name":
             idx = self.c_mat.findText("C4")
             if idx >= 0:
@@ -3929,8 +4015,34 @@ class TabGeneral3D(QWidget):
             if "write_interval_time" in data:
                 self.spin_write_time.setValue(data["write_interval_time"])
             if "cycle_write" in data:
-                self.spin_cycle_write.setValue(data["cycle_write"])
+                self._cycle_write = int(data["cycle_write"])
+            if "keep_openfoam_time_folders" in data:
+                self._keep_openfoam_time_folders = bool(
+                    data["keep_openfoam_time_folders"]
+                )
             self._on_write_control_changed(self.combo_write_control.currentText())
+            if "probe_fields" in data:
+                self._probe_fields = tuple(data.get("probe_fields") or ("p",))
+            if "write_surfaces" in data:
+                self._write_surfaces = bool(data["write_surfaces"])
+            if "write_volumes" in data:
+                self._write_volumes = bool(data["write_volumes"])
+            if "surface_write_by_time" in data:
+                self._surface_by_time = bool(data["surface_write_by_time"])
+            if "surface_write_interval_time" in data:
+                self._surface_time_s = float(data["surface_write_interval_time"])
+            if "surface_write_interval_steps" in data:
+                self._surface_steps = int(data["surface_write_interval_steps"])
+            if "section_fields" in data:
+                self._section_fields = tuple(data.get("section_fields") or ())
+            if "obstacle_fields" in data:
+                self._obstacle_fields = tuple(data.get("obstacle_fields") or ())
+            if "volume_fields" in data:
+                self._volume_fields = tuple(data.get("volume_fields") or ())
+            if "write_arrival" in data:
+                self._write_arrival = bool(data["write_arrival"])
+            if "write_obstacle_id" in data:
+                self._write_obstacle_id = bool(data["write_obstacle_id"])
 
             # --- Obstacles (STL) ---
             stl_list = data.get("stl_obstacles", [])
@@ -4027,7 +4139,8 @@ class TabGeneral3D(QWidget):
             write_interval_steps=self.spin_write.value(),
             write_interval_time=self.spin_write_time.value(),
             write_control_type=self.combo_write_control.currentText(),
-            cycle_write=self.spin_cycle_write.value(),
+            cycle_write=self._cycle_write,
+            keep_openfoam_time_folders=self._keep_openfoam_time_folders,
             cores=self.spin_cores.value(),
             cfl_value=self.spin_cfl.value(),
             obstacles=obs_data,
@@ -4092,6 +4205,19 @@ class TabGeneral3D(QWidget):
             bubble_radius_factor=getattr(self, "_bubble_radius_factor", 1.5),
             enable_post_processing=getattr(self, "_enable_post_processing", False),
             fast_run_mode=getattr(self, "_fast_run_mode", True),
+            probe_points=tuple((p.x, p.y, p.z) for p in self.probes_model.probes()),
+            probe_fields=tuple(getattr(self, "_probe_fields", ("p",))),
+            write_volumes=bool(getattr(self, "_write_volumes", False)),
+            write_surfaces=bool(getattr(self, "_write_surfaces", True)),
+            surface_write_by_time=bool(getattr(self, "_surface_by_time", True)),
+            surface_write_interval_time=float(getattr(self, "_surface_time_s", 0.001)),
+            surface_write_interval_steps=int(getattr(self, "_surface_steps", 25)),
+            surface_planes=self._surface_planes_for_case(),
+            section_fields=tuple(getattr(self, "_section_fields", ("p", "overpressure", "impulse"))),
+            obstacle_fields=tuple(getattr(self, "_obstacle_fields", ("p", "overpressure", "impulse"))),
+            volume_fields=tuple(getattr(self, "_volume_fields", ())),
+            write_arrival=bool(getattr(self, "_write_arrival", False)),
+            write_obstacle_id=bool(getattr(self, "_write_obstacle_id", False)),
             enable_balancing=bool(getattr(self, "_enable_balancing", False)),
             dynamic_max_cells=getattr(self, "_dynamic_max_cells", 200000000),
             outside_extent=getattr(self, "_outside_extent", None),

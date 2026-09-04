@@ -616,13 +616,13 @@ class Tab3DGuiCorrectnessTests(unittest.TestCase):
         self.assertEqual(catch.exact_1, 1)
         self.assertEqual(catch.exact_end, 1)
 
-    def test_obstacle_refine_and_cycle_write_remain_in_sim_control(self):
+    def test_obstacle_refine_remains_and_cycle_write_moved_from_sim_control(self):
         tab = self.make_tab()
         self.assertFalse(tab.chk_obstacle_refine.isHidden())
         self.assertFalse(tab.spin_obstacle_refine_min.isHidden())
         self.assertFalse(tab.spin_obstacle_refine_max.isHidden())
-        self.assertFalse(tab.spin_cycle_write.isHidden())
-        self.assertEqual(tab.spin_cycle_write.value(), 0)
+        self.assertFalse(hasattr(tab, "spin_cycle_write"))
+        self.assertEqual(tab._cycle_write, 0)
         # Mesh Properties moved next to Cell Size (Domain/Grid), not Simulation Control.
         self.assertFalse(tab.btn_mesh_properties.isHidden())
         self.assertEqual(tab.btn_mesh_properties.text(), "Mesh Properties…")

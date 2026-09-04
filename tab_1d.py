@@ -1,15 +1,20 @@
 import math
+import numpy as np
 from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QFrame,
-    QGroupBox, QFormLayout, QComboBox, QDoubleSpinBox, QLineEdit,
+    QGroupBox, QFormLayout, QComboBox, QDoubleSpinBox, QSpinBox, QLineEdit,
     QRadioButton, QSplitter, QScrollArea, QSizePolicy, QTabWidget
 )
-from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QFont
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from PyQt5.QtCore import QSize, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QFont, QImage, QPixmap
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
-from models import CaseInputs1D
+from models import (
+    BOUNDARY_1D_RIGHT_OPTIONS,
+    BOUNDARY_1D_TRANSMIT,
+    CaseInputs1D,
+)
 from ui_metrics import (
     COMPUTATIONAL_LEFT_PANEL_WIDTH,
     COMPUTATIONAL_LEFT_PANEL_MIN,
@@ -19,13 +24,136 @@ from ui_metrics import (
     GROUP_TITLE_FONT_PT,
 )
 
-class MplCanvas(FigureCanvas):
+
+def spherical_charge_radius_m(mass_kg: float, rho_kg_m3: float) -> float:
+    """Equivalent sphere radius for a given charge mass and density."""
+    rho = max(float(rho_kg_m3), 1e-12)
+    mass = max(float(mass_kg), 0.0)
+    return ((3.0 * mass) / (4.0 * math.pi * rho)) ** (1.0 / 3.0)
+
+
+# Ideal-gas sketch of the charge, same γ as the air phase. Peak tracks ρ and energy.
+INITIAL_CHARGE_GAMMA = 1.4
+
+
+def ideal_gas_charge_pressure_pa(
+    rho_kg_m3: float,
+    energy_j_per_kg: float,
+    gamma: float = INITIAL_CHARGE_GAMMA,
+) -> float:
+    """P = (γ-1) ρ e for the pre-run overpressure step."""
+    return max(float(gamma) - 1.0, 0.0) * max(float(rho_kg_m3), 0.0) * max(float(energy_j_per_kg), 0.0)
+
+
+def initial_overpressure_step(
+    domain_radius_m: float,
+    charge_radius_m: float,
+    charge_pressure_pa: float,
+    p_atm: float,
+):
+    """Step profile: charge pressure inside R_charge, ambient overpressure outside."""
+    r_max = max(float(domain_radius_m), 1e-9)
+    r_c = min(max(float(charge_radius_m), 0.0), r_max)
+    over = max(float(charge_pressure_pa) - float(p_atm), 0.0)
+    return [0.0, r_c, r_c, r_max], [over, over, 0.0, 0.0]
+
+
+def _qimage_from_rgba(rgba: np.ndarray, width: int, height: int) -> QImage:
+    """Build a Qt-owned QImage. Never wrap a Python/numpy buffer (that aborts on Windows)."""
+    image = QImage(width, height, QImage.Format_RGBA8888)
+    if image.isNull():
+        return image
+    raw = np.ascontiguousarray(rgba, dtype=np.uint8).tobytes()
+    expected = width * height * 4
+    if len(raw) < expected:
+        return QImage()
+    bits = image.bits()
+    nbytes = image.byteCount() if hasattr(image, "byteCount") else image.sizeInBytes()
+    bits.setsize(nbytes)
+    bpl = image.bytesPerLine()
+    if bpl == width * 4:
+        bits[:expected] = raw
+    else:
+        for y in range(height):
+            src = y * width * 4
+            dst = y * bpl
+            bits[dst : dst + width * 4] = raw[src : src + width * 4]
+    return image
+
+
+class MplCanvas(QLabel):
+    """Raster matplotlib figure. Avoids Qt5Agg OpenGL swaps that abort on Windows."""
+
     def __init__(self, parent=None, width=5, height=4, dpi=100):
-        fig = Figure(figsize=(width, height), dpi=dpi)
-        self.axes = fig.add_subplot(111)
-        super().__init__(fig)
+        super().__init__(parent)
+        self._dpi = float(dpi)
+        self.figure = Figure(figsize=(width, height), dpi=dpi, facecolor="white")
+        self.axes = self.figure.add_subplot(111)
+        self._agg = FigureCanvasAgg(self.figure)
+        self._drawing = False
+        self._draw_timer = QTimer(self)
+        self._draw_timer.setSingleShot(True)
+        self._draw_timer.setInterval(0)
+        self._draw_timer.timeout.connect(self._render_to_label)
+        self.setMinimumHeight(120)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.updateGeometry()
+        self.setAlignment(Qt.AlignCenter)
+        self.setScaledContents(False)
+        self.tight_layout_rect = None
+
+    def sizeHint(self):
+        return QSize(400, 300)
+
+    def minimumSizeHint(self):
+        return QSize(40, 120)
+
+    def draw(self):
+        self._render_to_label()
+
+    def draw_idle(self):
+        if not self.isVisible():
+            return
+        self._render_to_label()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self.isVisible() or self._draw_timer.isActive():
+            return
+        self._draw_timer.start()
+
+    def _render_to_label(self) -> None:
+        if self._drawing:
+            return
+        self._drawing = True
+        try:
+            area = self.contentsRect()
+            w = max(int(area.width()), 1)
+            h = max(int(area.height()), 1)
+            if w < 40 or h < 40:
+                w, h = max(w, 40), max(h, 40)
+            self.figure.set_size_inches(w / self._dpi, h / self._dpi, forward=False)
+            if w >= 200 and h >= 200:
+                try:
+                    if self.tight_layout_rect is not None:
+                        self.figure.tight_layout(rect=self.tight_layout_rect)
+                    else:
+                        self.figure.tight_layout()
+                except Exception:
+                    pass
+            self._agg.draw()
+            renderer = self._agg.get_renderer()
+            buf = np.asarray(renderer.buffer_rgba())
+            if buf.ndim != 3 or buf.shape[0] < 1 or buf.shape[1] < 1:
+                return
+            height, width = int(buf.shape[0]), int(buf.shape[1])
+            image = _qimage_from_rgba(np.ascontiguousarray(buf[:, :, :4]), width, height)
+            if image is None or image.isNull():
+                return
+            self.setPixmap(QPixmap.fromImage(image))
+        except Exception:
+            pass
+        finally:
+            self._drawing = False
 
 
 class Tab1D(QWidget):
@@ -40,6 +168,17 @@ class Tab1D(QWidget):
         
         self.last_r_min = None
         self.last_r_max = None
+        self._live_graph = False
+        self._pending_pressures = None
+        self._pending_time_s = 0.0
+        self._graph_timer = QTimer(self)
+        self._graph_timer.setSingleShot(True)
+        self._graph_timer.setInterval(50)
+        self._graph_timer.timeout.connect(self._redraw_canvas)
+        self._probe_fields = ("p", "impulse")
+        self._enable_impulse = True
+        self._enable_dynamic_pressure = False
+        self._gauge_locations = ()
 
         self.setup_ui()
         self.recalc_stats()
@@ -48,12 +187,9 @@ class Tab1D(QWidget):
     def get_case_inputs(self) -> CaseInputs1D:
         """אוספת את כל הנתונים מהממשק ומחזירה אובייקט מסודר"""
         
-        if self.radio_yes.isChecked():
-            rho_final = self.calculated_adj_rho
-        else:
-            rho_final = self.spin_density.value()
-            
-        mat_props = self.get_selected_material_properties()
+        rho_final = float(self.spin_density.value())
+        mat_props = dict(self.get_selected_material_properties())
+        mat_props["rho"] = rho_final
         
         return CaseInputs1D(
             radius=self.spin_radius.value(),
@@ -67,14 +203,69 @@ class Tab1D(QWidget):
             max_cfl=self.spin_cfl.value(),
             end_time_s=self.spin_endtime.value(), # השם המקורי שלך
             # ברירות מחדל קבועות (כי אין להן שדות ב-UI המקורי)
-            write_interval_s=1e-5,
-            n_probes=1000,
-            probe_write_interval_steps=100,
-            wedge_angle_deg=5.0,
+            write_interval_s=0.0,
+            n_probes=200,
+            probe_write_interval_steps=int(self.spin_gui_refresh.value()),
+            wedge_angle_deg=15.0,
             cone_half_angle_deg=12.0,
-            axis_epsilon=1e-3
+            axis_epsilon=0.10,
+            right_boundary=self.cmb_right.currentText(),
+            probe_fields=tuple(getattr(self, "_probe_fields", ("p", "impulse"))),
+            enable_impulse=bool(getattr(self, "_enable_impulse", True)),
+            enable_dynamic_pressure=bool(getattr(self, "_enable_dynamic_pressure", False)),
+            gauge_locations=tuple(getattr(self, "_gauge_locations", ()) or ()),
+            material_name=self.combo_comp.currentText(),
         )
-    # ----------------------------------------
+
+    def set_case_inputs(self, data: dict) -> None:
+        """Restore persisted 1D inputs without changing control semantics."""
+        values = dict(data)
+        material_name = str(values.get("material_name") or "")
+        if self.combo_comp.findText(material_name) < 0:
+            material_name = "Custom"
+        self.combo_comp.blockSignals(True)
+        try:
+            self.combo_comp.setCurrentText(material_name or "Custom")
+            for widget, key in (
+                (self.spin_radius, "radius"),
+                (self.spin_cellsize, "cell_size"),
+                (self.spin_press, "p_atm"),
+                (self.spin_temp, "t_atm"),
+                (self.spin_mass, "mass_kg"),
+                (self.spin_density, "rho_charge"),
+                (self.spin_cfl, "max_cfl"),
+                (self.spin_endtime, "end_time_s"),
+                (self.spin_gui_refresh, "probe_write_interval_steps"),
+            ):
+                if key in values:
+                    widget.setValue(values[key])
+            if "energy_j_per_kg" in values:
+                self.edit_energy.setText(f"{float(values['energy_j_per_kg']):.12g}")
+            if "right_boundary" in values:
+                self.cmb_right.setCurrentText(str(values["right_boundary"]))
+            self._probe_fields = tuple(values.get("probe_fields") or ("p",))
+            self._enable_impulse = bool(values.get("enable_impulse", True))
+            self._enable_dynamic_pressure = bool(
+                values.get("enable_dynamic_pressure", False)
+            )
+            self.set_gauge_locations(tuple(values.get("gauge_locations") or ()))
+        finally:
+            self.combo_comp.blockSignals(False)
+        self.recalc_stats()
+
+    def apply_output_gauges(self, fields: tuple, *, impulse: bool, dynamic_pressure: bool) -> None:
+        """Store gauge field list from Output File Options (1D probes)."""
+        names = tuple(fields) if fields else ("p",)
+        if "p" not in names:
+            names = ("p",) + names
+        self._probe_fields = names
+        self._enable_impulse = bool(impulse)
+        self._enable_dynamic_pressure = bool(dynamic_pressure)
+
+    def set_gauge_locations(self, locations: tuple) -> None:
+        self._gauge_locations = tuple(
+            (float(radius), str(label)) for radius, label in (locations or ())
+        )
 
     def get_selected_material_properties(self):
         mat_name = self.combo_comp.currentText()
@@ -162,6 +353,8 @@ class Tab1D(QWidget):
 
         self.edit_energy = QLineEdit("4.52e+06")
         self.edit_energy.setFixedWidth(100)
+        self.edit_energy.editingFinished.connect(self.recalc_stats)
+        self.edit_energy.textChanged.connect(self.recalc_stats)
         energy_lay = QHBoxLayout()
         energy_lay.addWidget(self.edit_energy)
         energy_lay.addWidget(QLabel("(J/kg)"))
@@ -190,6 +383,22 @@ class Tab1D(QWidget):
         group_atmo.setLayout(atmo_layout)
         input_layout.addWidget(group_atmo)
 
+        group_bounds = QGroupBox("Boundaries")
+        bounds_layout = QFormLayout()
+        self.cmb_left = QComboBox()
+        self.cmb_left.addItem("Reflecting - spherical")
+        self.cmb_left.setEnabled(False)
+        self.cmb_right = QComboBox()
+        self.cmb_right.addItems(list(BOUNDARY_1D_RIGHT_OPTIONS))
+        self.cmb_right.setCurrentText(BOUNDARY_1D_TRANSMIT)
+        for combo in (self.cmb_left, self.cmb_right):
+            combo.setMinimumWidth(160)
+            combo.setMaximumWidth(220)
+        bounds_layout.addRow("Left", self.cmb_left)
+        bounds_layout.addRow("Right", self.cmb_right)
+        group_bounds.setLayout(bounds_layout)
+        input_layout.addWidget(group_bounds)
+
         group_solver = QGroupBox("Solver")
         solver_layout = QFormLayout()
         self.spin_cfl, lay_cfl = self.create_input_row("", 0.50, 2, 0.1)
@@ -200,6 +409,24 @@ class Tab1D(QWidget):
         
         group_solver.setLayout(solver_layout)
         input_layout.addWidget(group_solver)
+
+        self.group_output = QGroupBox("Output Options")
+        output_layout = QFormLayout()
+        self.spin_gui_refresh = QSpinBox()
+        self.spin_gui_refresh.setObjectName("spin1dGuiRefresh")
+        self.spin_gui_refresh.setRange(1, 1_000_000)
+        self.spin_gui_refresh.setValue(25)
+        self.spin_gui_refresh.setButtonSymbols(QSpinBox.NoButtons)
+        self.spin_gui_refresh.wheelEvent = lambda event: event.ignore()
+        self.spin_gui_refresh.setFixedWidth(100)
+        self.spin_gui_refresh.setAlignment(Qt.AlignRight)
+        lay_refresh = QHBoxLayout()
+        lay_refresh.addWidget(self.spin_gui_refresh)
+        lay_refresh.addWidget(QLabel("Steps"))
+        lay_refresh.addStretch()
+        output_layout.addRow("GUI refresh freq.", lay_refresh)
+        self.group_output.setLayout(output_layout)
+        input_layout.addWidget(self.group_output)
         input_layout.addStretch()
 
         # Scroll area for input parameters only
@@ -238,12 +465,7 @@ class Tab1D(QWidget):
         self._right_v_splitter.setChildrenCollapsible(False)
         self._right_v_splitter.setObjectName("tab1dRightVerticalSplitter")
 
-        self.canvas = MplCanvas(self)
-        self.canvas.axes.set_title("Overpressure vs Distance")
-        self.canvas.axes.set_xlabel("Distance (m)")
-        self.canvas.axes.set_ylabel("Overpressure (Pa)")
-        self.canvas.axes.grid(True)
-        self.canvas.setMinimumHeight(120)
+        viewport = self._build_viewport()
 
         self.ctrl_tabs = QTabWidget()
         self.ctrl_tabs.setMinimumHeight(EXECUTION_AREA_MIN_HEIGHT)
@@ -260,7 +482,7 @@ class Tab1D(QWidget):
         self._exec_scroll = exec_scroll
         self.ctrl_tabs.addTab(exec_scroll, "Execution Controls")
 
-        self._right_v_splitter.addWidget(self.canvas)
+        self._right_v_splitter.addWidget(viewport)
         self._right_v_splitter.addWidget(self.ctrl_tabs)
         self._right_v_splitter.setStretchFactor(0, 1)
         self._right_v_splitter.setStretchFactor(1, 0)
@@ -278,6 +500,95 @@ class Tab1D(QWidget):
         self.splitter.setSizes([left_w, max(400, 1200 - left_w)])
         self._main_splitter = self.splitter
         root_layout.addWidget(self.splitter)
+
+    def _build_viewport(self) -> QWidget:
+        frame = QWidget()
+        frame.setMinimumWidth(0)
+        frame.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(4, 4, 4, 4)
+        controls = QHBoxLayout()
+        self._status_caption_host = QWidget(frame)
+        self._status_caption_host.setObjectName("viewportStatusHost")
+        host_layout = QHBoxLayout(self._status_caption_host)
+        host_layout.setContentsMargins(0, 0, 0, 0)
+        host_layout.setSpacing(8)
+        host_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._status_caption_host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.btn_fit = QPushButton("Fit")
+        self.btn_fit.clicked.connect(self._fit_graph)
+        controls.addWidget(self._status_caption_host, 1)
+        controls.addWidget(self.btn_fit, 0)
+        layout.addLayout(controls)
+        self.canvas = MplCanvas(self)
+        self.canvas.setMinimumHeight(120)
+        layout.addWidget(self.canvas, 1)
+        return frame
+
+    def embed_status_caption(self, *widgets) -> None:
+        """Place the Ready/status caption on the Fit row, left-aligned."""
+        layout = self._status_caption_host.layout()
+        for widget in widgets:
+            if widget is None:
+                continue
+            layout.addWidget(widget, 0)
+            if isinstance(widget, QLabel):
+                widget.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+    def _fit_graph(self) -> None:
+        self.canvas.axes.relim()
+        self.canvas.axes.autoscale_view()
+        self._redraw_canvas()
+
+    def _redraw_canvas(self) -> None:
+        """Apply pending live data, then paint a software bitmap (no Qt OpenGL)."""
+        if self._live_graph and self._pending_pressures:
+            self._apply_live_profile(self._pending_pressures, self._pending_time_s)
+        try:
+            self.canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _style_overpressure_axes(self) -> None:
+        axes = self.canvas.axes
+        axes.set_title("Overpressure vs Range")
+        axes.set_xlabel("Radius (m)")
+        axes.set_ylabel("Overpressure (Pa)")
+        axes.grid(True)
+        axes.legend(loc="upper right")
+
+    def charge_pressure_pa(self) -> float:
+        """Charge pressure for the pre-run sketch from the entered density and energy."""
+        rho = float(self.spin_density.value())
+        try:
+            energy = float(self.edit_energy.text())
+        except (TypeError, ValueError):
+            energy = float(self.get_selected_material_properties().get("E0") or 0.0)
+        return ideal_gas_charge_pressure_pa(rho, energy)
+
+    def initial_overpressure_profile(self):
+        rho = float(self.spin_density.value())
+        charge_r = spherical_charge_radius_m(self.spin_mass.value(), rho)
+        return initial_overpressure_step(
+            self.spin_radius.value(),
+            charge_r,
+            self.charge_pressure_pa(),
+            self.spin_press.value(),
+        )
+
+    def plot_initial_condition(self) -> None:
+        """Show the entered charge as a step in overpressure vs radius, before a run."""
+        if self._live_graph or not hasattr(self, "canvas"):
+            return
+        radii, overpressures = self.initial_overpressure_profile()
+        self.canvas.axes.clear()
+        self.canvas.axes.plot(radii, overpressures, color="#c0392b", linewidth=1.8, label="Pressure")
+        self._style_overpressure_axes()
+        self._redraw_canvas()
+
+    def end_live_graph(self) -> None:
+        """Allow input edits to refresh the initial-condition sketch after a run."""
+        self._live_graph = False
 
     def _on_1d_exec_splitter_moved(self, _pos: int = 0, _index: int = 0) -> None:
         """Remember the user's graph/execution split for this session."""
@@ -356,73 +667,59 @@ class Tab1D(QWidget):
             r_charge = ((3.0 * vol) / (4.0 * math.pi))**(1/3.0)
             
             cells_charge = int(r_charge / dx)
-            
-            if self.radio_yes.isChecked(): 
-                if cells_charge > 0:
-                    discrete_radius = cells_charge * dx
-                    discrete_vol = (4.0/3.0) * math.pi * (discrete_radius**3)
-                    adj_rho = mass / discrete_vol
-                    self.calculated_discrete_radius = discrete_radius
-                else:
-                    adj_rho = rho_input
-                    self.calculated_discrete_radius = r_charge
-            else: 
-                adj_rho = rho_input
-                self.calculated_discrete_radius = r_charge
-
-            self.calculated_adj_rho = adj_rho
+            self.calculated_adj_rho = rho_input
+            self.calculated_discrete_radius = r_charge
 
             self.lbl_domain_cells.setText(f"{cells_dom}")
             self.lbl_charge_radius.setText(f"{r_charge:.6f}")
             self.lbl_charge_cells.setText(f"{cells_charge}")
-            self.lbl_adj_density.setText(f"{adj_rho:.1f}")
+            self.lbl_adj_density.setText(f"{rho_input:.1f}")
+            self._live_graph = False
+            self.plot_initial_condition()
 
         except Exception:
             pass
 
     def update_graph(self, pressures, sim_time_s: float):
-        if not pressures: return
-        
+        if not pressures:
+            return
+        self._pending_pressures = [float(p) for p in pressures]
+        self._pending_time_s = float(sim_time_s)
+        self._live_graph = True
+        if not self._graph_timer.isActive():
+            self._graph_timer.start()
+
+    def _apply_live_profile(self, pressures, sim_time_s: float) -> None:
         if self.last_r_min is None:
             try:
                 radius = float(self.spin_radius.value())
                 dx = float(self.spin_cellsize.value())
-                if self.radio_yes.isChecked():
-                    rho = self.calculated_adj_rho
-                else:
-                    rho = float(self.spin_density.value())
-                
+                rho = float(self.spin_density.value())
+
                 vol = float(self.spin_mass.value()) / max(rho, 1.0)
-                r_ch = ((3.0 * vol) / (4.0 * math.pi))**(1/3.0)
-                
+                r_ch = ((3.0 * vol) / (4.0 * math.pi)) ** (1 / 3.0)
+
                 r_min_geom = max(1e-6, 0.05 * dx)
                 r_min = max(1e-6, min(r_min_geom, 0.2 * r_ch))
                 self.last_r_min = r_min
                 self.last_r_max = radius
-            except:
+            except (TypeError, ValueError, ZeroDivisionError, AttributeError):
                 self.last_r_min = 0.0
                 self.last_r_max = 1.0
 
         r_min = self.last_r_min
         r_max = self.last_r_max
-        
         p_atm = self.spin_press.value()
         overpressures = [p - p_atm for p in pressures]
-        
         n = len(overpressures)
         if n > 1:
-            distances = [r_min + (i/(n-1))*(r_max - r_min) for i in range(n)]
+            distances = [r_min + (i / (n - 1)) * (r_max - r_min) for i in range(n)]
         else:
             distances = [r_min]
 
         self.canvas.axes.clear()
-        self.canvas.axes.plot(distances, overpressures, label=f"t = {sim_time_s*1000.0:.3f} ms")
-        self.canvas.axes.set_title("Overpressure vs Distance")
-        self.canvas.axes.set_xlabel("Distance (m)")
-        self.canvas.axes.set_ylabel("Overpressure (Pa)")
-        
-        self.canvas.axes.axhline(0, color='gray', linestyle='--', linewidth=0.8)
-        
-        self.canvas.axes.grid(True)
-        self.canvas.axes.legend(loc="upper right")
-        self.canvas.draw()
+        self.canvas.axes.plot(
+            distances, overpressures, color="#c0392b", linewidth=1.8,
+            label=f"t = {sim_time_s*1000.0:.3f} ms",
+        )
+        self._style_overpressure_axes()

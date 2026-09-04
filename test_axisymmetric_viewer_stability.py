@@ -57,6 +57,7 @@ class GuiThreadAndLifecycleTests(unittest.TestCase):
             # Do not invoke full VTK path in offscreen unit test.
 
         viewer.refresh_view = tracked  # type: ignore[method-assign]
+        viewer.set_viewport_active(True)
         for _ in range(25):
             viewer.request_refresh()
         # Allow the single-shot coalesce timer to fire.
@@ -91,6 +92,22 @@ class GuiThreadAndLifecycleTests(unittest.TestCase):
         thread.join(timeout=2.0)
         self.assertIs(seen["assert_ok"], False)
         viewer.shutdown_viewer()
+
+    def test_release_vtk_clears_plotter_without_permanent_shutdown(self):
+        viewer = AxisymmetricViewerWidget()
+        viewer.set_viewport_active(True)
+        viewer.release_vtk()
+        self.assertIsNone(viewer._plotter)
+        self.assertFalse(viewer._shutdown)
+        self.assertFalse(viewer._viewport_active)
+        viewer.set_viewport_active(True)
+        self.assertTrue(viewer._viewport_active)
+        self.assertFalse(viewer._shutdown)
+        viewer.set_viewport_active(False)
+        self.assertIsNone(viewer._plotter)
+        self.assertFalse(viewer._shutdown)
+        viewer.shutdown_viewer()
+        self.assertTrue(viewer._shutdown)
 
 
 class ChargeAndMirrorGeometryTests(unittest.TestCase):

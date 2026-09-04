@@ -1,164 +1,133 @@
+import glob
 import os
 import re
-import glob
 import time
-import shlex
 import subprocess
-from dataclasses import dataclass
-from enum import Enum
+import threading
 from typing import Optional, Tuple, List
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
+from execution_plan import (  # noqa: F401 — re-export for existing imports
+    FINAL_RECONSTRUCT_CMD,
+    ExecutionIntent,
+    ExecutionPlan,
+    ExecutionPreparationError,
+    build_execution_plan,
+)
+from foam_dictionary import update_top_level_entries
+from result_storage import ResultStoragePolicy, ensure_remap_snapshot
+from wsl_runtime import (
+    build_case_command_argv,
+    popen_group_kwargs,
+    terminate_process_tree,
+    to_wsl_path_and_distro,
+)
+
 # Number of tail lines to capture from each log file for debug_summary.txt
 DEBUG_TAIL_LINES = 50
+DEFAULT_PROBE_WRITE_INTERVAL_STEPS = 25
+WATCHDOG_STRONG_P_PA = 1.5e5
+WATCHDOG_ARRIVAL_OVER_PA = 8.0e3
+WATCHDOG_DROP_FRAC = 0.10
 
 
-class ExecutionIntent(str, Enum):
-    FRESH_FULL_PIPELINE = "fresh_full_pipeline"
-    INITIALIZED_SOLVER_RUN = "initialized_solver_run"
-    RESUME = "resume"
-    ONE_STEP_RESUME = "one_step_resume"
+class WatchdogState:
+    """Ambient and peak overpressure at the 1D target-radius probe."""
+
+    __slots__ = ("p_ref", "peak_over")
+
+    def __init__(self) -> None:
+        self.p_ref: Optional[float] = None
+        self.peak_over: float = 0.0
 
 
-class ExecutionPreparationError(RuntimeError):
-    pass
+def watchdog_should_stop(pressure: float, state: WatchdogState) -> bool:
+    """True when the shock has reached the target radius.
+
+    A hard 150 kPa cut misses weak arrivals (e.g. ~149 kPa at 4 m). Stop on a
+    strong jump, or after overpressure at the target has peaked and fallen.
+    """
+    if pressure != pressure or pressure <= 0.0:
+        return False
+    if state.p_ref is None:
+        state.p_ref = float(pressure)
+        return False
+    over = float(pressure) - float(state.p_ref)
+    if over > state.peak_over:
+        state.peak_over = over
+    if float(pressure) >= WATCHDOG_STRONG_P_PA:
+        return True
+    arrived = state.peak_over >= WATCHDOG_ARRIVAL_OVER_PA
+    dropped = over <= (1.0 - WATCHDOG_DROP_FRAC) * state.peak_over
+    return bool(arrived and dropped)
 
 
-@dataclass(frozen=True)
-class ExecutionPlan:
-    intent: ExecutionIntent
-    command: str
-    latest_time: Optional[float]
-    log_name: str = "log.blastFoam"
+def probe_write_interval_from_control_dict(
+    text: str, default: int = DEFAULT_PROBE_WRITE_INTERVAL_STEPS
+) -> int:
+    """Read probes1d writeInterval from a controlDict (GUI refresh cadence)."""
+    match = re.search(r"probes1d\s*\{.*?writeInterval\s+(\d+)", text, re.DOTALL)
+    if not match:
+        return max(1, int(default))
+    try:
+        return max(1, int(match.group(1)))
+    except (TypeError, ValueError):
+        return max(1, int(default))
 
 
-def _numeric_time_dirs(path: str) -> List[float]:
-    values: List[float] = []
-    if not os.path.isdir(path):
-        return values
-    for name in os.listdir(path):
-        try:
-            value = float(name)
-        except ValueError:
-            continue
-        if value > 0 and os.path.isdir(os.path.join(path, name)):
-            values.append(value)
-    return values
+def request_solver_write_and_stop(case_dir: str) -> bool:
+    """Ask a running OpenFOAM solver to dump the current time and exit.
 
-
-def build_execution_plan(
-    case_dir: str,
-    cores: int,
-    intent: ExecutionIntent,
-) -> ExecutionPlan:
-    """Build a non-destructive solver command for an already generated case."""
-    cores = max(1, int(cores))
-    if intent == ExecutionIntent.FRESH_FULL_PIPELINE:
-        return ExecutionPlan(intent, "bash ./Allrun", None, "log.Allrun")
-
-    serial_times = _numeric_time_dirs(case_dir)
-    serial_latest = max(serial_times) if serial_times else None
-    processor_dirs = sorted(
-        path
-        for path in glob.glob(os.path.join(case_dir, "processor[0-9]*"))
-        if os.path.isdir(path)
-    )
-    per_processor_times = [_numeric_time_dirs(path) for path in processor_dirs]
-    resume = intent in (ExecutionIntent.RESUME, ExecutionIntent.ONE_STEP_RESUME)
-
-    # Consistent processor latest only when every discovered rank reports the same max time.
-    # This rule applies for both serial and parallel resume — never silently take max().
-    processor_latest: Optional[float] = None
-    if processor_dirs:
-        latest_values = [max(times) if times else None for times in per_processor_times]
-        if cores > 1:
-            expected = {f"processor{i}" for i in range(cores)}
-            actual = {os.path.basename(path) for path in processor_dirs}
-            if actual != expected:
-                raise ExecutionPreparationError(
-                    f"Processor state has {len(processor_dirs)} directories but the GUI requests {cores} cores."
-                )
-        if resume:
-            if len(set(latest_values)) != 1:
-                raise ExecutionPreparationError(
-                    "Processor directories do not share one consistent latest saved time; "
-                    "reconstruct or repair the case before resuming."
-                )
-            if latest_values and latest_values[0] is not None:
-                processor_latest = latest_values[0]
-        elif latest_values and latest_values[0] is not None and len(set(latest_values)) == 1:
-            processor_latest = latest_values[0]
-
-    latest: Optional[float] = None
-    if resume:
-        # latest_time must match the state the solver will actually use.
-        if cores == 1:
-            if processor_latest is not None and (
-                serial_latest is None or processor_latest > serial_latest
-            ):
-                latest = processor_latest
-            else:
-                latest = serial_latest
-        else:
-            if serial_latest is not None and (
-                processor_latest is None or serial_latest > processor_latest
-            ):
-                latest = serial_latest
-            elif processor_latest is not None:
-                latest = processor_latest
-            else:
-                latest = serial_latest
-    else:
-        candidates = [t for t in (serial_latest, processor_latest) if t is not None]
-        latest = max(candidates) if candidates else None
-
-    if intent == ExecutionIntent.ONE_STEP_RESUME and latest is None:
-        zero_dir = os.path.join(processor_dirs[0] if processor_dirs else case_dir, "0")
-        if os.path.isdir(zero_dir) and os.path.isfile(os.path.join(zero_dir, "p")):
-            latest = 0.0
-    if resume and latest is None:
-        raise ExecutionPreparationError(
-            "No resumable saved time exists. Initialize and run the case before Resume/Exact 1."
+    1D field dumps are sparse (one interval at endTime). The watchdog must not
+    wait for that write; ``stopAt writeNow`` is reread because controlDict is
+    ``runTimeModifiable``.
+    """
+    cd_path = os.path.join(case_dir, "system", "controlDict")
+    try:
+        with open(cd_path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        new_text, _changed = update_top_level_entries(
+            text, {"stopAt": "writeNow"}
         )
-
-    if cores == 1:
-        start_mode = "latestTime" if resume else "startTime"
-        prep = ""
-        if resume and processor_dirs:
-            if processor_latest is not None and (
-                serial_latest is None or processor_latest > serial_latest
-            ):
-                prep = "reconstructPar -latestTime > log.reconstructResume 2>&1 && "
-        cmd = (
-            f"set -o pipefail; foamDictionary system/controlDict -entry startFrom -set {start_mode} "
-            f"> log.prepareSolver 2>&1 && {prep}blastFoam 2>&1 | tee log.blastFoam"
-        )
-        return ExecutionPlan(intent, cmd, latest)
-
-    prep = ""
-    if resume and processor_dirs:
-        if serial_latest is not None and (
-            processor_latest is None or serial_latest > processor_latest
-        ):
-            # Serial state is ahead: re-decompose latest serial time into processors.
-            prep = "decomposePar -force -latestTime > log.decomposeParSolver 2>&1 && "
-        # else: consistent processor state is newer or equal — reuse it.
-    elif not processor_dirs:
-        # Decompose the initialized time 0 for a new run, or only the latest
-        # reconstructed serial state for resume. Neither path cleans the case.
-        decompose_opt = "-force -latestTime" if resume else "-force"
-        prep = f"decomposePar {decompose_opt} > log.decomposeParSolver 2>&1 && "
-    start_mode = "latestTime" if resume else "startTime"
-    cmd = (
-        f"set -o pipefail; foamDictionary system/controlDict -entry startFrom -set {start_mode} "
-        f"> log.prepareSolver 2>&1 && {prep}"
-        f"mpirun -np {cores} blastFoam -parallel 2>&1 | tee log.blastFoam"
-    )
-    return ExecutionPlan(intent, cmd, latest)
+        with open(cd_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(new_text)
+        return True
+    except (OSError, KeyError):
+        return False
 
 
-FINAL_RECONSTRUCT_CMD = "reconstructPar -latestTime > log.reconstructFinal 2>&1"
+def complete_probe_chunk(raw: bytes) -> Tuple[bytes, int]:
+    """Keep only newline-terminated probe text; leftover bytes stay unread."""
+    if not raw:
+        return b"", 0
+    last_nl = raw.rfind(b"\n")
+    if last_nl < 0:
+        return b"", len(raw)
+    complete = raw[: last_nl + 1]
+    return complete, len(raw) - len(complete)
+
+
+def parse_last_probe_pressures(text: str) -> Optional[Tuple[float, List[float], int]]:
+    """Return (time, pressures, data_line_count) from complete probe text."""
+    lines = [
+        ln.strip()
+        for ln in text.splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+    if not lines:
+        return None
+    parts = lines[-1].split()
+    if len(parts) < 2:
+        return None
+    try:
+        t = float(parts[0])
+        pressures = [float(x) for x in parts[1:]]
+    except ValueError:
+        return None
+    if not pressures:
+        return None
+    return t, pressures, len(lines)
 
 
 class SolverRunner(QThread):
@@ -166,7 +135,7 @@ class SolverRunner(QThread):
     Run the case via Allrun in WSL and stream probes data live.
     
     UPDATES:
-    - Calculates Step Number (based on writeInterval=100).
+    - Calculates Step Number from probes1d writeInterval (GUI refresh freq.).
     - Calculates Avg DeltaT (based on time difference).
     - Emits (pressures, time, step, dt).
     - On failure: aggregates last N lines of all log.* into debug_summary.txt at project_root.
@@ -185,6 +154,7 @@ class SolverRunner(QThread):
         project_root: Optional[str] = None,
         cores: int = 1,
         intent: ExecutionIntent = ExecutionIntent.FRESH_FULL_PIPELINE,
+        result_storage_policy: Optional[ResultStoragePolicy] = None,
     ):
         super().__init__()
         self.win_case_dir = win_case_dir
@@ -192,12 +162,16 @@ class SolverRunner(QThread):
         self.project_root = project_root
         self.cores = max(1, int(cores))
         self.intent = ExecutionIntent(intent)
+        self.result_storage_policy = result_storage_policy or ResultStoragePolicy()
         self.keep_running = True
+        self._stop_requested = False
+        self._process_lock = threading.Lock()
         self._proc: Optional[subprocess.Popen] = None
 
         self._probe_file: Optional[str] = None
         self._probe_pos: int = 0
         self._end_time_s: Optional[float] = None
+        self._probe_write_interval_steps: int = DEFAULT_PROBE_WRITE_INTERVAL_STEPS
         
         # Stats tracking
         self._total_lines_read = 0
@@ -210,62 +184,58 @@ class SolverRunner(QThread):
 
         # 1D watchdog: trigger stop when shock reaches target radius (only once)
         self._watchdog_triggered: bool = False
-        self._watchdog_stop_requested_time: Optional[float] = None  # time.time() when we created "stop"
-        self._watchdog_grace_seconds: float = 3.0  # wait before forcing process stop if solver ignores "stop"
+        self._watchdog_stop_requested_time: Optional[float] = None  # time.time() when writeNow was requested
+        self._watchdog_grace_seconds: float = 3.0  # wait before forcing process stop if solver ignores writeNow
+        self._watchdog_state = WatchdogState()
 
-        self._wsl_distro, self._linux_case_dir = self._win_unc_to_wsl_path_and_distro(win_case_dir)
+        path = to_wsl_path_and_distro(win_case_dir)
+        self._wsl_distro, self._linux_case_dir = path.distro, path.linux_path
 
     def stop(self) -> None:
         self.keep_running = False
-        if self._proc and self._proc.poll() is None:
-            try:
-                self.status_signal.emit("Stopping solver...")
-                self._proc.terminate()
-                for _ in range(40):
-                    if self._proc.poll() is not None:
-                        break
-                    time.sleep(0.05)
-                if self._proc.poll() is None:
-                    self._proc.kill()
-            except Exception:
-                pass
+        self._stop_requested = True
+        with self._process_lock:
+            solver = self._proc
+            reconstruct = self._reconstruct_proc
+        if solver and solver.poll() is None:
+            self.status_signal.emit("Stopping solver...")
+            terminate_process_tree(solver)
+        if (
+            reconstruct is not None
+            and reconstruct is not solver
+            and reconstruct.poll() is None
+        ):
+            terminate_process_tree(reconstruct)
+        with self._process_lock:
+            if self._reconstruct_proc is reconstruct:
+                self._reconstruct_proc = None
 
     @staticmethod
     def _win_unc_to_wsl_path_and_distro(win_path: str) -> Tuple[Optional[str], str]:
-        p = (win_path or "").strip()
-        if p.startswith("/"):
-            return None, p
-        if p.startswith("\\\\"):
-            parts = [x for x in p.split("\\") if x]
-            if len(parts) >= 3 and parts[0].lower() in ("wsl.localhost", "wsl$"):
-                distro = parts[1]
-                linux_parts = parts[2:]
-                return distro, "/" + "/".join(linux_parts)
-            return None, p.replace("\\", "/")
-        # Windows absolute path (e.g. C:\...): WSL needs /mnt/c/...
-        if len(p) >= 2 and p[1] == ":":
-            drive = p[0].lower()
-            rest = p[2:].replace("\\", "/").lstrip("/")
-            return None, f"/mnt/{drive}/{rest}" if rest else f"/mnt/{drive}/"
-        return None, p.replace("\\", "/")
+        """Compatibility wrapper around ``wsl_runtime.to_wsl_path_and_distro``."""
+        path = to_wsl_path_and_distro(win_path)
+        return path.distro, path.linux_path
 
     def _build_wsl_cmd(self, linux_dir: str, cmd: str) -> List[str]:
-        """Build WSL/bash command that sources OpenFOAM in the same shell then runs cmd.
-        Source must run in the current shell (not a subshell) so PATH and env persist for cmd.
-        Redirection (e.g. > log.reconstructPar) in cmd is interpreted by bash -lc."""
-        src = shlex.quote(self.openfoam_bashrc)
-        cdir = shlex.quote(linux_dir)
-        script = (
-            'set +u; '
-            'export ZSH_NAME="${ZSH_NAME:-}"; '
-            f'source {src} >/dev/null 2>&1 || true; '
-            f'cd {cdir} && {cmd}'
+        """Build WSL/bash argv via the central ``wsl_runtime`` module."""
+        # linux_dir is already converted; pass a synthetic case dir only for quoting
+        # of bashrc + command. Distro comes from the runner instance.
+        argv, _, _ = build_case_command_argv(
+            linux_dir if linux_dir.startswith("/") else self.win_case_dir,
+            cmd,
+            openfoam_bashrc=self.openfoam_bashrc,
+            quiet_source=True,
         )
-        if os.name == "nt":
-            if self._wsl_distro:
-                return ["wsl", "-d", self._wsl_distro, "--", "bash", "-lc", script]
-            return ["wsl", "bash", "-lc", script]
-        return ["bash", "-lc", script]
+        # Rebuild with the exact linux_dir + known distro to avoid re-detect drift.
+        from wsl_runtime import build_openfoam_script, build_wsl_argv
+
+        script = build_openfoam_script(
+            case_linux_path=linux_dir,
+            command=cmd,
+            openfoam_bashrc=self.openfoam_bashrc,
+            quiet_source=True,
+        )
+        return build_wsl_argv(script, distro=self._wsl_distro)
 
     def _run_simple(self, linux_dir: str, cmd: str) -> None:
         try:
@@ -274,37 +244,73 @@ class SolverRunner(QThread):
         except Exception:
             pass
 
+    def _run_result_export(self) -> int:
+        if not self.result_storage_policy.terminal_run:
+            return 0
+        if self.result_storage_policy.preserve_remap_data:
+            self.status_signal.emit("Preserving selected 2D remap snapshot...")
+            if not ensure_remap_snapshot(self.win_case_dir):
+                return 1
+        command = self.result_storage_policy.foam_to_vtk_command()
+        if not command:
+            return 0
+        self.status_signal.emit("Writing selected whole-domain VTK output...")
+        try:
+            args = self._build_wsl_cmd(self._linux_case_dir, command)
+            completed = subprocess.run(
+                args,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if completed.returncode != 0:
+                return int(completed.returncode)
+            return 0 if os.path.isdir(os.path.join(self.win_case_dir, "VTK")) else 1
+        except Exception:
+            return 1
+
     def _find_control_dict_end_time(self) -> None:
         try:
             p = os.path.join(self.win_case_dir, "system", "controlDict")
             with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    s = line.strip()
-                    if s.startswith("endTime"):
-                        tokens = s.replace(";", "").split()
-                        if len(tokens) >= 2:
-                            self._end_time_s = float(tokens[1])
-                            return
+                text = f.read()
         except Exception:
             self._end_time_s = None
+            return
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("endTime"):
+                tokens = s.replace(";", "").split()
+                if len(tokens) >= 2:
+                    try:
+                        self._end_time_s = float(tokens[1])
+                    except ValueError:
+                        self._end_time_s = None
+                    break
+        self._probe_write_interval_steps = probe_write_interval_from_control_dict(text)
 
     def _discover_probe_file(self) -> Optional[str]:
-        base = os.path.join(self.win_case_dir, "postProcessing", "probes1d")
-        if not os.path.isdir(base):
+        try:
+            base = os.path.join(self.win_case_dir, "postProcessing", "probes1d")
+            if not os.path.isdir(base):
+                return None
+            candidate = os.path.join(base, "0", "p")
+            if os.path.isfile(candidate):
+                return candidate
+            paths = glob.glob(os.path.join(base, "*", "p"))
+            if not paths:
+                return None
+
+            def time_key(path: str) -> float:
+                try:
+                    tdir = os.path.basename(os.path.dirname(path))
+                    return float(tdir)
+                except Exception:
+                    return -1.0
+
+            return sorted(paths, key=time_key)[-1]
+        except Exception:
             return None
-        candidate = os.path.join(base, "0", "p")
-        if os.path.isfile(candidate):
-            return candidate
-        paths = glob.glob(os.path.join(base, "*", "p"))
-        if not paths:
-            return None
-        def time_key(path: str) -> float:
-            try:
-                tdir = os.path.basename(os.path.dirname(path))
-                return float(tdir)
-            except Exception:
-                return -1.0
-        return sorted(paths, key=time_key)[-1]
 
     def _aggregate_log_errors(self, exit_code: int) -> str:
         """Collect last DEBUG_TAIL_LINES from each log.* in case dir. Return full summary text."""
@@ -419,13 +425,18 @@ class SolverRunner(QThread):
         cmd = "reconstructPar -newTimes > log.reconstructPar 2>&1"
         try:
             args = self._build_wsl_cmd(self._linux_case_dir, cmd)
-            self._reconstruct_proc = subprocess.Popen(
-                args,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            with self._process_lock:
+                if self._stop_requested or not self.keep_running:
+                    return
+                self._reconstruct_proc = subprocess.Popen(
+                    args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    **popen_group_kwargs(),
+                )
         except Exception:
-            self._reconstruct_proc = None
+            with self._process_lock:
+                self._reconstruct_proc = None
 
     def _wait_for_inflight_reconstruction(self, timeout_s: float = 120.0) -> bool:
         """Wait for any in-flight reconstructPar -newTimes process.
@@ -463,8 +474,8 @@ class SolverRunner(QThread):
             self._reconstruct_proc = None
         return False
 
-    def _final_reconstruct_latest(self) -> int:
-        """Deterministic post-parallel reconstruct so the serial case has the latest result.
+    def _final_reconstruct_latest(self, *, all_new_times: bool = False) -> int:
+        """Deterministically reconstruct serial results needed by final outputs.
 
         Returns the subprocess exit code (0 on success). Does not launch a second
         reconstructPar while an earlier reconstruction is still active or after a
@@ -476,21 +487,38 @@ class SolverRunner(QThread):
                 "and was stopped after timeout. Check log.reconstructPar / debug_summary.txt."
             )
             return 1
-        self.status_signal.emit("Final reconstruction (reconstructPar -latestTime)...")
+        command = (
+            "reconstructPar -newTimes > log.reconstructFinal 2>&1"
+            if all_new_times
+            else FINAL_RECONSTRUCT_CMD
+        )
+        label = "-newTimes" if all_new_times else "-latestTime"
+        self.status_signal.emit(f"Final reconstruction (reconstructPar {label})...")
+        proc = None
         try:
-            args = self._build_wsl_cmd(self._linux_case_dir, FINAL_RECONSTRUCT_CMD)
-            completed = subprocess.run(
-                args,
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return int(completed.returncode)
+            args = self._build_wsl_cmd(self._linux_case_dir, command)
+            with self._process_lock:
+                if self._stop_requested or not self.keep_running:
+                    return 1
+                proc = subprocess.Popen(
+                    args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    **popen_group_kwargs(),
+                )
+                self._reconstruct_proc = proc
+            while proc.poll() is None:
+                time.sleep(0.05)
+            return int(proc.returncode)
         except Exception:
             return 1
+        finally:
+            with self._process_lock:
+                if self._reconstruct_proc is proc:
+                    self._reconstruct_proc = None
 
     def _check_watchdog_trigger(self, case_dir: str) -> None:
-        """If 1D case has watchdog_probe and pressure at target radius > 1.5e5 Pa, create 'stop' for graceful exit."""
+        """Stop when the shock has arrived at the target radius (peak-and-fall or strong p)."""
         if self._watchdog_triggered:
             return
         base = os.path.join(case_dir, "postProcessing", "watchdog_probe")
@@ -521,7 +549,7 @@ class SolverRunner(QThread):
             pressure = float(parts[1])
         except ValueError:
             return
-        if pressure <= 1.5e5:
+        if not watchdog_should_stop(pressure, self._watchdog_state):
             return
         self._watchdog_triggered = True
         radius_str = "?"
@@ -533,16 +561,11 @@ class SolverRunner(QThread):
         except OSError:
             pass
         self.status_signal.emit(f"Shockwave reached target radius ({radius_str}m). Stopping simulation.")
-        try:
-            stop_path = os.path.join(case_dir, "stop")
-            with open(stop_path, "w", encoding="utf-8") as f:
-                pass
-        except OSError:
-            pass
+        request_solver_write_and_stop(case_dir)
         self._watchdog_stop_requested_time = time.time()
 
     def _maybe_stop_after_watchdog(self) -> None:
-        """If watchdog requested stop and grace period elapsed, terminate process so run actually stops."""
+        """If watchdog requested writeNow and grace period elapsed, terminate process so run actually stops."""
         if not self._watchdog_triggered or self._watchdog_stop_requested_time is None:
             return
         if self._proc is None or self._proc.poll() is not None:
@@ -551,68 +574,41 @@ class SolverRunner(QThread):
         if elapsed < self._watchdog_grace_seconds:
             return
         self.keep_running = False
-        try:
-            self._proc.terminate()
-            for _ in range(40):
-                if self._proc.poll() is not None:
-                    break
-                time.sleep(0.05)
-            if self._proc.poll() is None:
-                self._proc.kill()
-        except Exception:
-            pass
+        terminate_process_tree(self._proc)
 
     def _read_new_probe_lines(self) -> Optional[Tuple[float, List[float], int, float]]:
         if not self._probe_file:
             return None
 
         try:
-            with open(self._probe_file, "r", encoding="utf-8", errors="ignore") as f:
+            with open(self._probe_file, "rb") as f:
                 f.seek(self._probe_pos)
-                new = f.read()
-                self._probe_pos = f.tell()
+                raw = f.read()
+                complete, leftover = complete_probe_chunk(raw)
+                self._probe_pos = f.tell() - leftover
         except Exception:
             return None
 
-        if not new:
+        if not complete:
             return None
 
-        lines = [ln.strip() for ln in new.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-        if not lines:
-            return None
-
-        # Parse the last line
-        last = lines[-1]
-        parts = last.split()
-        if len(parts) < 2:
+        parsed = parse_last_probe_pressures(complete.decode("utf-8", "ignore"))
+        if parsed is None:
             return None
 
         try:
-            t = float(parts[0])
-            ps = [float(x) for x in parts[1:]]
-            
-            # --- CALCULATE STATS ---
-            # 1. Update total lines read
-            count_new = len(lines)
+            t, ps, count_new = parsed
             self._total_lines_read += count_new
-            
-            # 2. Estimated Step (We know writeInterval is 100 from Generator)
-            current_step = self._total_lines_read * 100
-            
-            # 3. Estimated dt (Time difference / steps elapsed)
-            # Avoid division by zero
+            interval = max(1, int(self._probe_write_interval_steps))
+            current_step = self._total_lines_read * interval
             dt_est = 0.0
             if count_new > 0 and self._total_lines_read > 1:
                 time_diff = t - self._last_time_val
-                # Each line represents 100 steps
-                steps_diff = count_new * 100 
+                steps_diff = count_new * interval
                 if steps_diff > 0:
                     dt_est = time_diff / steps_diff
-            
             self._last_time_val = t
-            
             return t, ps, current_step, dt_est
-            
         except Exception:
             return None
 
@@ -635,7 +631,11 @@ class SolverRunner(QThread):
         self.status_signal.emit(f"Running: {self.intent.value}")
         args = self._build_wsl_cmd(linux_dir, execution.command)
         try:
-            self._proc = subprocess.Popen(args)
+            with self._process_lock:
+                if self._stop_requested or not self.keep_running:
+                    self.finished_signal.emit(False)
+                    return
+                self._proc = subprocess.Popen(args, **popen_group_kwargs())
         except Exception as e:
             self.status_signal.emit(
                 f"Failed command `{execution.command}`: {e}. Log: {execution.log_name}"
@@ -655,6 +655,7 @@ class SolverRunner(QThread):
 
         self._watchdog_triggered = False
         self._watchdog_stop_requested_time = None
+        self._watchdog_state = WatchdogState()
         _re_time = re.compile(r"^Time\s*=\s*([\d\.eE\+\-]+)", re.MULTILINE)
         _re_dt = re.compile(r"^deltaT\s*=\s*([\d\.eE\+\-]+)", re.MULTILINE)
         _re_courant = re.compile(r"^Courant Number.*$", re.MULTILINE)
@@ -705,8 +706,18 @@ class SolverRunner(QThread):
             return
 
         if rc == 0:
-            if self.cores > 1 and self.intent != ExecutionIntent.FRESH_FULL_PIPELINE:
-                recon_rc = self._final_reconstruct_latest()
+            needs_final_reconstruct = (
+                self.cores > 1
+                and (
+                    self.intent != ExecutionIntent.FRESH_FULL_PIPELINE
+                    or self.result_storage_policy.needs_serial_results
+                )
+            )
+            if needs_final_reconstruct:
+                if self.result_storage_policy.vtk_fields:
+                    recon_rc = self._final_reconstruct_latest(all_new_times=True)
+                else:
+                    recon_rc = self._final_reconstruct_latest()
                 if recon_rc != 0:
                     self._write_debug_summary(recon_rc)
                     self.status_signal.emit(
@@ -715,6 +726,14 @@ class SolverRunner(QThread):
                     )
                     self.finished_signal.emit(False)
                     return
+            export_rc = self._run_result_export()
+            if export_rc != 0:
+                self.status_signal.emit(
+                    f"Solver finished but selected-result export failed (rc={export_rc}). "
+                    "Native time folders were left in place. Check remap data and log.foamToVTK."
+                )
+                self.finished_signal.emit(False)
+                return
             self.progress_signal.emit(100)
             self.status_signal.emit("Finished.")
             self.finished_signal.emit(True)

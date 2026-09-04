@@ -1,30 +1,47 @@
+from __future__ import annotations
+
+import importlib.util
 import os
 import logging
 import numpy as np
-import pyvista as pv
-from pyvistaqt import QtInteractor
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QFrame, QLabel, QSizePolicy
 )
 from PyQt5.QtCore import pyqtSignal
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 
 from viewer_gl import (
     close_plotter_safely,
     create_embedded_interactor,
+    guard_embedded_interactor,
     register_viewer,
     scalar_bar_kwargs,
+    set_plotter_visible,
     stop_plotter_render_timer,
+    sync_interactor_size,
     unregister_viewer,
 )
 
-HAS_PV = True
-try:
-    import pyvista as pv
-    from pyvistaqt import QtInteractor
-except ImportError:
-    HAS_PV = False
+HAS_PV = importlib.util.find_spec("pyvista") is not None
+
+
+class _PyVistaProxy:
+    """Load pyvista on first attribute access so 1D never initializes VTK."""
+
+    _mod = None
+
+    def _load(self):
+        if self._mod is None:
+            import pyvista as _pv
+            self._mod = _pv
+        return self._mod
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+
+pv = _PyVistaProxy()
 
 _LOG = logging.getLogger("ggui.viewer_widget")
 
@@ -61,7 +78,7 @@ class BlastViewerWidget(QWidget):
         super().__init__(parent)
         self.current_case_dir = None
         self.is_simulating = False
-        self._stl_cache: Dict[str, pv.PolyData] = {}
+        self._stl_cache: Dict[str, Any] = {}
         self.field_settings: Dict[str, FieldViewSettings] = {}
         self.current_field = "p"
         self._first_load = True
@@ -97,13 +114,20 @@ class BlastViewerWidget(QWidget):
         self._dynamic_actors: List = []
         self._obstacle_actors: List = []
         self._shutdown = False
-        self._viewport_active = True
+        self._viewport_active = False
         self._gl_info = None
         self._init_ui()
-        # Headless Qt regression runs must not create an interactive OpenGL
-        # context. The data/model paths remain fully testable offscreen.
-        if HAS_PV and os.environ.get("QT_QPA_PLATFORM", "").lower() != "offscreen":
-            self._init_vtk()
+        # Do not create an OpenGL interactor until this tab is actually shown.
+        # Hidden VTK widgets on Windows abort the process during 1D graph updates.
+
+    def _vtk_allowed(self) -> bool:
+        return HAS_PV and os.environ.get("QT_QPA_PLATFORM", "").lower() != "offscreen"
+
+    def ensure_vtk(self) -> None:
+        """Create the embedded plotter the first time this viewport becomes active."""
+        if self._shutdown or self._plotter is not None or not self._vtk_allowed():
+            return
+        self._init_vtk()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -136,33 +160,74 @@ class BlastViewerWidget(QWidget):
         except Exception:
             pass
         self.plotter_layout.addWidget(interactor)
+        guard_embedded_interactor(interactor, self)
         self._gl_info = register_viewer("BlastViewerWidget/3D", self, self._plotter)
 
+    def release_vtk(self) -> None:
+        """Destroy the OpenGL interactor while this tab is hidden.
+
+        Hiding is not enough on Windows: a dormant vtkWin32OpenGLRenderWindow
+        still receives paint and aborts the process during 1D graph updates.
+        Recreate on the next set_viewport_active(True).
+        """
+        self._viewport_active = False
+        plotter = self._plotter
+        if plotter is None:
+            return
+        self._plotter = None
+        stop_plotter_render_timer(plotter)
+        interactor = getattr(plotter, "interactor", None)
+        try:
+            if interactor is not None:
+                interactor.hide()
+                interactor.setUpdatesEnabled(False)
+                self.plotter_layout.removeWidget(interactor)
+                interactor.setParent(None)
+        except Exception:
+            pass
+        close_plotter_safely(plotter, owner=type(self).__name__)
+        unregister_viewer(self)
+        self._gl_info = None
+        self._dynamic_actors.clear()
+        self._obstacle_actors.clear()
+        self._probe_actors = []
+
     def set_viewport_active(self, active: bool) -> None:
-        """Pause/resume any plotter timers when the hosting tab is hidden."""
-        self._viewport_active = bool(active)
-        stop_plotter_render_timer(self._plotter)
+        """Create VTK only while shown; destroy it when the tab is hidden."""
+        was_active = bool(self._viewport_active)
+        if not active:
+            self.release_vtk()
+            try:
+                self.setUpdatesEnabled(False)
+                self.plotter_frame.setUpdatesEnabled(False)
+            except Exception:
+                pass
+            return
+        self._viewport_active = True
+        try:
+            self.setUpdatesEnabled(True)
+            self.plotter_frame.setUpdatesEnabled(True)
+        except Exception:
+            pass
+        self.ensure_vtk()
+        set_plotter_visible(self._plotter, True)
+        if not was_active:
+            sync_interactor_size(
+                getattr(self._plotter, "interactor", None) if self._plotter else None
+            )
 
     def shutdown_viewer(self) -> None:
         """Stop timers and close the VTK window while the Qt HWND is still valid."""
         if self._shutdown:
             return
         self._shutdown = True
-        self._viewport_active = False
-        plotter = self._plotter
-        self._plotter = None
-        stop_plotter_render_timer(plotter)
-        close_plotter_safely(plotter, owner="BlastViewerWidget/3D")
-        unregister_viewer(self)
-        self._dynamic_actors.clear()
-        self._obstacle_actors.clear()
-        self._probe_actors = []
+        self.release_vtk()
 
     def set_field(self, name):
         self.current_field = name
         if name not in self.field_settings:
             self.field_settings[name] = FieldViewSettings()
-        self.refresh_view()
+        self.force_refresh_view()
 
     def set_field_range(self, mn, mx, auto):
         if self.current_field in self.field_settings:
@@ -170,15 +235,15 @@ class BlastViewerWidget(QWidget):
             s.min_val = mn
             s.max_val = mx
             s.auto_scale = auto
-            self.refresh_view()
+            self.force_refresh_view()
     
     def toggle_mesh_lines(self, state):
         self.show_mesh_lines = state
-        self.refresh_view()
+        self.force_refresh_view()
     
     def toggle_boundaries(self, state):
         self.show_boundaries = state
-        self.refresh_view()
+        self.force_refresh_view()
 
     def force_refresh_view(self) -> None:
         """Force a full redraw (e.g. after viewport option change) even if time step unchanged."""
@@ -193,7 +258,7 @@ class BlastViewerWidget(QWidget):
 
     def toggle_tracers(self, state):
         self.show_tracers = state
-        self.refresh_view()
+        self.force_refresh_view()
 
     def set_log_scale(self, state: bool) -> None:
         for s in self.field_settings.values():
@@ -250,7 +315,7 @@ class BlastViewerWidget(QWidget):
     def update_sections(self, sections: List[SectionItem]):
         self.sections = sections
         if self.is_simulating:
-            self.refresh_view()
+            self.force_refresh_view()
         else:
             if self._last_preview_data:
                 self.update_preview(*self._last_preview_data)
@@ -381,10 +446,6 @@ class BlastViewerWidget(QWidget):
             self.update_preview(*self._last_preview_data)
             return
         if not self.is_simulating or not self.current_case_dir:
-            return
-
-        poly_points = os.path.join(self.current_case_dir, "constant", "polyMesh", "points")
-        if not os.path.exists(poly_points):
             return
 
         foam_file = os.path.join(self.current_case_dir, "case.foam")
