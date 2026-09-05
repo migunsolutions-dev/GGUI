@@ -19,6 +19,7 @@ from wsl_runtime import (
     WslCancelToken,
     build_case_command_argv,
     build_wsl_argv,
+    publish_case_file,
     quote_shell,
     run_wsl_command,
     to_wsl_path_and_distro,
@@ -214,6 +215,41 @@ class PreparationWorkerTests(unittest.TestCase):
         win._set_preparation_controls_enabled = mock.Mock()
         win._on_imported_2d_prep_cancelled(PreparationResult(ok=False, cancelled=True))
         self.assertFalse(win.active_case_initialized_2d)
+
+
+class PublishCaseFileTests(unittest.TestCase):
+    def test_wsl_case_uses_linux_mv(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "src.tmp")
+            dest = os.path.join(td, "controlDict")
+            with open(src, "w", encoding="utf-8") as handle:
+                handle.write("stopAt writeNow;\n")
+            mapped = mock.Mock(distro="Ubuntu-20.04", linux_path="/home/naor/case/system/controlDict")
+            src_mapped = mock.Mock(distro="Ubuntu-20.04", linux_path="/home/naor/case/system/src.tmp")
+            with mock.patch("wsl_runtime.to_wsl_path_and_distro", side_effect=[mapped, src_mapped]), mock.patch(
+                "wsl_runtime.build_wsl_argv", return_value=["wsl", "echo"]
+            ) as argv, mock.patch("wsl_runtime.subprocess.run") as run:
+                run.return_value = mock.Mock(returncode=0)
+                publish_case_file(src, dest)
+            argv.assert_called_once()
+            script = argv.call_args[0][0]
+            self.assertIn("mv -f", script)
+            self.assertIn("touch", script)
+            run.assert_called_once()
+
+    def test_local_case_uses_os_replace(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "src.tmp")
+            dest = os.path.join(td, "controlDict")
+            with open(src, "w", encoding="utf-8") as handle:
+                handle.write("new\n")
+            with open(dest, "w", encoding="utf-8") as handle:
+                handle.write("old\n")
+            local = mock.Mock(distro=None, linux_path=dest.replace("\\", "/"))
+            with mock.patch("wsl_runtime.to_wsl_path_and_distro", return_value=local):
+                publish_case_file(src, dest)
+            with open(dest, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "new\n")
 
 
 if __name__ == "__main__":

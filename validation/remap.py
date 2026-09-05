@@ -27,9 +27,11 @@ from validation.remap_timing import (
 from validation.spatial import (
     first_initialized_time,
     parse_remap2d_ggui,
+    physical_radius_from_centre,
     read_1d_profile,
     read_cell_centres,
     read_vol_field,
+    spherical_radii,
 )
 
 REMAP_FIELDS = ("p", "rho", "U", "T", "alpha.c4")
@@ -62,6 +64,11 @@ class ProfileCompare:
     target_physical_time: Optional[float]
     physical_time_offset: Optional[float]
     message: str = ""
+    correspondence: str = ""
+    n_pairs: int = 0
+    remap_radius_m: Optional[float] = None
+    sorted_in_r: bool = True
+    field_unit: str = ""
 
 
 @dataclass(frozen=True)
@@ -218,10 +225,36 @@ def _interpolate(src_r: np.ndarray, src_v: np.ndarray, query_r: np.ndarray) -> n
 def _shock_position(r: np.ndarray, values: np.ndarray) -> Optional[float]:
     if r.size < 3:
         return None
-    g = np.gradient(values, r, edge_order=1)
+    keep = np.ones(r.size, dtype=bool)
+    keep[1:] = np.diff(r) > 1.0e-15
+    ru = r[keep]
+    vu = values[keep]
+    if ru.size < 3:
+        return None
+    g = np.gradient(vu, ru, edge_order=1)
     if not np.isfinite(g).any():
         return None
-    return float(r[int(np.nanargmax(np.abs(g)))])
+    return float(ru[int(np.nanargmax(np.abs(g)))])
+
+
+FIELD_UNITS = {
+    "p": "Pa",
+    "rho": "kg/m³",
+    "U": "m/s",
+    "T": "K",
+    "alpha.c4": "",
+}
+FIELD_CANDIDATES = {
+    "rho": ("rho", "rho.air"),
+    "p": ("p",),
+    "T": ("T",),
+    "U": ("U",),
+    "alpha.c4": ("alpha.c4",),
+}
+
+
+def field_unit(field: str) -> str:
+    return FIELD_UNITS.get(str(field), "")
 
 
 def compare_profiles(
@@ -235,6 +268,7 @@ def compare_profiles(
     source_time: Optional[float],
     target_time: Optional[float],
     physical_time_offset: Optional[float] = None,
+    correspondence: str = "",
 ) -> ProfileCompare:
     r_src = np.asarray(source_r, dtype=float)
     v_src = np.asarray(source_v, dtype=float)
@@ -243,8 +277,12 @@ def compare_profiles(
     mask = np.isfinite(r_tgt) & np.isfinite(v_tgt) & (r_tgt <= float(r_max) + 1e-12)
     r = r_tgt[mask]
     tgt = v_tgt[mask]
+    if r.size:
+        order = np.argsort(r, kind="mergesort")
+        r = r[order]
+        tgt = tgt[order]
     src = _interpolate(r_src, v_src, r)
-    abs_diff = tgt - src
+    abs_diff = np.abs(tgt - src)
     rel: list[Optional[float]] = []
     for a, b in zip(tgt, src):
         if is_finite_number(a) and is_finite_number(b) and abs(float(b)) > 1e-12:
@@ -264,15 +302,21 @@ def compare_profiles(
     src_list = [float(v) if is_finite_number(v) else float("nan") for v in src]
     tgt_list = [float(v) if is_finite_number(v) else float("nan") for v in tgt]
     interval = (float(r.min()) if r.size else 0.0, float(r.max()) if r.size else 0.0)
-    peak_s = float(np.nanmax(v_src)) if v_src.size else None
-    peak_t = float(np.nanmax(v_tgt)) if v_tgt.size else None
-    peak_rs = float(r_src[int(np.nanargmax(v_src))]) if v_src.size and np.isfinite(v_src).any() else None
-    peak_rt = float(r_tgt[int(np.nanargmax(v_tgt))]) if v_tgt.size and np.isfinite(v_tgt).any() else None
+    finite_src = np.isfinite(src)
+    finite_tgt = np.isfinite(tgt)
+    peak_s = float(np.nanmax(src)) if finite_src.any() else None
+    peak_t = float(np.nanmax(tgt)) if finite_tgt.any() else None
+    peak_rs = float(r[int(np.nanargmax(src))]) if finite_src.any() else None
+    peak_rt = float(r[int(np.nanargmax(tgt))]) if finite_tgt.any() else None
     msg = ""
     if not sync:
         msg = "Source and target physical times do not match; comparison is not synchronized."
     if r.size == 0:
         msg = "No overlapping samples inside the remap radius."
+    note = correspondence or (
+        "Source interpolated onto target samples at the same physical R, "
+        "sorted by increasing R."
+    )
     return ProfileCompare(
         field=field,
         r=tuple(float(x) for x in r),
@@ -289,8 +333,8 @@ def compare_profiles(
         mae=mean_absolute_error(tgt_list, src_list),
         max_abs=max_absolute_error(tgt_list, src_list),
         max_rel=max_meaningful_relative_error(tgt_list, src_list),
-        shock_source=_shock_position(r_src, v_src),
-        shock_target=_shock_position(r_tgt, v_tgt),
+        shock_source=_shock_position(r, src),
+        shock_target=_shock_position(r, tgt),
         peak_source=peak_s,
         peak_target=peak_t,
         peak_r_source=peak_rs,
@@ -299,6 +343,11 @@ def compare_profiles(
         target_physical_time=tgt_phys,
         physical_time_offset=offset,
         message=msg,
+        correspondence=note,
+        n_pairs=int(r.size),
+        remap_radius_m=float(r_max) if is_finite_number(r_max) else None,
+        sorted_in_r=bool(r.size < 2 or np.all(np.diff(r) >= -1.0e-15)),
+        field_unit=field_unit(field),
     )
 
 
@@ -393,10 +442,78 @@ def conservation_1d_2d(
     return tuple(items)
 
 
+def resolve_stored_field_name(case_dir: str, time_label: str, field: str) -> str:
+    for name in FIELD_CANDIDATES.get(str(field), (str(field),)):
+        path = os.path.join(case_dir, time_label, name)
+        if os.path.isfile(path):
+            return name
+    return str(field)
+
+
+def load_physical_radial_profile(
+    case_dir: str,
+    time_label: str,
+    field: str,
+    *,
+    dim: str = "1d",
+    charge_centre: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    ray_half_width: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray, str]:
+    """Load a 1D function of physical R from the charge centre, sorted in R.
+
+    1D uses spherical cell-centre radius. 2D uses Euclidean R from the charge
+    centre. When ``ray_half_width`` is set, only the charge-height row is kept
+    so the series is a single physical ray rather than every mesh cell.
+    """
+    stored = resolve_stored_field_name(case_dir, time_label, field)
+    values = read_vol_field(case_dir, time_label, stored)
+    centres = read_cell_centres(case_dir, time_label)
+    if values is None:
+        return np.array([]), np.array([]), f"Field {stored} is not available at time {time_label}."
+    if centres is None:
+        return np.array([]), np.array([]), "Cell centres are not available; physical R cannot be formed."
+    n = min(centres.shape[0], values.shape[0] if values.ndim > 1 else values.size)
+    pts = np.asarray(centres[:n], dtype=float)
+    kind = str(dim or "").strip().lower()
+    if values.ndim > 1:
+        if stored.upper() == "U":
+            if kind in ("2d", "3d", "axisymmetric_2d"):
+                r_vec = pts[:, : values.shape[1]] - np.asarray(charge_centre[: values.shape[1]], dtype=float)
+                rad = np.linalg.norm(r_vec, axis=1)
+                rad = np.maximum(rad, 1.0e-20)
+                values = np.sum(values[:n, : r_vec.shape[1]] * r_vec, axis=1) / rad
+            else:
+                # Same radial speed the remap transfers (1D |U|), not the wedge Ux.
+                values = np.linalg.norm(values[:n], axis=1)
+        else:
+            values = np.linalg.norm(values[:n], axis=1)
+    else:
+        values = np.asarray(values[:n], dtype=float)
+    if kind in ("1d", "spherical_1d", ""):
+        r = spherical_radii(pts)
+        note = ""
+    else:
+        r = physical_radius_from_centre(pts, charge_centre)
+        if is_finite_number(ray_half_width) and float(ray_half_width) > 0.0 and pts.ndim == 2 and pts.shape[1] > 1:
+            dy = np.abs(pts[:, 1] - float(charge_centre[1]))
+            best = int(np.argmin(dy))
+            if dy[best] > float(ray_half_width) + 1e-12:
+                return np.array([]), np.array([]), (
+                    "No target cells lie on the charge-height ray inside the remap radius."
+                )
+            keep = np.abs(pts[:, 1] - float(pts[best, 1])) <= 1.0e-9
+            r = r[keep]
+            values = values[keep]
+        note = ""
+    order = np.argsort(r, kind="mergesort")
+    return r[order], values[order], note
+
+
 def load_line_from_case(
     case_dir: str, time_label: str, field: str, *, dim: str = "1d"
 ) -> Tuple[np.ndarray, np.ndarray]:
     geometry = "spherical_1d" if str(dim).strip().lower() == "1d" else "axisymmetric_2d"
-    if field == "U":
+    stored = resolve_stored_field_name(case_dir, time_label, field)
+    if stored == "U":
         return read_1d_profile(case_dir, time_label, "U", geometry=geometry)
-    return read_1d_profile(case_dir, time_label, field, geometry=geometry)
+    return read_1d_profile(case_dir, time_label, stored, geometry=geometry)

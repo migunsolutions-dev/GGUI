@@ -1,9 +1,13 @@
 """Offscreen Qt tests for the Validation & Verification tab."""
 from __future__ import annotations
 
+import json
 import os
 import sys
+import tempfile
 import unittest
+
+import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
@@ -20,7 +24,10 @@ from tab_validation import (
     MODE_REMAP,
     TabValidation,
 )
+from ui_metrics import ERROR_STATUS_STYLE, INFO_STATUS_STYLE, WARNING_STYLE
+from validation.auto_points import ValidationPoint
 from validation.current_run import SOURCE_CURRENT, SOURCE_MANUAL, RunSnapshot
+from validation import remap as remap_engine
 from validation import ufc_hob
 
 
@@ -360,6 +367,66 @@ class TabValidationTests(unittest.TestCase):
         dims = {tab.table.item(r, 1).text() for r in range(tab.table.rowCount())}
         self.assertEqual(dims, {"1D", "2D"})
 
+    def test_mixed_1d_spherical_and_2d_hemi_use_separate_reference_curves(self):
+        from validation import ufc_airblast as ufc_ab
+        from validation.units import fmt, pa_to_kpa
+
+        snap = RunSnapshot(
+            live_mode="1d",
+            mass_kg=1.0,
+            domain_radius_1d=2.0,
+            domain_radius_2d=2.0,
+            domain_height_2d=1.0,
+            hob_m=0.0,
+        )
+        tab = self._tab(snap)
+        tab.chk_show_2d.setChecked(True)
+        tab.combo_kb_source.setCurrentText("UFC 3-340-02")
+        tab._redraw()
+        labels = []
+        if tab.plot_canvas.axes.get_legend():
+            labels = [t.get_text() for t in tab.plot_canvas.axes.get_legend().get_texts()]
+        self.assertTrue(any("Figure 2-7" in t for t in labels))
+        self.assertTrue(any("Figure 2-15" in t for t in labels))
+        plans = {p.dim: p for p in tab._collect_auto_plans()}
+        pt_1d = plans["1d"].points[0]
+        pt_2d = plans["2d"].points[0]
+        ev_1d = ufc_ab.evaluate(
+            ufc_ab.QUANTITY_PEAK_PRESSURE,
+            range_m=pt_1d.range_m,
+            mass_kg=1.0,
+            burst_type=ufc_ab.BURST_SPHERICAL,
+        )
+        ev_2d = ufc_ab.evaluate(
+            ufc_ab.QUANTITY_PEAK_PRESSURE,
+            range_m=pt_2d.range_m,
+            mass_kg=1.0,
+            burst_type=ufc_ab.BURST_HEMISPHERICAL,
+        )
+        wrong_1d = ufc_ab.evaluate(
+            ufc_ab.QUANTITY_PEAK_PRESSURE,
+            range_m=pt_1d.range_m,
+            mass_kg=1.0,
+            burst_type=ufc_ab.BURST_HEMISPHERICAL,
+        )
+        row_1d = None
+        row_2d = None
+        for r in range(tab.table.rowCount()):
+            gid = tab.table.item(r, 0).text()
+            if gid == pt_1d.point_id:
+                row_1d = r
+            if gid == pt_2d.point_id:
+                row_2d = r
+        self.assertIsNotNone(row_1d)
+        self.assertIsNotNone(row_2d)
+        self.assertTrue(ev_1d.ok)
+        self.assertTrue(ev_2d.ok)
+        self.assertEqual(tab.table.item(row_1d, 5).text(), fmt(pa_to_kpa(ev_1d.value_si), suffix="kPa"))
+        self.assertEqual(tab.table.item(row_2d, 5).text(), fmt(pa_to_kpa(ev_2d.value_si), suffix="kPa"))
+        self.assertFalse(wrong_1d.ok)
+        self.assertEqual(tab.table.item(row_1d, 6).text(), "N/A")
+        self.assertEqual(tab.table.item(row_2d, 6).text(), "N/A")
+
     def test_3d_user_gauge_standoff_and_hemi_na(self):
         from probes_model import ProbePoint
 
@@ -413,6 +480,254 @@ class MainWindowRegistrationTests(unittest.TestCase):
             self.assertEqual(window.tabs.tabText(window.tabs.currentIndex()), "Validation & Verification")
         finally:
             window.close()
+
+
+class ValidationCacheAndStyleTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _app()
+
+    def _tab(self, snapshot):
+        tab = TabValidation()
+
+        def provider():
+            return snapshot
+
+        tab.set_source_provider(context=provider, gauges_1d=lambda: (), probes_2d=lambda: (), probes_3d=lambda: ())
+        tab.show()
+        return tab
+
+    def _write_scalar(self, path, values):
+        body = " ".join(f"{float(v)}" for v in values)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(f"internalField   nonuniform List<scalar> {len(values)} ({body});\n")
+
+    def _write_vector(self, path, pts):
+        chunks = " ".join(f"({p[0]} {p[1]} {p[2]})" for p in pts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(f"internalField   nonuniform List<vector> {len(pts)} ({chunks});\n")
+
+    def test_completed_case_reuses_stored_plan_when_receive_fingerprint_differs(self):
+        from validation.fingerprint import case_id_from_path
+
+        with tempfile.TemporaryDirectory() as td:
+            case_id = case_id_from_path(td)
+            payload = {
+                "dim": "2d",
+                "burst_master": "ufc_free_air_spherical",
+                "figure": "2-7",
+                "mass_kg": 1.0,
+                "charge_center": [0.0, 1.0, 0.0],
+                "r_min": 0.67,
+                "r_max": 1.9,
+                "z_min": 0.15,
+                "z_max": 30.0,
+                "n_points": 1,
+                "line_kind": "horizontal_through_charge_centre",
+                "line_z": 1.0,
+                "points": [
+                    {
+                        "point_id": "VAL_2D_STORED",
+                        "dim": "2d",
+                        "index": 0,
+                        "range_m": 0.67,
+                        "x": 0.67,
+                        "y": 1.0,
+                        "z": 0.0,
+                        "mass_kg": 1.0,
+                        "burst": "ufc_free_air_spherical",
+                        "figure": "2-7",
+                    }
+                ],
+                "domain_r_max": 2.0,
+                "remap_receive_r_max": 0.658,
+                "fingerprint": {
+                    "dim": "2d",
+                    "case_id": case_id,
+                    "mass_kg": 1.0,
+                    "domain_size": {"radius": 2.0, "height": 2.0},
+                    "hob_m": 1.0,
+                    "charge_center": [0.0, 1.0, 0.0],
+                    "cell_size": 0.01,
+                    "burst_mode": "ufc_free_air_spherical",
+                    "reference_mode": "UFC 3-340-02 Figure 2-7",
+                    "remap_receive_r_max": 0.658,
+                },
+            }
+            with open(os.path.join(td, "ggui_validation_sampling.json"), "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            tab = self._tab(
+                RunSnapshot(
+                    case_2d=td,
+                    mass_kg=1.0,
+                    hob_m=1.0,
+                    domain_radius_2d=2.0,
+                    domain_height_2d=2.0,
+                    domain_cell_2d=0.01,
+                    mapped_radius=0.6,
+                )
+            )
+            plans = tab._collect_auto_plans()
+            self.assertEqual(len(plans), 1)
+            self.assertEqual(plans[0].points[0].point_id, "VAL_2D_STORED")
+
+    def test_dim_toggle_does_not_clear_auto_plans(self):
+        tab = self._tab(RunSnapshot(mass_kg=1.0, domain_radius_1d=1.0, domain_cell_1d=0.01))
+        sentinel = [object()]
+        tab._auto_plans = sentinel
+        tab._on_auto_dim_changed()
+        self.assertIs(tab._auto_plans, sentinel)
+
+    def test_probe_cache_reuses_and_invalidates_on_case_change(self):
+        point = ValidationPoint(point_id="p1", dim="1d", index=0, range_m=1.0, x=1.0, y=0.0, z=0.0)
+        tab = self._tab(RunSnapshot(case_1d="caseA", domain_radius_1d=1.0, mass_kg=1.0))
+        calls = []
+
+        def fake_compute(_point):
+            calls.append(1)
+            return 1.0, 2.0, "", True
+
+        tab._bf_auto_peak_impulse_compute = fake_compute
+        tab._auto_key = tab._snapshot_cache_key()
+        first = tab._bf_auto_peak_impulse(point)
+        second = tab._bf_auto_peak_impulse(point)
+        self.assertEqual(first, second)
+        self.assertEqual(len(calls), 1)
+        other = RunSnapshot(case_1d="caseB", domain_radius_1d=1.0, mass_kg=1.0)
+        tab.set_source_provider(context=lambda: other, gauges_1d=lambda: (), probes_2d=lambda: (), probes_3d=lambda: ())
+        self.assertEqual(tab._probe_cache, {})
+        self.assertEqual(tab._remap_cache, {})
+        self.assertEqual(tab._numerical_cache, {})
+
+    def test_fixed_mesh_cell_count_is_info_not_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "system"))
+            os.makedirs(os.path.join(td, "constant", "polyMesh"))
+            with open(os.path.join(td, "system", "controlDict"), "w", encoding="utf-8") as handle:
+                handle.write("maxCo 0.4;\nendTime 0.01;\nstartTime 0;\n")
+            with open(os.path.join(td, "log.blastFoam"), "w", encoding="utf-8") as handle:
+                handle.write("Time = 0.001\ndeltaT = 1e-6\nCourant Number Mean/Max = 0.1, 0.4\nEnd\n")
+            with open(os.path.join(td, "constant", "polyMesh", "owner"), "w", encoding="utf-8") as handle:
+                handle.write("nCells: 40000\n")
+            tab = self._tab(RunSnapshot(case_2d=td, keep_openfoam_2d=False))
+            tab.combo_mode.setCurrentText(MODE_NUMERICAL)
+            tab._on_mode_changed(MODE_NUMERICAL)
+            tab._redraw()
+            self.assertIn("Cell count is constant", tab.lbl_status.text())
+            self.assertEqual(tab.lbl_status.styleSheet(), INFO_STATUS_STYLE)
+            self.assertNotEqual(tab.lbl_status.styleSheet(), ERROR_STATUS_STYLE)
+            self.assertNotEqual(tab.lbl_status.styleSheet(), WARNING_STYLE)
+            from validation import numerical as numerical_engine
+
+            builds = []
+            original = numerical_engine.build_report
+
+            def wrapped(*args, **kwargs):
+                builds.append(1)
+                return original(*args, **kwargs)
+
+            numerical_engine.build_report = wrapped
+            try:
+                tab.combo_num_plot.setCurrentText("deltaT vs Time")
+                tab._draw_numerical()
+                tab.combo_num_plot.setCurrentText("Total Cells vs Time")
+                tab._draw_numerical()
+                self.assertEqual(len(builds), 0)
+            finally:
+                numerical_engine.build_report = original
+
+    def test_fatal_log_uses_error_style(self):
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "system"))
+            with open(os.path.join(td, "system", "controlDict"), "w", encoding="utf-8") as handle:
+                handle.write("maxCo 0.4;\n")
+            with open(os.path.join(td, "log.blastFoam"), "w", encoding="utf-8") as handle:
+                handle.write("FOAM FATAL ERROR\nfloating point exception\n")
+            tab = self._tab(RunSnapshot(case_2d=td, keep_openfoam_2d=False))
+            tab.combo_mode.setCurrentText(MODE_NUMERICAL)
+            tab._on_mode_changed(MODE_NUMERICAL)
+            tab._redraw()
+            self.assertEqual(tab.lbl_status.styleSheet(), ERROR_STATUS_STYLE)
+
+    def test_remap_graph_is_sorted_clipped_and_cached(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "1d")
+            tgt = os.path.join(td, "2d")
+            src_r = np.array([0.10, 0.30, 0.50, 0.70])
+            src_p = np.array([4.0, 3.0, 2.0, 1.0])
+            src_rho = np.array([1.4, 1.3, 1.2, 1.1])
+            tgt_r = np.array([0.70, 0.50, 0.30, 0.10])
+            tgt_p = np.array([1.05, 2.10, 3.05, 4.00])
+            tgt_rho = np.array([1.11, 1.21, 1.31, 1.40])
+            off_r = np.array([0.10, 0.30])
+            self._write_vector(os.path.join(src, "0.000184", "C"), np.column_stack([src_r, np.zeros(4), np.zeros(4)]))
+            self._write_scalar(os.path.join(src, "0.000184", "p"), src_p)
+            self._write_scalar(os.path.join(src, "0.000184", "rho.air"), src_rho)
+            ray = np.column_stack([tgt_r, np.ones(4), np.zeros(4)])
+            off = np.column_stack([off_r, np.zeros(2), np.zeros(2)])
+            self._write_vector(os.path.join(tgt, "0", "C"), np.vstack([ray, off]))
+            self._write_scalar(os.path.join(tgt, "0", "p"), np.concatenate([tgt_p, np.array([99.0, 88.0])]))
+            self._write_scalar(os.path.join(tgt, "0", "rho.air"), np.concatenate([tgt_rho, np.array([9.0, 8.0])]))
+            with open(os.path.join(tgt, "case_2d.json"), "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "mapping": {"case_path": src, "specific_time": "0.000184"},
+                        "remap_timing": {
+                            "source_time_label": "0.000184",
+                            "source_physical_time": 0.000184,
+                            "physical_time_offset": 0.000184,
+                            "target_time_label": "0",
+                        },
+                        "remap_handoff": {"remap_radius_m": 0.6},
+                    },
+                    handle,
+                )
+            tab = self._tab(
+                RunSnapshot(
+                    case_1d=src,
+                    case_2d=tgt,
+                    mapping_source_2d=src,
+                    mapping_time_2d="0.000184",
+                    mapped_radius=0.6,
+                    hob_m=1.0,
+                    domain_cell_2d=0.01,
+                )
+            )
+            tab.combo_mode.setCurrentText(MODE_REMAP)
+            tab._on_mode_changed(MODE_REMAP)
+            loads = []
+            original = remap_engine.load_physical_radial_profile
+
+            def wrapped(*args, **kwargs):
+                loads.append(1)
+                return original(*args, **kwargs)
+
+            remap_engine.load_physical_radial_profile = wrapped
+            try:
+                tab._draw_remap()
+                first_loads = len(loads)
+                self.assertGreaterEqual(first_loads, 2)
+                xs = tab.plot_canvas.axes.lines[0].get_xdata()
+                self.assertTrue(all(xs[i] <= xs[i + 1] for i in range(len(xs) - 1)))
+                self.assertLessEqual(max(xs), 0.6 + 1e-12)
+                self.assertNotIn(0.70, [round(float(v), 6) for v in xs])
+                self.assertIn("0.000184", tab.lbl_remap_times.text())
+                self.assertIn("Physical remap radius: 0.6 m", tab.lbl_remap_times.text())
+                self.assertIn("|Target − Source|", [line.get_label() for line in tab.plot_canvas.axes.lines])
+                tab.combo_remap_diff.setCurrentIndex(1)
+                tab._draw_remap()
+                self.assertEqual(len(loads), first_loads)
+                tab.combo_remap_field.setCurrentText("Density")
+                tab._draw_remap()
+                after_density = len(loads)
+                self.assertGreater(after_density, first_loads)
+                tab.combo_remap_field.setCurrentText("Pressure")
+                tab._draw_remap()
+                self.assertEqual(len(loads), after_density)
+            finally:
+                remap_engine.load_physical_radial_profile = original
 
 
 if __name__ == "__main__":

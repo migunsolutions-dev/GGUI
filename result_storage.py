@@ -8,6 +8,13 @@ import shutil
 from typing import Iterable, Optional, Tuple
 
 from output_options import REMAP_2D_FILENAME
+from completion_1d import (
+    COMPLETION_FILENAME,
+    is_terminate_mode,
+    read_completion_record,
+    reflect_end_time_is_success,
+    wave_radius_stop_is_success,
+)
 
 
 _FOAM_FIELD = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
@@ -143,6 +150,8 @@ def last_blastfoam_logged_time(
 
 
 def is_generated_1d_case(case_dir: str) -> bool:
+    if os.path.isfile(os.path.join(case_dir, COMPLETION_FILENAME)):
+        return True
     if os.path.isfile(os.path.join(case_dir, ".watchdog_target_radius")):
         return True
     try:
@@ -156,31 +165,9 @@ def is_generated_1d_case(case_dir: str) -> bool:
         return False
 
 
-def solver_run_succeeded(
-    case_dir: str,
-    return_code: Optional[int],
-    *,
-    user_stopped: bool = False,
+def logged_time_reached_end(
+    case_dir: str, log_text: Optional[str] = None
 ) -> bool:
-    """True only for a normal solver finish that honours configured endTime on 1D.
-
-    A process exiting 0 is not enough: ``blastFoam | tee`` used to hide FOAM
-    abort, and 1D ``stopAt writeNow`` (watchdog) also exits 0 before endTime.
-    """
-    if user_stopped:
-        return False
-    if return_code != 0:
-        return False
-    log_path = os.path.join(case_dir, "log.blastFoam")
-    try:
-        with open(log_path, encoding="utf-8", errors="ignore") as stream:
-            log_text = stream.read()
-    except OSError:
-        log_text = ""
-    if "FOAM FATAL" in log_text:
-        return False
-    if not is_generated_1d_case(case_dir):
-        return True
     end_time = control_dict_root_end_time(case_dir)
     last_t = last_blastfoam_logged_time(case_dir, log_text)
     if last_t is None:
@@ -190,6 +177,39 @@ def solver_run_succeeded(
         return False
     tolerance = max(1.0e-9, abs(end_time) * 1.0e-4)
     return last_t >= end_time - tolerance
+
+
+def solver_run_succeeded(
+    case_dir: str,
+    return_code: Optional[int],
+    *,
+    user_stopped: bool = False,
+) -> bool:
+    """True only when the selected 1D completion mode is satisfied.
+
+    Process exit 0 is not success: FOAM abort, user interrupt, and an early
+    ``writeNow`` without verified wave arrival must not be labelled Done.
+    """
+    if user_stopped:
+        return False
+    log_path = os.path.join(case_dir, "log.blastFoam")
+    try:
+        with open(log_path, encoding="utf-8", errors="ignore") as stream:
+            log_text = stream.read()
+    except OSError:
+        log_text = ""
+    if "FOAM FATAL" in log_text:
+        return False
+    record = read_completion_record(case_dir)
+    if record is not None:
+        if is_terminate_mode(record):
+            return wave_radius_stop_is_success(record)
+        return reflect_end_time_is_success(record)
+    if return_code != 0:
+        return False
+    if not is_generated_1d_case(case_dir):
+        return True
+    return False
 
 
 def run_reached_configured_end(case_dir: str) -> bool:

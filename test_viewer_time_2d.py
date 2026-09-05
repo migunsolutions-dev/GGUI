@@ -162,6 +162,32 @@ class OpenFOAMTimeHelperTests(unittest.TestCase):
             self.assertTrue((root / "0" / "p").is_file())
             self.assertTrue((root / "0.00076").is_dir())
 
+    def test_single_time_view_copies_when_junction_cannot_target_unc(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _touch_case_tree(root, ["0", "1e-07"], mesh_at=["constant"])
+            (root / "0" / "p").write_text("mapped-pressure\n", encoding="utf-8")
+            before = (root / "0" / "p").read_text(encoding="utf-8")
+            with mock.patch(
+                "openfoam_times_2d._link_directory",
+                side_effect=OSError(
+                    "Local volumes are required to complete the operation."
+                ),
+            ):
+                view = make_single_time_case_view(str(root), TIME_ZERO_LABEL)
+            try:
+                copied = Path(view) / "0" / "p"
+                self.assertTrue(copied.is_file())
+                self.assertEqual(copied.read_text(encoding="utf-8"), before)
+                self.assertFalse(copied.is_symlink())
+                foam = Path(view) / "case.foam"
+                self.assertTrue(foam.is_file())
+            finally:
+                remove_single_time_case_view(view)
+            self.assertEqual((root / "0" / "p").read_text(encoding="utf-8"), before)
+            self.assertTrue((root / "1e-07").is_dir())
+            self.assertFalse(os.path.isdir(view))
+
 
 class ViewerTimeSelectionTests(unittest.TestCase):
     def setUp(self):
@@ -292,6 +318,32 @@ class ViewerTimeSelectionTests(unittest.TestCase):
             (root / "2e-07" / "p").write_text("x", encoding="utf-8")
             self.viewer._sync_available_times_from_case()
             self.assertEqual(self.viewer.selected_time_label, "2e-07")
+
+    def test_live_follow_refresh_reads_local_single_time_view(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _touch_case_tree(root, ["0"])
+            with mock.patch.object(self.viewer, "request_refresh"):
+                self.viewer.load_case(str(root))
+                self.viewer.enable_live_follow()
+            foam = self.viewer._single_time_foam_file()
+            self.assertIsNotNone(foam)
+            self.assertTrue(os.path.isfile(foam))
+            self.assertTrue(
+                os.path.basename(os.path.dirname(foam)).startswith("ggui_of_tview_")
+            )
+            with mock.patch.object(
+                self.viewer,
+                "_single_time_foam_file",
+                wraps=self.viewer._single_time_foam_file,
+            ) as single:
+                with mock.patch(
+                    "axisymmetric_viewer.pv.POpenFOAMReader",
+                    side_effect=RuntimeError("skip vtk"),
+                ):
+                    self.viewer._refresh_axisymmetric_result()
+            if self.viewer._plotter is not None:
+                single.assert_called()
 
     def test_selecting_fixed_time_during_live_disables_follow(self):
         with tempfile.TemporaryDirectory() as td:

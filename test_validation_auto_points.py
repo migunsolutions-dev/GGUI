@@ -172,6 +172,7 @@ class AutoPointsEngineTests(unittest.TestCase):
         self.assertTrue(plan.ok)
         self.assertTrue(plan.points)
         self.assertTrue(all(p.range_m > 0.8 for p in plan.points))
+        self.assertTrue(all(p.range_m > 0.8 + 0.05 for p in plan.points))
         self.assertEqual(plan.extra["remap_region"]["center"], [0.0, 0.5, 0.0])
         self.assertTrue(
             all(

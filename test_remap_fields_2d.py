@@ -12,11 +12,13 @@ import tempfile
 from remap_fields_2d import (
     GROUND_CLIP,
     MAPPING_METHOD,
+    RADIUS_POLICY,
     _read_1d_data,
     carry_mixture_mass_in_air,
     charge_center_xyz,
     effective_mapped_radius,
     map_fields_to_2d_cells,
+    map_radial_velocity,
     map_scalar_profile,
     remap_region_metadata,
     source_radius_rz,
@@ -241,6 +243,43 @@ class RemapFields2DTests(unittest.TestCase):
         self.assertAlmostEqual(effective_mapped_radius(r_1d, mapped_radius=0.5), 0.5)
         self.assertAlmostEqual(effective_mapped_radius(r_1d, mapped_radius=0.0), 1.6)
         self.assertAlmostEqual(effective_mapped_radius(r_1d, mapped_radius=2.0), 1.6)
+
+    def test_radius_policy_is_user_mapped_not_source_padding(self):
+        self.assertEqual(RADIUS_POLICY, "user_mapped_radius")
+
+    def test_same_physical_r_is_spherically_symmetric(self):
+        r_1d = np.linspace(0.0, 0.8, 17)
+        p_1d = 1.0e5 + 2.0e6 * np.exp(-((r_1d - 0.3) ** 2) / 0.01)
+        hob = 1.0
+        r = np.array([0.35, 0.0])
+        z = np.array([hob, hob + 0.35])
+        self.assertTrue(np.allclose(source_radius_rz(r, z, hob), 0.35))
+        p = map_scalar_profile(r, z, hob, r_1d, p_1d, mapped_radius=0.6, ambient=1.0e5)
+        self.assertTrue(np.allclose(p, p[0], rtol=0, atol=1e-8))
+
+    def test_reconstructed_hob_ray_velocity_matches_1d_speed(self):
+        r_1d = np.array([0.1, 0.3, 0.5])
+        u_mag = np.array([100.0, 200.0, 300.0])
+        hob = 1.0
+        r = np.array([0.1, 0.3, 0.5, 0.7])
+        z = np.array([hob, hob, hob, hob])
+        u = map_radial_velocity(r, z, hob, r_1d, u_mag, mapped_radius=0.6)
+        self.assertTrue(np.allclose(u[:3, 0], u_mag))
+        self.assertTrue(np.allclose(u[:3, 1], 0.0))
+        self.assertTrue(np.allclose(u[3], 0.0))
+
+    def test_carry_keeps_mixture_mass_and_clears_he(self):
+        mapped = {
+            "alpha.c4": np.array([1.0, 0.0]),
+            "rho.c4": np.array([2.5, 1600.0]),
+            "rho.air": np.array([1e-16, 1.225]),
+        }
+        mix = mapped["alpha.c4"] * mapped["rho.c4"] + (1.0 - mapped["alpha.c4"]) * mapped["rho.air"]
+        carry_mixture_mass_in_air(mapped, unused_rho_c4=1600.0)
+        self.assertTrue(np.allclose(mapped["alpha.c4"], 0.0))
+        self.assertTrue(np.allclose(mapped["rho.c4"], 1600.0))
+        self.assertAlmostEqual(float(mapped["rho.air"][0]), float(mix[0]))
+        self.assertGreater(float(mapped["rho.air"][0]), 1.0)
 
     def test_user_radius_is_not_silently_replaced_by_1d_padding(self):
         r_1d = np.array([0.0, 0.3, 0.6, 0.66])

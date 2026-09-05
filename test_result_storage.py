@@ -117,7 +117,7 @@ class ResultStorageTests(unittest.TestCase):
             _mkdir(case, "0.2")
             self.assertTrue(run_reached_configured_end(case))
 
-    def test_1d_success_requires_end_time_and_rejects_fatal_or_interrupt(self):
+    def test_1d_without_completion_json_is_never_done(self):
         with tempfile.TemporaryDirectory() as case:
             _mkdir(case, "system")
             with open(
@@ -134,10 +134,10 @@ class ResultStorageTests(unittest.TestCase):
             self.assertFalse(solver_run_succeeded(case, 0))
             with open(os.path.join(case, "log.blastFoam"), "w", encoding="utf-8") as stream:
                 stream.write("Time = 0.0299999\nEnd\n")
-            self.assertTrue(solver_run_succeeded(case, 0))
+            self.assertFalse(solver_run_succeeded(case, 0))
             with open(os.path.join(case, "log.blastFoam"), "w", encoding="utf-8") as stream:
                 stream.write("Time = 0.03\nEnd\n")
-            self.assertTrue(solver_run_succeeded(case, 0))
+            self.assertFalse(solver_run_succeeded(case, 0))
             self.assertFalse(solver_run_succeeded(case, 0, user_stopped=True))
             with open(os.path.join(case, "log.blastFoam"), "w", encoding="utf-8") as stream:
                 stream.write(
@@ -146,6 +146,41 @@ class ResultStorageTests(unittest.TestCase):
                 )
             self.assertFalse(solver_run_succeeded(case, 0))
             self.assertFalse(solver_run_succeeded(case, 1))
+
+    def test_1d_terminate_mode_is_not_done_without_verified_arrival(self):
+        from completion_1d import (
+            RUN_MODE_TERMINATE,
+            finalize_completion_record,
+            initial_completion_record,
+            write_completion_record,
+        )
+
+        with tempfile.TemporaryDirectory() as case:
+            _mkdir(case, "system")
+            with open(
+                os.path.join(case, "system", "controlDict"), "w", encoding="utf-8"
+            ) as stream:
+                stream.write(
+                    "endTime         0.03;\n"
+                    "functions\n{\n    probes1d { writeInterval 25; }\n}\n"
+                )
+            write_completion_record(
+                case,
+                initial_completion_record(
+                    mode=RUN_MODE_TERMINATE,
+                    requested_stop_radius_m=1.0,
+                ),
+            )
+            with open(os.path.join(case, "log.blastFoam"), "w", encoding="utf-8") as stream:
+                stream.write("Time = 0.005776\nEnd\n")
+            finalize_completion_record(
+                case,
+                return_code=0,
+                user_stopped=False,
+                final_solver_time_s=0.005776,
+                reached_end_time=False,
+            )
+            self.assertFalse(solver_run_succeeded(case, 0))
 
     def test_vtk_export_must_materialize_durable_directory(self):
         from solver_runner import SolverRunner

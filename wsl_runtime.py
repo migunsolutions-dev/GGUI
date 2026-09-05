@@ -213,6 +213,32 @@ def build_case_command_argv(
     return argv, path, safe
 
 
+def publish_case_file(temp_path: str, dest_path: str) -> None:
+    """Replace a live case file via Linux mv when the case is on WSL.
+
+    Windows os.replace of a UNC path is not the same inode operation the
+    Linux solver sees. blastFoam rereads controlDict; a Windows replace can
+    leave stopAt writeNow invisible to the running process.
+    """
+    dest = to_wsl_path_and_distro(dest_path)
+    src = to_wsl_path_and_distro(temp_path)
+    if dest.distro and dest.linux_path.startswith("/"):
+        script = (
+            f"mv -f {shlex.quote(src.linux_path)} {shlex.quote(dest.linux_path)} "
+            f"&& touch {shlex.quote(dest.linux_path)}"
+        )
+        argv = build_wsl_argv(script, distro=dest.distro)
+        try:
+            completed = subprocess.run(
+                argv, capture_output=True, text=True, timeout=20
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            completed = None
+        if completed is not None and completed.returncode == 0:
+            return
+    os.replace(temp_path, dest_path)
+
+
 def popen_group_kwargs() -> dict:
     """Start children in a new session/group so cancel can target the tree."""
     if os.name == "nt":

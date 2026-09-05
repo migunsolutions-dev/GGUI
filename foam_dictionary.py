@@ -113,3 +113,25 @@ def update_top_level_entries(
     if remaining:
         raise KeyError(f"Top-level keys not found: {sorted(remaining)}")
     return "".join(output), tuple(changed)
+
+
+def with_write_now(text: str) -> str:
+    """Ask a runTimeModifiable solver to dump the current time and exit.
+
+    Also shrink the top-level writeInterval so writeNow does not wait for the
+    original field dump (often one interval at endTime).
+    """
+    try:
+        new_text, _changed = update_top_level_entries(
+            text, {"stopAt": "writeNow", "writeInterval": "1e-12"}
+        )
+        return new_text
+    except KeyError:
+        new_text, _changed = update_top_level_entries(text, {"stopAt": "writeNow"})
+        if "writeInterval" not in new_text:
+            new_text = new_text.replace(
+                "stopAt          writeNow;",
+                "stopAt          writeNow;\nwriteInterval   1e-12;",
+                1,
+            )
+        return new_text

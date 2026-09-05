@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import stat
 import subprocess
 import tempfile
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -93,23 +95,51 @@ def _link_directory(source: str, dest: str) -> None:
         raise OSError(detail or f"failed to link {source!r} -> {dest!r}")
 
 
+def _is_reparse_or_link(path: str) -> bool:
+    if os.path.islink(path):
+        return True
+    try:
+        attrs = int(getattr(os.lstat(path), "st_file_attributes", 0) or 0)
+    except OSError:
+        return False
+    return bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _materialize_directory(source: str, dest: str) -> None:
+    """Expose ``source`` at ``dest``. Copy when a junction cannot target WSL/UNC."""
+    source = os.path.abspath(source)
+    dest = os.path.abspath(dest)
+    if os.path.lexists(dest):
+        return
+    try:
+        _link_directory(source, dest)
+        return
+    except OSError:
+        pass
+    if not os.path.isdir(source):
+        raise OSError(f"OpenFOAM case directory is not readable: {source}")
+    shutil.copytree(source, dest)
+
+
 def make_single_time_case_view(case_dir: str, time_label: str) -> str:
     """Temp case root that exposes only ``constant``, ``system``, and one time dir.
 
     VTK/OpenFOAM readers otherwise enumerate every saved time directory. Linking
     a single time keeps initial load independent of how many results exist.
-    The original case is not copied or modified.
+    Windows junctions cannot point at ``\\\\wsl.localhost\\...``, so those
+    cases are copied into a local temp tree that PyVista can open.
+    The original case is not modified.
     """
     root = tempfile.mkdtemp(prefix="ggui_of_tview_")
     try:
         for name in _VIEW_LINK_NAMES:
             source = os.path.join(case_dir, name)
             if os.path.isdir(source):
-                _link_directory(source, os.path.join(root, name))
+                _materialize_directory(source, os.path.join(root, name))
         label = str(time_label or TIME_ZERO_LABEL)
         source_time = os.path.join(case_dir, label)
         if os.path.isdir(source_time):
-            _link_directory(source_time, os.path.join(root, label))
+            _materialize_directory(source_time, os.path.join(root, label))
         with open(os.path.join(root, "case.foam"), "w", encoding="utf-8") as handle:
             handle.write("")
     except Exception:
@@ -119,15 +149,23 @@ def make_single_time_case_view(case_dir: str, time_label: str) -> str:
 
 
 def remove_single_time_case_view(view_root: Optional[str]) -> None:
-    """Drop junctions/symlinks only. Never recurse into the original case."""
+    """Drop a temp view. Never follow junctions/symlinks into the original case."""
     if not view_root or not os.path.isdir(view_root):
+        return
+    base = os.path.basename(os.path.normpath(view_root))
+    if not base.startswith("ggui_of_tview_"):
         return
     try:
         for name in os.listdir(view_root):
             path = os.path.join(view_root, name)
             try:
-                if os.path.isdir(path):
-                    os.rmdir(path)
+                if _is_reparse_or_link(path):
+                    if os.path.isdir(path):
+                        os.rmdir(path)
+                    else:
+                        os.unlink(path)
+                elif os.path.isdir(path):
+                    shutil.rmtree(path)
                 else:
                     os.unlink(path)
             except OSError:

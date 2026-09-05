@@ -66,6 +66,8 @@ CONTROL_MAX_WIDTH_DEFAULT = 144
 LABEL_COLUMN_WIDTH = 100
 
 SECONDARY_INFO_STYLE = "font-size: 9pt; color: #555;"
+INFO_STATUS_STYLE = "color: #2c3e50; font-size: 9pt;"
 WARNING_STYLE = "color: #c0392b; font-size: 9pt; font-weight: bold;"
+ERROR_STATUS_STYLE = "color: #922b21; font-size: 9pt; font-weight: bold;"
 INFO_ROW_STYLE = "font-size: 9pt; color: #333; background: transparent; border: none;"
 INFO_TITLE_STYLE = "font-weight: bold; font-size: 9pt; color: #333; background: transparent; border: none;"

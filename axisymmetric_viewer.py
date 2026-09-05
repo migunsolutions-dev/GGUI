@@ -783,7 +783,10 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
                 except Exception:
                     pass
 
-            foam_file = None if self._live_follow else self._single_time_foam_file()
+            # Always read a local single-time view. Direct ``case.foam`` on
+            # ``\\wsl.localhost\...`` is invisible to PyVista, and Windows
+            # junctions cannot target that UNC path.
+            foam_file = self._single_time_foam_file()
             if not foam_file:
                 foam_file = os.path.join(self.current_case_dir, "case.foam")
                 if not os.path.exists(foam_file):

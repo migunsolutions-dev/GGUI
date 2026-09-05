@@ -23,6 +23,7 @@ from generator_2d import Generator2D
 from generator_3d import Generator3D
 from models_2d import CaseInputs2D, MappingSource2D
 from remap_fields_2d import map_fields_to_2d_cells, source_radius_rz
+from remap_handoff_1d import write_handoff_metadata
 from remap_snapshot_1d import (
     SCHEMA_VERSION,
     SNAPSHOT_JSON,
@@ -31,12 +32,14 @@ from remap_snapshot_1d import (
     SOURCE_SNAPSHOT,
     availability_for_case,
     canonical_case_path,
+    declared_remap_radius_m,
     load_profile_for_remap,
     read_snapshot_arrays,
     read_snapshot_metadata,
     resolve_remap_source,
     same_source_case,
     snapshot_exists,
+    transfer_limit_notes,
     validate_snapshot,
     write_snapshot,
     write_snapshot_after_run,
@@ -623,6 +626,57 @@ class RemapSnapshot1DTests(unittest.TestCase):
             status = write_snapshot_after_run(td, record, user_stopped=True)
             self.assertIn("Remap snapshot written", status)
             self.assertTrue(snapshot_exists(td))
+
+    def test_declared_remap_radius_ignores_domain_and_field_extent(self):
+        with tempfile.TemporaryDirectory() as td:
+            write_completion_record(
+                td,
+                CompletionRecord(
+                    mode=RUN_MODE_TERMINATE,
+                    remap_for_2d=False,
+                    requested_stop_radius_m=1.5,
+                    remap_radius_m=None,
+                ),
+            )
+            write_snapshot(
+                td,
+                {
+                    "r": np.linspace(0.01, 1.65, 8),
+                    "p": np.full(8, 2.0e5),
+                    "T": np.full(8, 300.0),
+                    "U_mag": np.linspace(0.0, 10.0, 8),
+                },
+                physical_time=0.001,
+            )
+            self.assertIsNone(declared_remap_radius_m(td))
+            notes = transfer_limit_notes(td, 0.5)
+            self.assertTrue(any("Remap = No" in item for item in notes))
+            self.assertTrue(any("1.5" in item and "Domain" in item for item in notes))
+            self.assertTrue(any("0.5" in item and "mapped radius" in item for item in notes))
+            self.assertTrue(any("stays ambient" in item for item in notes))
+            report = validate_mapping_source(_mapping_inputs(td))
+            self.assertTrue(any("Remap = No" in item for item in report.warnings))
+            self.assertTrue(any("stays ambient" in item for item in report.warnings))
+
+    def test_declared_remap_radius_uses_handoff_not_padding(self):
+        with tempfile.TemporaryDirectory() as td:
+            write_handoff_metadata(
+                td,
+                {"remap_radius_m": 0.6, "field_r_max_m": 0.66, "handoff_radius_m": 0.59},
+            )
+            write_completion_record(
+                td,
+                CompletionRecord(
+                    mode=RUN_MODE_TERMINATE,
+                    remap_for_2d=True,
+                    remap_radius_m=0.6,
+                    requested_stop_radius_m=0.6,
+                ),
+            )
+            self.assertAlmostEqual(declared_remap_radius_m(td), 0.6)
+            notes = transfer_limit_notes(td, 0.6)
+            self.assertTrue(any("R_remap = 0.6" in item for item in notes))
+            self.assertFalse(any("Remap = No" in item for item in notes))
 
 
 if __name__ == "__main__":

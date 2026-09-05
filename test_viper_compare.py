@@ -251,5 +251,41 @@ class RemapIdentityTests(unittest.TestCase):
         self.assertTrue(direct["run_summary_has_2d"])
 
 
+class AllrunWatchdogDefaultTests(unittest.TestCase):
+    def test_terminate_standalone_matches_gui_watchdog(self):
+        from models import BOUNDARY_1D_TERMINATE, RUN_MODE_TERMINATE
+        from viper_compare.ggui_run import allrun_watchdog_default
+
+        class Inputs:
+            stop_mode = RUN_MODE_TERMINATE
+            right_boundary = BOUNDARY_1D_TERMINATE
+            remap_for_2d = False
+
+        self.assertTrue(allrun_watchdog_default(Inputs()))
+
+    def test_reflect_does_not_enable_watchdog(self):
+        from models import BOUNDARY_1D_REFLECT, RUN_MODE_REFLECT
+        from viper_compare.ggui_run import allrun_watchdog_default
+
+        class Inputs:
+            stop_mode = RUN_MODE_REFLECT
+            right_boundary = BOUNDARY_1D_REFLECT
+            remap_for_2d = False
+
+        self.assertFalse(allrun_watchdog_default(Inputs()))
+
+    def test_allrun_discards_solver_stdout(self):
+        from viper_compare.ggui_run import ALLRUN
+
+        self.assertIn(">/dev/null", ALLRUN)
+
+    def test_harness_watchdog_poll_matches_gui(self):
+        from completion_1d import WATCHDOG_POLL_S
+        from viper_compare.ggui_run import WATCHDOG_POLL_S as HARNESS_POLL
+
+        self.assertEqual(WATCHDOG_POLL_S, 0.10)
+        self.assertEqual(HARNESS_POLL, WATCHDOG_POLL_S)
+
+
 if __name__ == "__main__":
     unittest.main()

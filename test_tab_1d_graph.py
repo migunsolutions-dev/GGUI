@@ -279,8 +279,23 @@ class Tab1DStopModeTests(unittest.TestCase):
         self.assertAlmostEqual(tab.get_case_inputs().stop_radius_m, 1.0)
         self.assertAlmostEqual(tab.get_case_inputs().end_time_s, 0.04)
 
+    def test_remap_for_2d_follows_remap_radio(self):
+        from tab_1d import Tab1D
+
+        tab = Tab1D()
+        self.assertFalse(tab.get_case_inputs().remap_for_2d)
+        tab.radio_yes.setChecked(True)
+        self.assertTrue(tab.get_case_inputs().remap_for_2d)
+        tab.set_case_inputs({"remap_for_2d": False, "radius": 1.0})
+        self.assertFalse(tab.radio_yes.isChecked())
+        self.assertFalse(tab.get_case_inputs().remap_for_2d)
+        tab.set_case_inputs({"remap_for_2d": True, "radius": 1.0})
+        self.assertTrue(tab.radio_yes.isChecked())
+        self.assertTrue(tab.get_case_inputs().remap_for_2d)
+
     def test_right_boundary_wins_when_legacy_stop_mode_conflicts(self):
         from models import BOUNDARY_1D_TERMINATE, RUN_MODE_TERMINATE
+        from tab_1d import Tab1D
 
         tab = Tab1D()
         tab.set_case_inputs(
@@ -297,6 +312,8 @@ class Tab1DStopModeTests(unittest.TestCase):
         self.assertTrue(tab.radio_reflect.isChecked())
 
     def test_begin_run_graph_clears_stale_profile_times(self):
+        from tab_1d import Tab1D
+
         tab = Tab1D()
         tab._has_run_profile = True
         tab._live_graph = True

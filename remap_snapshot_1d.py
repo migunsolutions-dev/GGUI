@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -912,6 +913,96 @@ def availability_for_case(case_dir: str) -> RemapAvailability:
         message=resolved.message or "Remap is unavailable.",
         physical_time=completion.get("final_solver_time_s"),
     )
+
+
+def _positive_radius_m(raw: Any) -> Optional[float]:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0.0:
+        return None
+    return value
+
+
+def declared_remap_radius_m(case_dir: str) -> Optional[float]:
+    """Return explicit 1D R_remap only.
+
+    Domain Radius, requested stop radius, and numerical field extent are
+    not substitutes. Remap = No sources return None.
+    """
+    if not case_dir:
+        return None
+    try:
+        from remap_handoff_1d import read_handoff_metadata
+
+        handoff = read_handoff_metadata(case_dir) or {}
+    except Exception:
+        handoff = {}
+    found = _positive_radius_m(handoff.get("remap_radius_m"))
+    if found is not None:
+        return found
+    snap = read_snapshot_metadata(case_dir) or {}
+    return _positive_radius_m(snap.get("remap_radius_m"))
+
+
+def source_field_r_max_m(case_dir: str) -> Optional[float]:
+    if not case_dir:
+        return None
+    snap = read_snapshot_metadata(case_dir) or {}
+    found = _positive_radius_m(snap.get("field_r_max_m"))
+    if found is not None:
+        return found
+    try:
+        from remap_handoff_1d import read_handoff_metadata
+
+        handoff = read_handoff_metadata(case_dir) or {}
+    except Exception:
+        handoff = {}
+    return _positive_radius_m(handoff.get("field_r_max_m"))
+
+
+def transfer_limit_notes(case_dir: str, mapped_radius: float) -> List[str]:
+    """GUI / preflight notes that keep Domain Radius distinct from R_remap."""
+    notes: List[str] = []
+    if not case_dir:
+        return notes
+    try:
+        mapped = float(mapped_radius)
+    except (TypeError, ValueError):
+        mapped = 0.0
+    if not math.isfinite(mapped) or mapped < 0.0:
+        mapped = 0.0
+    completion = _completion_info(case_dir)
+    has_completion = False
+    try:
+        from completion_1d import read_completion_record
+
+        has_completion = read_completion_record(case_dir) is not None
+    except Exception:
+        has_completion = False
+    declared = declared_remap_radius_m(case_dir)
+    field_max = source_field_r_max_m(case_dir)
+    if has_completion and not bool(completion.get("remap_for_2d")):
+        notes.append(
+            "This 1D run used Remap = No. Domain Radius is the computational "
+            "domain, not a physical R_remap."
+        )
+        stop_r = _positive_radius_m(completion.get("requested_stop_radius_m"))
+        if stop_r is not None:
+            notes.append(f"1D Domain / stop radius was {stop_r:g} m.")
+    elif declared is not None:
+        notes.append(f"1D R_remap = {declared:g} m.")
+    if mapped > 0.0:
+        notes.append(
+            f"2D will transfer source state only within mapped radius {mapped:g} m."
+        )
+    if field_max is not None and mapped > 0.0 and mapped + 1e-9 < field_max:
+        notes.append(
+            f"Source field extends to {field_max:.6g} m; state beyond "
+            f"{mapped:g} m stays ambient."
+        )
+    return notes
 
 
 def display_text(avail: RemapAvailability) -> str:

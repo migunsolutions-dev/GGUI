@@ -133,15 +133,15 @@ def histories_available(snapshot: RunSnapshot, dim: str) -> bool:
 
 
 def default_display_dims(snapshot: RunSnapshot) -> set:
-    """Select only the Current Run dimension. Do not enable idle sibling tabs."""
-    live = live_dimension(snapshot)
+    """Select completed Current Run dimensions that have simulation histories.
+
+    A dimension without histories is not shown as a computed result. If nothing
+    has finished yet, preview only the live dimension (labelled Planned).
+    """
     available = {name for name in ("1d", "2d", "3d") if histories_available(snapshot, name)}
-    if live in available:
-        return {live}
     if available:
-        for name in ("1d", "2d", "3d"):
-            if name in available:
-                return {name}
+        return available
+    live = live_dimension(snapshot)
     if live in ("1d", "2d", "3d"):
         return {live}
     return set()

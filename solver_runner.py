@@ -1,7 +1,6 @@
 import glob
 import os
 import re
-import shlex
 import tempfile
 import time
 import subprocess
@@ -21,6 +20,7 @@ from completion_1d import (
     STOP_REASON_END_TIME_REACHED,
     STOP_REASON_END_TIME_WITHOUT_ARRIVAL,
     STOP_REASON_WAVE_RADIUS_REACHED,
+    WATCHDOG_POLL_S,
     detect_arrival_in_case,
     finalize_completion_record,
     is_terminate_mode,
@@ -31,7 +31,7 @@ from completion_1d import (
     write_completion_record,
 )
 from remap_handoff_1d import primary_shock_at_probe
-from foam_dictionary import update_top_level_entries
+from foam_dictionary import with_write_now
 from result_storage import (
     ResultStoragePolicy,
     control_dict_root_end_time,
@@ -47,6 +47,7 @@ from wsl_runtime import (
     build_case_command_argv,
     build_wsl_argv,
     popen_group_kwargs,
+    publish_case_file,
     terminate_process_tree,
     to_wsl_path_and_distro,
 )
@@ -125,30 +126,8 @@ def probe_write_interval_from_control_dict(
 
 
 def _publish_control_dict(temp_path: str, dest_path: str) -> None:
-    """Replace controlDict without leaving a truncated file for OpenFOAM.
-
-    blastFoam rereads ``system/controlDict`` because it is runTimeModifiable.
-    A Windows truncate-and-rewrite of the live file, while the solver reads
-    it from Linux, produces ``FOAM FATAL IO ERROR: problem while reading
-    header for object controlDict``. Publish a complete temp file, then
-    rename it in place (Linux ``mv`` when the case lives in WSL).
-    """
-    dest = to_wsl_path_and_distro(dest_path)
-    src = to_wsl_path_and_distro(temp_path)
-    if dest.distro and dest.linux_path.startswith("/"):
-        script = (
-            f"mv -f {shlex.quote(src.linux_path)} {shlex.quote(dest.linux_path)}"
-        )
-        argv = build_wsl_argv(script, distro=dest.distro)
-        try:
-            completed = subprocess.run(
-                argv, capture_output=True, text=True, timeout=20
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            completed = None
-        if completed is not None and completed.returncode == 0:
-            return
-    os.replace(temp_path, dest_path)
+    """Replace controlDict without leaving a truncated file for OpenFOAM."""
+    publish_case_file(temp_path, dest_path)
 
 
 def request_solver_write_and_stop(case_dir: str) -> bool:
@@ -164,9 +143,7 @@ def request_solver_write_and_stop(case_dir: str) -> bool:
     try:
         with open(cd_path, "r", encoding="utf-8") as handle:
             text = handle.read()
-        new_text, _changed = update_top_level_entries(
-            text, {"stopAt": "writeNow"}
-        )
+        new_text = with_write_now(text)
         sys_dir = os.path.dirname(cd_path)
         fd, temp_path = tempfile.mkstemp(
             prefix=".ggui-cd-", suffix=".tmp", dir=sys_dir
@@ -184,6 +161,41 @@ def request_solver_write_and_stop(case_dir: str) -> bool:
             except OSError:
                 pass
         return False
+
+
+def latest_written_processor_time(case_dir: str) -> Optional[Tuple[float, str]]:
+    """Newest processor0 time directory that looks like a completed field write.
+
+    blastFoam prints ``Time =`` every step. That is not a reconstruct trigger.
+    Live reconstructPar must wait for an actual processor time folder.
+    """
+    proc0 = os.path.join(case_dir or "", "processor0")
+    if not os.path.isdir(proc0):
+        return None
+    best: Optional[Tuple[float, str]] = None
+    try:
+        names = os.listdir(proc0)
+    except OSError:
+        return None
+    for name in names:
+        if name in ("constant", "system") or name.startswith("processor"):
+            continue
+        try:
+            time_val = float(name)
+        except ValueError:
+            continue
+        if time_val <= 0.0:
+            continue
+        path = os.path.join(proc0, name)
+        if not os.path.isdir(path):
+            continue
+        marker = os.path.join(path, "uniform", "time")
+        field = os.path.join(path, "p")
+        if not (os.path.isfile(marker) or os.path.isfile(field)):
+            continue
+        if best is None or time_val >= best[0]:
+            best = (time_val, name)
+    return best
 
 
 def complete_probe_chunk(raw: bytes) -> Tuple[bytes, int]:
@@ -461,64 +473,21 @@ class SolverRunner(QThread):
             pass
 
     def _maybe_reconstruct_new_times(self) -> None:
-        """If parallel (cores > 1), tail solver log and run reconstructPar -newTimes when a write is detected (non-blocking).
-        Uses shell redirection so Linux creates log.reconstructPar in the case directory."""
+        """Reconstruct only after a real processor field write, not every Time=.
+
+        Parallel GUI cases print ``Time =`` every step. Waiting 4 s and launching
+        reconstructPar on that floods I/O when writeInterval is sparse.
+        """
         if self.cores <= 1:
             return
         if self._reconstruct_proc is not None and self._reconstruct_proc.poll() is None:
             return
-        log_path = os.path.join(self.win_case_dir, "log.blastFoam")
-        if not os.path.isfile(log_path):
+        written = latest_written_processor_time(self.win_case_dir)
+        if written is None:
             return
-        try:
-            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-                f.seek(0, 2)
-                end_pos = f.tell()
-                if self._log_blastfoam_pos == 0:
-                    self._log_blastfoam_pos = end_pos
-                    return
-                f.seek(self._log_blastfoam_pos)
-                new_content = f.read()
-                self._log_blastfoam_pos = f.tell()
-        except Exception:
-            return
-        if not new_content:
-            return
-        if "Time =" not in new_content and "Writing" not in new_content:
-            return
-
-        # Extract latest time string from log (Time = 0.001 or Writing time 0.001)
-        time_re = re.compile(r"(?:Time\s*=\s*|Writing\s+time\s+)([\d\.eE\+\-]+)")
-        matches = time_re.findall(new_content)
-        if not matches:
-            return
-        time_str = matches[-1]
-        try:
-            time_val = float(time_str)
-        except ValueError:
-            return
+        time_val, _label = written
         if self._last_reconstructed_time is not None and time_val <= self._last_reconstructed_time:
             return
-
-        # Poll for processor0/<time> to exist and have content (avoids race with solver write)
-        proc0_dir = os.path.join(self.win_case_dir, "processor0")
-        time_dir = os.path.join(proc0_dir, time_str)
-        marker_file = os.path.join(time_dir, "uniform", "time")
-        max_retries = 20
-        interval = 0.2
-        found = False
-        for _ in range(max_retries):
-            if os.path.isdir(time_dir):
-                if os.path.isfile(marker_file):
-                    found = True
-                    break
-                try:
-                    if os.listdir(time_dir):
-                        found = True
-                        break
-                except OSError:
-                    pass
-            time.sleep(interval)
 
         self._last_reconstructed_time = time_val
         cmd = "reconstructPar -newTimes > log.reconstructPar 2>&1"
@@ -857,7 +826,7 @@ class SolverRunner(QThread):
                     except Exception:
                         pass
 
-            time.sleep(0.10)
+            time.sleep(WATCHDOG_POLL_S)
 
         rc = self._proc.poll() if self._proc else 1
         user_stopped = bool(self._stop_requested)

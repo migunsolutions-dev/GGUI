@@ -45,6 +45,11 @@ from ui_metrics import COMPUTATIONAL_LEFT_PANEL_WIDTH, DEFAULT_WINDOW_WIDTH
 from validation import ufc_airblast as ufc_ab
 from validation.fingerprint import attach_plan_fingerprint, build_fingerprint
 from validation.kb_overlay import SOURCE_UFC
+from validation.kb_propagation import (
+    exclusive_independent_r_min,
+    first_independent_r_m,
+    physical_standoff_m,
+)
 from validation.metrics import is_finite_number
 from validation.ufc_airblast import scaled_distance
 from validation.ufc_units import cube_root
@@ -73,9 +78,9 @@ REMAP_NO_VALID_DOMAIN = (
     "outside the remap receiving region."
 )
 REMAP_RECEIVE_NOTE = (
-    "Automatic validation points are placed outside the remap receiving region "
-    "centred at [0, HOB, 0] (spherical radius from the target charge centre) "
-    "so the comparison is of later physical evolution."
+    "Automatic KB propagation points are placed outside the copied 1D remap "
+    "region plus one target cell, using the actual remap metadata. Inside/"
+    "on-boundary locations belong to Remap Validation, not KB propagation."
 )
 
 
@@ -477,22 +482,23 @@ def plan_2d(
             domain_r_max=float(domain_radius_m),
         )
     r_min, r_max = clipped
-    inset = _inset(domain_radius_m, cell_size)
     receive = (
         float(remap_receive_r_max)
         if is_finite_number(remap_receive_r_max) and float(remap_receive_r_max) > 0.0
         else None
     )
+    charge_center = (0.0, z_line, 0.0)
+    dx = float(cell_size) if is_finite_number(cell_size) and float(cell_size) > 0.0 else None
     if receive is not None:
-        lo_phys = receive + inset
-        if r_max <= lo_phys:
+        lo_phys = exclusive_independent_r_min(receive, dx)
+        if r_max <= first_independent_r_m(receive, dx):
             notes.append(REMAP_NO_VALID_DOMAIN)
             return SamplingPlan(
                 dim="2d",
                 burst_master=burst,
                 figure=figure,
                 mass_kg=float(mass_kg),
-                charge_center=(0.0, z_line, 0.0),
+                charge_center=charge_center,
                 r_min=r_min,
                 r_max=r_max,
                 z_min=z_lo,
@@ -506,29 +512,39 @@ def plan_2d(
                 notes=tuple(notes),
                 domain_r_max=float(domain_radius_m),
                 remap_receive_r_max=receive,
-                extra={"remap_region": {"center": [0.0, z_line, 0.0], "radius_m": receive}},
+                extra={
+                    "remap_region": {
+                        "center": [0.0, z_line, 0.0],
+                        "radius_m": receive,
+                        "exclusion_guard_m": float(dx or 0.0),
+                        "first_independent_r_m": first_independent_r_m(receive, dx),
+                    }
+                },
             )
         r_min = max(r_min, lo_phys)
         notes.append(
             REMAP_RECEIVE_NOTE
-            + f" (r > {receive:.6g} m)."
+            + f" (R > {first_independent_r_m(receive, dx):.6g} m)."
         )
     n = point_count(usable_width_px, logical_dpi_x)
     radii = log_spaced(r_min, r_max, n)
-    points = tuple(
-        _point(
-            dim="2d",
-            index=i,
-            range_m=r,
-            x=r,
-            y=z_line,
-            z=0.0,
-            mass_kg=float(mass_kg),
-            burst=burst,
-            figure=figure,
+    points = []
+    for i, r in enumerate(radii):
+        rng = physical_standoff_m("2d", (r, z_line, 0.0), charge_center)
+        points.append(
+            _point(
+                dim="2d",
+                index=i,
+                range_m=rng,
+                x=r,
+                y=z_line,
+                z=0.0,
+                mass_kg=float(mass_kg),
+                burst=burst,
+                figure=figure,
+            )
         )
-        for i, r in enumerate(radii)
-    )
+    points = tuple(points)
     notes.append(
         "2D Validation Points lie on the horizontal line through the charge centre "
         "(z = HOB, r increasing). One line only; no angular rays."
@@ -538,7 +554,7 @@ def plan_2d(
         burst_master=burst,
         figure=figure,
         mass_kg=float(mass_kg),
-        charge_center=(0.0, z_line, 0.0),
+        charge_center=charge_center,
         r_min=r_min,
         r_max=r_max,
         z_min=z_lo,
@@ -553,7 +569,14 @@ def plan_2d(
         domain_r_max=float(domain_radius_m),
         remap_receive_r_max=receive,
         extra=(
-            {"remap_region": {"center": [0.0, z_line, 0.0], "radius_m": receive}}
+            {
+                "remap_region": {
+                    "center": [0.0, z_line, 0.0],
+                    "radius_m": receive,
+                    "exclusion_guard_m": float(dx or 0.0),
+                    "first_independent_r_m": first_independent_r_m(receive, dx),
+                }
+            }
             if receive is not None
             else {}
         ),

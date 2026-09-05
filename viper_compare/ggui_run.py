@@ -8,20 +8,26 @@ import time
 from typing import Sequence, Tuple
 
 from axisymmetric_2d import BOUNDARY_OPEN, DIRECT_SOURCE, FIXED_MESH, REMAP_SOURCE
-from completion_1d import overpressure_arrived, read_completion_record
+from completion_1d import (
+    RUN_MODE_TERMINATE,
+    WATCHDOG_POLL_S,
+    normalize_run_mode,
+    overpressure_arrived,
+    read_completion_record,
+)
 from remap_handoff_1d import primary_shock_at_probe
-from foam_dictionary import update_top_level_entries
+from foam_dictionary import with_write_now
 from models import BOUNDARY_1D_TERMINATE, CaseInputs1D, RUN_MODE_TERMINATE
 from models_2d import CaseInputs2D, MappingSource2D, ProbePoint2D
 from simulation_service import SimulationService
-from wsl_runtime import build_case_command_argv
+from wsl_runtime import build_case_command_argv, publish_case_file
 from viper_compare.physics import TestDefinition
 
 WORK = r"\\wsl.localhost\Ubuntu-20.04\home\naor\OpenFOAM\naor-9\run\Work"
 BASHRC = "/opt/openfoam9/etc/bashrc"
 ALLRUN = (
     "set -o pipefail; sed -i 's/\\r$//' Allrun Allclean 2>/dev/null || true; "
-    "chmod +x Allrun Allclean 2>/dev/null || true; bash ./Allrun"
+    "chmod +x Allrun Allclean 2>/dev/null || true; bash ./Allrun >/dev/null"
 )
 
 
@@ -118,6 +124,15 @@ def inputs_2d(
     )
 
 
+def allrun_watchdog_default(inputs) -> bool:
+    """Match GUI 1D: Terminate/remap precursors stop via writeNow, Reflect does not."""
+    mode = normalize_run_mode(
+        getattr(inputs, "stop_mode", None),
+        getattr(inputs, "right_boundary", None),
+    )
+    return mode == RUN_MODE_TERMINATE
+
+
 def request_write_now(case_dir: str) -> bool:
     """Qt-free copy of solver_runner.request_solver_write_and_stop."""
     import tempfile
@@ -126,14 +141,14 @@ def request_write_now(case_dir: str) -> bool:
     try:
         with open(cd_path, encoding="utf-8") as handle:
             text = handle.read()
-        new_text, _changed = update_top_level_entries(text, {"stopAt": "writeNow"})
+        new_text = with_write_now(text)
         sys_dir = os.path.dirname(cd_path)
         fd, temp_path = tempfile.mkstemp(prefix=".ggui-cd-", suffix=".tmp", dir=sys_dir)
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(new_text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_path, cd_path)
+        publish_case_file(temp_path, cd_path)
         return True
     except (OSError, KeyError):
         return False
@@ -196,7 +211,9 @@ def run_allrun_with_optional_watchdog(
     out_path = os.path.join(log_dir, f"{prefix}_allrun.log")
     t0 = time.perf_counter()
     with open(out_path, "w", encoding="utf-8", errors="replace") as logf:
-        proc = subprocess.Popen(argv, stdout=logf, stderr=subprocess.STDOUT)
+        logf.write("Allrun stdout discarded; solver text stays in case log.blastFoam.\n")
+        logf.flush()
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         triggered = False
         record = read_completion_record(case_dir) if watchdog else None
         p_atm = float(getattr(record, "p_atm", 101325.0) or 101325.0)
@@ -216,11 +233,13 @@ def run_allrun_with_optional_watchdog(
                     if reached:
                         request_write_now(case_dir)
                         triggered = True
-            time.sleep(0.25)
+            time.sleep(WATCHDOG_POLL_S)
         wall = time.perf_counter() - t0
     text = ""
     try:
-        text = open(out_path, encoding="utf-8", errors="replace").read()[-4000:]
+        text = open(
+            os.path.join(case_dir, "log.blastFoam"), encoding="utf-8", errors="replace"
+        ).read()[-4000:]
     except OSError:
         pass
     crashed = "Floating point exception" in text or "FOAM FATAL" in text
@@ -294,7 +313,7 @@ def generate_and_run(
     t_gen = time.perf_counter()
     case_dir = svc.generate_case(name, inputs)
     gen_s = time.perf_counter() - t_gen
-    use_watchdog = bool(getattr(inputs, "remap_for_2d", False)) if watchdog is None else bool(watchdog)
+    use_watchdog = allrun_watchdog_default(inputs) if watchdog is None else bool(watchdog)
     run = run_allrun_with_optional_watchdog(
         case_dir=case_dir,
         log_dir=log_dir,

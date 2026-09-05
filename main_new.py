@@ -279,6 +279,14 @@ class SegmentedStatusBar(QFrame):
             "QScrollArea#statusMetricsScroll > QWidget > QWidget { background-color: #34495e; }"
         )
         self._metrics_scroll.setWidget(self._metrics_widget)
+        live_tip = (
+            "Live solver progress for the active run. "
+            "These values are not the Validation-page case time."
+        )
+        self._metrics_widget.setToolTip(live_tip)
+        self._metrics_scroll.setToolTip(live_tip)
+        for lbl in (self.lbl_1d_group, self.lbl_2d_group, self.lbl_3d_group, self.lbl_et):
+            lbl.setToolTip(live_tip)
         self._refresh_metrics_width()
 
         outer.addWidget(self._metrics_scroll, stretch=1)

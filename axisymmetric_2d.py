@@ -350,6 +350,9 @@ def validate_mapping_source(
                     missing.append(name)
             if missing:
                 errors.append("Required source fields are missing: " + ", ".join(missing))
+    from remap_snapshot_1d import transfer_limit_notes
+
+    warnings.extend(transfer_limit_notes(source_case, source.mapped_radius))
     warnings.append(
         "Radial mapping about the target charge centre [0, HOB, 0] is not conservative."
     )

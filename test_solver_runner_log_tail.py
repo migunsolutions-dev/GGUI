@@ -4,7 +4,7 @@ import tempfile
 import unittest
 
 from execution_plan import ExecutionIntent, build_execution_plan
-from solver_runner import live_log_read_position
+from solver_runner import latest_written_processor_time, live_log_read_position
 
 
 class LiveLogReadPositionTests(unittest.TestCase):
@@ -77,6 +77,34 @@ class ResumeTeeAppendTests(unittest.TestCase):
             self.assertIn("| tee log.blastFoam", parallel.command)
             self.assertNotIn("tee -a", serial.command)
             self.assertNotIn("tee -a", parallel.command)
+
+
+class ProcessorWriteDiscoveryTests(unittest.TestCase):
+    def test_time_equals_log_without_folder_is_not_a_write(self):
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "processor0", "constant"))
+            with open(os.path.join(td, "log.blastFoam"), "w", encoding="utf-8") as handle:
+                handle.write("Time = 0.001\nTime = 0.002\n")
+            self.assertIsNone(latest_written_processor_time(td))
+
+    def test_processor_field_folder_is_a_write(self):
+        with tempfile.TemporaryDirectory() as td:
+            written = os.path.join(td, "processor0", "0.001")
+            os.makedirs(written)
+            with open(os.path.join(written, "p"), "w", encoding="utf-8") as handle:
+                handle.write("101325\n")
+            found = latest_written_processor_time(td)
+            self.assertIsNotNone(found)
+            self.assertAlmostEqual(found[0], 0.001)
+            self.assertEqual(found[1], "0.001")
+
+    def test_time_zero_is_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            zero = os.path.join(td, "processor0", "0")
+            os.makedirs(zero)
+            with open(os.path.join(zero, "p"), "w", encoding="utf-8") as handle:
+                handle.write("101325\n")
+            self.assertIsNone(latest_written_processor_time(td))
 
 
 if __name__ == "__main__":

@@ -38,6 +38,8 @@ from tab_time_history import GaugeRow, catalog_rows
 from ui_metrics import (
     COMPUTATIONAL_LEFT_PANEL_MIN,
     COMPUTATIONAL_LEFT_PANEL_WIDTH,
+    ERROR_STATUS_STYLE,
+    INFO_STATUS_STYLE,
     SECONDARY_INFO_STYLE,
     WARNING_STYLE,
 )
@@ -198,6 +200,12 @@ class TabValidation(QWidget):
         self._auto_defaults_key: Optional[tuple] = None
         self._display_sync_key: Optional[tuple] = None
         self._sampling_notes: List[str] = []
+        self._probe_cache: Dict[tuple, object] = {}
+        self._probe_file_cache: Dict[tuple, object] = {}
+        self._probe_path_cache: Dict[tuple, str] = {}
+        self._case_end_cache: Dict[tuple, object] = {}
+        self._remap_cache: Dict[object, object] = {}
+        self._numerical_cache: Dict[str, object] = {}
         self._redraw_timer = QTimer(self)
         self._redraw_timer.setSingleShot(True)
         self._redraw_timer.setInterval(50)
@@ -240,6 +248,7 @@ class TabValidation(QWidget):
             self._auto_plans = []
             self._auto_defaults_key = None
             self._display_sync_key = None
+            self._clear_validation_caches()
         self._refresh_banner()
         self._prefill_from_snapshot()
         self.refresh_catalog()
@@ -268,7 +277,7 @@ class TabValidation(QWidget):
         root.addLayout(top)
         self.lbl_status = QLabel("")
         self.lbl_status.setWordWrap(True)
-        self.lbl_status.setStyleSheet(WARNING_STYLE)
+        self.lbl_status.setStyleSheet(INFO_STATUS_STYLE)
         root.addWidget(self.lbl_status)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -633,7 +642,6 @@ class TabValidation(QWidget):
         return self.radio_auto_points.isChecked()
 
     def _on_auto_dim_changed(self, *_args) -> None:
-        self._auto_plans = []
         self._schedule_redraw()
 
     def _on_sampling_changed(self, *_args) -> None:
@@ -831,6 +839,26 @@ class TabValidation(QWidget):
             remap_receive_r_max=receive,
         )
 
+    def _stored_plan_for_case(self, case: Optional[str], dim: str, expected: dict) -> Tuple[Optional[SamplingPlan], str]:
+        """Reuse the on-disk plan for this completed case even if remap policy drifted.
+
+        Probe locations are facts of the run. A newer receive-radius fingerprint must
+        not invent new sample stations that the existing histories do not contain.
+        """
+        if not case:
+            return None, ""
+        loaded, mismatch = load_matching_plan(case, expected)
+        if loaded is not None and loaded.dim == dim and (loaded.points or loaded.notes):
+            return loaded, ""
+        stored = read_sampling_plan(case)
+        if stored is None or stored.dim != dim or not stored.points:
+            return None, mismatch
+        stored_id = str((stored.fingerprint or {}).get("case_id") or "")
+        live_id = str((expected or {}).get("case_id") or "")
+        if stored_id and live_id and stored_id == live_id:
+            return stored, ""
+        return None, mismatch
+
     def _collect_auto_plans(self) -> List[SamplingPlan]:
         if self._auto_plans:
             return list(self._auto_plans)
@@ -840,10 +868,9 @@ class TabValidation(QWidget):
         width = DEFAULT_PLOT_WIDTH_PX
         plans: List[SamplingPlan] = []
         notes: List[str] = []
-        want = self._display_dims()
-        if "1d" in want and is_finite_number(snap.domain_radius_1d) and float(snap.domain_radius_1d) > 0.0:
+        if is_finite_number(snap.domain_radius_1d) and float(snap.domain_radius_1d) > 0.0:
             case = case_dir_for_dim(snap, "1d")
-            loaded, mismatch = load_matching_plan(case or "", self._live_fingerprint("1d")) if case else (None, "")
+            loaded, mismatch = self._stored_plan_for_case(case, "1d", self._live_fingerprint("1d")) if case else (None, "")
             if loaded is not None and loaded.dim == "1d" and loaded.points:
                 plans.append(loaded)
             else:
@@ -864,12 +891,12 @@ class TabValidation(QWidget):
                         hob_m=0.0,
                     )
                 )
-        if "2d" in want and is_finite_number(snap.domain_radius_2d) and float(snap.domain_radius_2d) > 0.0:
+        if is_finite_number(snap.domain_radius_2d) and float(snap.domain_radius_2d) > 0.0:
             case = case_dir_for_dim(snap, "2d")
             hob = float(snap.hob_m) if is_finite_number(snap.hob_m) else 0.0
             height = float(snap.domain_height_2d) if is_finite_number(snap.domain_height_2d) else hob
             receive = self._remap_receive_2d()
-            loaded, mismatch = load_matching_plan(case or "", self._live_fingerprint("2d")) if case else (None, "")
+            loaded, mismatch = self._stored_plan_for_case(case, "2d", self._live_fingerprint("2d")) if case else (None, "")
             if loaded is not None and loaded.dim == "2d" and (loaded.points or loaded.notes):
                 plans.append(loaded)
             else:
@@ -935,16 +962,26 @@ class TabValidation(QWidget):
     def _case_end_state(self, case: Optional[str], last_time: Optional[float]) -> Tuple[Optional[float], Optional[bool]]:
         if not case:
             return None, None
-        end_time = None
-        reached = None
+        ctrl = os.path.join(case, "system", "controlDict")
         try:
-            from result_storage import control_dict_root_end_time, run_reached_configured_end
-
-            end_time = control_dict_root_end_time(case)
-            reached = run_reached_configured_end(case)
-        except Exception:
+            stamp = os.path.getmtime(ctrl) if os.path.isfile(ctrl) else None
+        except OSError:
+            stamp = None
+        cached = self._case_end_cache.get((case, stamp))
+        if cached is not None:
+            end_time, reached = cached
+        else:
             end_time = None
             reached = None
+            try:
+                from result_storage import control_dict_root_end_time, run_reached_configured_end
+
+                end_time = control_dict_root_end_time(case)
+                reached = run_reached_configured_end(case)
+            except Exception:
+                end_time = None
+                reached = None
+            self._case_end_cache[(case, stamp)] = (end_time, reached)
         if last_time is not None and end_time is not None:
             from validation.history_quality import run_reached_end_time
 
@@ -973,22 +1010,38 @@ class TabValidation(QWidget):
 
     def _bf_auto_peak_impulse(self, point: ValidationPoint) -> Tuple[Optional[float], Optional[float], str, bool]:
         case = case_dir_for_dim(self._snapshot, point.dim)
+        fo = EXISTING_1D_GRAPH_FO if point.dim == "1d" else VALIDATION_FO.get(point.dim, "")
+        p_path = self._latest_probe_path(case, fo, "p") if case and fo else ""
+        try:
+            stamp = os.path.getmtime(p_path) if p_path and os.path.isfile(p_path) else None
+        except OSError:
+            stamp = None
+        key = (self._auto_key, point.dim, getattr(point, "point_id", ""), float(point.range_m or 0.0), p_path, stamp)
+        hit = self._probe_cache.get(key)
+        if hit is not None:
+            return hit  # type: ignore[return-value]
+        result = self._bf_auto_peak_impulse_compute(point)
+        self._probe_cache[key] = result
+        return result
+
+    def _bf_auto_peak_impulse_compute(self, point: ValidationPoint) -> Tuple[Optional[float], Optional[float], str, bool]:
+        case = case_dir_for_dim(self._snapshot, point.dim)
         if not case:
             return None, None, PLANNED_NOT_RUN, False
         if point.dim == "1d":
             fo = EXISTING_1D_GRAPH_FO
-            p_path = latest_probe_field_file(case, fo, "p")
-            i_path = latest_probe_field_file(case, fo, "impulse")
+            p_path = self._latest_probe_path(case, fo, "p")
+            i_path = self._latest_probe_path(case, fo, "impulse")
             if not p_path:
                 return None, None, LEGACY_NO_VALIDATION_HISTORIES, False
-            locs, times, cols = parse_probe_history(p_path)
+            locs, times, cols = self._parse_probe_cached(p_path)
             radii = radii_from_locations(locs, dim="1d")
             mapping = map_radius(radii, point.range_m)
             if not mapping.ok:
                 return None, None, mapping.reason or LEGACY_NO_VALIDATION_HISTORIES, False
             impulse_cols = None
             if i_path:
-                _li, _itimes, impulse_cols = parse_probe_history(i_path)
+                _li, _itimes, impulse_cols = self._parse_probe_cached(i_path)
             peak_raw, impl_raw, t_use, p_use = mapped_peak_impulse(
                 mapping,
                 times,
@@ -1010,18 +1063,18 @@ class TabValidation(QWidget):
                     ]
             return self._assess_probe_series(t_use, p_use, impulse_series, case)
         fo = VALIDATION_FO.get(point.dim, "")
-        p_path = latest_probe_field_file(case, fo, "p") if fo else ""
-        i_path = latest_probe_field_file(case, fo, "impulse") if fo else ""
+        p_path = self._latest_probe_path(case, fo, "p") if fo else ""
+        i_path = self._latest_probe_path(case, fo, "impulse") if fo else ""
         if not p_path:
             return None, None, LEGACY_NO_VALIDATION_HISTORIES, False
-        locs, times, cols = parse_probe_history(p_path)
+        locs, times, cols = self._parse_probe_cached(p_path)
         idx, match_reason = match_probe_to_point(locs, (point.x, point.y, point.z))
         if idx is None:
             return None, None, match_reason, False
         _t, pvals = series_for_index(times, cols, idx)
         impulse_vals = None
         if i_path:
-            _li, itimes, icols = parse_probe_history(i_path)
+            _li, itimes, icols = self._parse_probe_cached(i_path)
             _it, ivals = series_for_index(itimes, icols, idx)
             impulse_vals = ivals or None
         return self._assess_probe_series(_t, pvals, impulse_vals, case)
@@ -1055,6 +1108,7 @@ class TabValidation(QWidget):
         self._auto_key = self._snapshot_cache_key()
         self._auto_defaults_key = None
         self._display_sync_key = None
+        self._clear_validation_caches()
         self._refresh_banner()
         self._prefill_from_snapshot()
         self.refresh_catalog()
@@ -1080,15 +1134,57 @@ class TabValidation(QWidget):
         self._auto_key = self._snapshot_cache_key()
         self._auto_defaults_key = None
         self._display_sync_key = None
+        self._clear_validation_caches()
         self._refresh_banner()
         self._reload_hob_times()
         self._schedule_redraw()
 
+    def _clear_validation_caches(self) -> None:
+        self._probe_cache = {}
+        self._probe_file_cache = {}
+        self._probe_path_cache = {}
+        self._case_end_cache = {}
+        self._remap_cache = {}
+        self._numerical_cache = {}
+
+    def _latest_probe_path(self, case: str, fo: str, field: str) -> str:
+        key = (case, fo, field)
+        hit = self._probe_path_cache.get(key)
+        if hit is not None:
+            return hit
+        path = latest_probe_field_file(case, fo, field) if case and fo else ""
+        self._probe_path_cache[key] = path
+        return path
+
+    def _parse_probe_cached(self, path: str):
+        if not path:
+            return [], [], []
+        try:
+            stamp = os.path.getmtime(path) if os.path.isfile(path) else None
+        except OSError:
+            stamp = None
+        key = (path, stamp)
+        hit = self._probe_file_cache.get(key)
+        if hit is not None:
+            return hit
+        parsed = parse_probe_history(path)
+        self._probe_file_cache[key] = parsed
+        return parsed
+
     def _schedule_redraw(self) -> None:
         self._redraw_timer.start()
 
-    def _set_status(self, text: str) -> None:
+    def _set_status(self, text: str, level: str = "info") -> None:
         self.lbl_status.setText(text)
+        if not text:
+            self.lbl_status.setStyleSheet(INFO_STATUS_STYLE)
+            return
+        if level == "error":
+            self.lbl_status.setStyleSheet(ERROR_STATUS_STYLE)
+        elif level == "warning":
+            self.lbl_status.setStyleSheet(WARNING_STYLE)
+        else:
+            self.lbl_status.setStyleSheet(INFO_STATUS_STYLE)
 
     def _redraw(self) -> None:
         mode = self._mode()
@@ -1109,11 +1205,11 @@ class TabValidation(QWidget):
         if not case:
             return None, None, "", False
         fo = PROBE_FO[row.dim]
-        p_path = latest_probe_field_file(case, fo, "p")
-        i_path = latest_probe_field_file(case, fo, "impulse")
+        p_path = self._latest_probe_path(case, fo, "p")
+        i_path = self._latest_probe_path(case, fo, "impulse")
         if not p_path:
             return None, None, "", False
-        locs, times, cols = parse_probe_history(p_path)
+        locs, times, cols = self._parse_probe_cached(p_path)
         idx = row.index
         if row.dim in ("2d", "3d"):
             matched, reason = match_probe_to_point(locs, (row.x, row.y, row.z))
@@ -1123,7 +1219,7 @@ class TabValidation(QWidget):
         _t, pvals = series_for_index(times, cols, idx)
         impulse_vals = None
         if i_path:
-            _li, itimes, icols = parse_probe_history(i_path)
+            _li, itimes, icols = self._parse_probe_cached(i_path)
             _it, ivals = series_for_index(itimes, icols, idx)
             impulse_vals = ivals or None
         return self._assess_probe_series(_t, pvals, impulse_vals, case)
@@ -1499,12 +1595,12 @@ class TabValidation(QWidget):
         fo = PROBE_FO[row.dim] if row is not None else VALIDATION_FO.get(auto_point.dim if auto_point else "2d", "")
         if auto_point is not None and auto_point.dim == "1d":
             fo = EXISTING_1D_GRAPH_FO
-        p_path = latest_probe_field_file(case or "", fo, "p") if case else ""
-        i_path = latest_probe_field_file(case or "", fo, "impulse") if case else ""
+        p_path = self._latest_probe_path(case, fo, "p") if case else ""
+        i_path = self._latest_probe_path(case, fo, "impulse") if case else ""
         times, pvals, ivals = [], [], []
         series_index = row.index if row is not None else (auto_point.index if auto_point else 0)
         if auto_point is not None and auto_point.dim == "1d" and p_path:
-            locs, times0, cols = parse_probe_history(p_path)
+            locs, times0, cols = self._parse_probe_cached(p_path)
             radii = radii_from_locations(locs, dim="1d")
             mapping = map_radius(radii, auto_point.range_m)
             if mapping.ok:
@@ -1518,7 +1614,7 @@ class TabValidation(QWidget):
                 times = t_use
                 pvals = [p - self._snapshot.p_atm for p in p_abs]
                 if i_path:
-                    _l, it, ic = parse_probe_history(i_path)
+                    _l, it, ic = self._parse_probe_cached(i_path)
                     _peak, _impl, _tt, _ = mapped_peak_impulse(
                         mapping, it or times0, ic, ic, p_atm=self._snapshot.p_atm
                     )
@@ -1531,11 +1627,11 @@ class TabValidation(QWidget):
                         w = float(mapping.weight or 0.0)
                         ivals = [i_lo[i] + w * (i_hi[i] - i_lo[i]) for i in range(n)]
         elif p_path:
-            _l, times, cols = parse_probe_history(p_path)
+            _l, times, cols = self._parse_probe_cached(p_path)
             times, pvals = series_for_index(times, cols, series_index)
             pvals = [p - self._snapshot.p_atm for p in pvals]
             if i_path:
-                _l, it, ic = parse_probe_history(i_path)
+                _l, it, ic = self._parse_probe_cached(i_path)
                 _it, ivals = series_for_index(it, ic, series_index)
         if times and pvals:
             ax.plot([s_to_ms(t) for t in times], [pa_to_kpa(p) for p in pvals], "-", label="BF Pressure")
@@ -1888,6 +1984,16 @@ class TabValidation(QWidget):
         self.spatial_canvas.draw_idle()
         self.plot_canvas.draw_idle()
 
+    def _remap_field_mtime(self, case_dir: Optional[str], time_label: Optional[str], field: str) -> Optional[float]:
+        if not case_dir or not time_label:
+            return None
+        stored = remap_engine.resolve_stored_field_name(case_dir, time_label, field)
+        path = os.path.join(case_dir, time_label, stored)
+        try:
+            return os.path.getmtime(path) if os.path.isfile(path) else None
+        except OSError:
+            return None
+
     def _remap_field_key(self) -> str:
         return {
             "Pressure": "p",
@@ -1923,103 +2029,128 @@ class TabValidation(QWidget):
         field = self._remap_field_key()
         src_dim = "1d" if self.combo_remap_mode.currentIndex() == 0 else "2d"
         tgt_dim = "2d" if self.combo_remap_mode.currentIndex() == 0 else "3d"
-        r_s, v_s = remap_engine.load_line_from_case(src, st or "0", field, dim=src_dim)
-        r_t, v_t = remap_engine.load_line_from_case(target, tt or "0", field, dim=tgt_dim)
         receive = self._remap_receive_2d() if self.combo_remap_mode.currentIndex() == 0 else self._remap_receive_3d()
-        r_max = float(
-            receive
-            or self._snapshot.mapped_radius
-            or (r_s.max() if r_s.size else 0.0)
-            or 0.0
-        )
-        if r_max <= 0 and r_s.size:
-            r_max = float(r_s.max())
-        st_f = None
-        tt_f = None
-        try:
-            st_f = float(st) if st is not None else None
-        except (TypeError, ValueError):
+        hob = float(self._snapshot.hob_m) if is_finite_number(self._snapshot.hob_m) else 0.0
+        centre = (0.0, hob, 0.0) if src_dim == "1d" else charge_center_for_dim(self._snapshot, tgt_dim)
+        dx = self._snapshot.domain_cell_2d if tgt_dim == "2d" else None
+        ray = float(dx) if is_finite_number(dx) and float(dx) > 0.0 else None
+        src_stamp = self._remap_field_mtime(src, st, field)
+        tgt_stamp = self._remap_field_mtime(target, tt, field)
+        cache_key = (src, target, st, tt, field, src_dim, tgt_dim, centre, ray, receive, src_stamp, tgt_stamp)
+        cached = self._remap_cache.get(cache_key)
+        if cached is not None:
+            cmp, r_max, status_text, status_level = cached
+        else:
+            r_s, v_s, src_err = remap_engine.load_physical_radial_profile(
+                src, st or "0", field, dim=src_dim, charge_centre=centre, ray_half_width=None
+            )
+            r_t, v_t, tgt_err = remap_engine.load_physical_radial_profile(
+                target, tt or "0", field, dim=tgt_dim, charge_centre=centre, ray_half_width=ray
+            )
+            r_max = float(receive or self._snapshot.mapped_radius or 0.0 or (float(r_s.max()) if r_s.size else 0.0))
+            if r_max <= 0 and r_s.size:
+                r_max = float(r_s.max())
             st_f = None
-        try:
-            tt_f = float(tt) if tt is not None else None
-        except (TypeError, ValueError):
             tt_f = None
-        offset = None
-        plan = read_sampling_plan(target) if target else None
-        if plan and plan.remap_timing:
-            raw = plan.remap_timing.get("physical_time_offset")
-            if is_finite_number(raw):
-                offset = float(raw)
-        if offset is None and self.combo_remap_mode.currentIndex() == 0:
-            recorded = remap_engine.recorded_1d2d_source_time(target or "")
-            if recorded:
+            try:
+                st_f = float(st) if st is not None else None
+            except (TypeError, ValueError):
+                st_f = None
+            try:
+                tt_f = float(tt) if tt is not None else None
+            except (TypeError, ValueError):
+                tt_f = None
+            offset = None
+            plan = read_sampling_plan(target) if target else None
+            if plan and plan.remap_timing:
+                raw = plan.remap_timing.get("physical_time_offset")
+                if is_finite_number(raw):
+                    offset = float(raw)
+            if offset is None and self.combo_remap_mode.currentIndex() == 0:
+                recorded = remap_engine.recorded_1d2d_source_time(target or "")
+                if recorded:
+                    offset = remap_engine.build_remap_timing(
+                        source_time_label=recorded, target_time_label=tt
+                    ).physical_time_offset
+            if offset is None:
                 offset = remap_engine.build_remap_timing(
-                    source_time_label=recorded, target_time_label=tt
+                    source_time_label=st, target_time_label=tt
                 ).physical_time_offset
-        if offset is None:
-            offset = remap_engine.build_remap_timing(
-                source_time_label=st, target_time_label=tt
-            ).physical_time_offset
-        cmp = remap_engine.compare_profiles(
-            field=field,
-            source_r=r_s,
-            source_v=v_s,
-            target_r=r_t,
-            target_v=v_t,
-            r_max=r_max,
-            source_time=st_f,
-            target_time=tt_f,
-            physical_time_offset=offset,
-        )
+            corr = (
+                "1D spherical profile vs 2D charge-height ray; "
+                "source interpolated onto target physical R from the charge centre."
+                if src_dim == "1d"
+                else "Source and target paired at the same physical R from the charge centre."
+            )
+            cmp = remap_engine.compare_profiles(
+                field=field,
+                source_r=r_s,
+                source_v=v_s,
+                target_r=r_t,
+                target_v=v_t,
+                r_max=r_max,
+                source_time=st_f,
+                target_time=tt_f,
+                physical_time_offset=offset,
+                correspondence=corr,
+            )
+            if src_err:
+                status_text, status_level = src_err, "warning"
+            elif tgt_err:
+                status_text, status_level = tgt_err, "warning"
+            elif cmp.message:
+                status_text, status_level = cmp.message, "warning"
+            else:
+                status_text, status_level = "", "info"
+            self._remap_cache[cache_key] = (cmp, r_max, status_text, status_level)
+        if status_text:
+            self._set_status(status_text, status_level)
         dt_txt = fmt(cmp.delta_t, suffix="s")
         warn = "" if cmp.synchronized else "  (NOT SYNCHRONIZED)"
+        unit = cmp.field_unit
+        unit_txt = f" {unit}" if unit else ""
         self.lbl_remap_times.setText(
             f"Source physical time: {fmt(cmp.source_physical_time, suffix='s')}\n"
             f"Target physical time: {fmt(cmp.target_physical_time, suffix='s')}\n"
             f"Physical time offset: {fmt(cmp.physical_time_offset, suffix='s')}\n"
             f"OpenFOAM source/target: {fmt(cmp.source_time, suffix='s')} / {fmt(cmp.target_time, suffix='s')}\n"
-            f"Delta t: {dt_txt}{warn}"
+            f"Delta t: {dt_txt}{warn}\n"
+            f"Physical remap radius: {fmt(r_max, suffix='m')}"
         )
-        if not cmp.synchronized:
-            self._set_status(cmp.message)
         ax.plot(cmp.r, cmp.source, label="Source Remap")
         ax.plot(cmp.r, cmp.target, label="Target After Initialize")
         if self.combo_remap_diff.currentIndex() == 0:
-            ax.plot(cmp.r, cmp.abs_diff, "--", label="Absolute Difference")
+            ax.plot(cmp.r, cmp.abs_diff, "--", label="|Target − Source|")
         else:
             rel = [v if v is not None else math.nan for v in cmp.rel_diff]
-            ax.plot(cmp.r, rel, "--", label="Relative Difference")
-        ax.set_xlabel("Radial Position r [m]")
-        ax.set_ylabel(field)
+            ax.plot(cmp.r, rel, "--", label="(Target − Source) / Source")
+        if r_max > 0:
+            ax.axvline(r_max, color="#888888", linestyle=":", label="R_remap")
+        ax.set_xlabel("Physical R from charge centre [m]")
+        if self.combo_remap_diff.currentIndex() == 0:
+            ax.set_ylabel(f"{field}{unit_txt}")
+        else:
+            ax.set_ylabel("Relative difference")
         ax.legend(loc="best")
         self.plot_canvas.draw_idle()
         self._init_table(["Metric", "Value"])
-        self._append_table_row(["Interval", f"{cmp.interval[0]:.4g} … {cmp.interval[1]:.4g} m"])
-        self._append_table_row(["RMS error", fmt(cmp.rms)])
-        self._append_table_row(["Mean absolute error", fmt(cmp.mae)])
-        self._append_table_row(["Maximum absolute error", fmt(cmp.max_abs)])
+        self._append_table_row(["Physical remap radius", fmt(r_max, suffix="m")])
+        self._append_table_row(["Comparison interval", f"{cmp.interval[0]:.4g} … {cmp.interval[1]:.4g} m"])
+        self._append_table_row(["Paired samples", str(cmp.n_pairs)])
+        self._append_table_row(["Correspondence", cmp.correspondence or "N/A"])
+        self._append_table_row(["RMS |Target − Source|", fmt(cmp.rms, suffix=unit)])
+        self._append_table_row(["Mean |Target − Source|", fmt(cmp.mae, suffix=unit)])
+        self._append_table_row(["Maximum |Target − Source|", fmt(cmp.max_abs, suffix=unit)])
         self._append_table_row(["Maximum meaningful relative error", fmt(cmp.max_rel)])
         self._append_table_row(["Source shock-front position", fmt(cmp.shock_source, suffix="m")])
         self._append_table_row(["Target shock-front position", fmt(cmp.shock_target, suffix="m")])
         self._append_table_row(
             ["Shock-front difference", fmt(None if cmp.shock_source is None or cmp.shock_target is None else cmp.shock_target - cmp.shock_source, suffix="m")]
         )
-        self._append_table_row(["Source peak", fmt(cmp.peak_source)])
-        self._append_table_row(["Target peak", fmt(cmp.peak_target)])
-        if r_s.size and r_t.size:
-            cons = remap_engine.conservation_1d_2d(
-                r_1d=r_s,
-                rho_1d=v_s if field == "rho" else remap_engine.load_line_from_case(src, st or "0", "rho")[1],
-                alpha_1d=None,
-                r_2d=r_t,
-                z_2d=np.zeros_like(r_t),
-                rho_2d=v_t if field == "rho" else remap_engine.load_line_from_case(target, tt or "0", "rho")[1],
-                alpha_2d=None,
-                r_max=r_max,
-            )
-            for item in cons:
-                self._append_table_row([item.quantity + " source", fmt(item.source)])
-                self._append_table_row([item.quantity + " target", fmt(item.target)])
+        self._append_table_row(["Source peak on interval", fmt(cmp.peak_source, suffix=unit)])
+        self._append_table_row(["Target peak on interval", fmt(cmp.peak_target, suffix=unit)])
+        self._append_table_row(["Source peak R", fmt(cmp.peak_r_source, suffix="m")])
+        self._append_table_row(["Target peak R", fmt(cmp.peak_r_target, suffix="m")])
 
     def _draw_numerical(self) -> None:
         ax = self.plot_canvas.axes
@@ -2038,14 +2169,36 @@ class TabValidation(QWidget):
             elif self._snapshot.live_mode:
                 dim = {"1D": "1d", "2D": "2d", "3D": "3d"}.get(self._snapshot.live_mode, dim)
         keep = self._snapshot.keep_openfoam_2d if dim == "2d" else self._snapshot.keep_openfoam_3d
-        report = numerical_engine.build_report(
-            case or "",
-            dim=dim,
-            options=self._snapshot.output_options,
-            keep_openfoam_time_folders=keep,
-        )
-        if report.notes:
-            self._set_status("; ".join(report.notes))
+        log_path = os.path.join(case, "log.blastFoam") if case else ""
+        try:
+            log_mtime = os.path.getmtime(log_path) if log_path and os.path.isfile(log_path) else None
+        except OSError:
+            log_mtime = None
+        num_key = (case, dim, keep, log_mtime, id(self._snapshot.output_options))
+        if self._numerical_cache.get("key") == num_key:
+            report = self._numerical_cache["report"]
+        else:
+            report = numerical_engine.build_report(
+                case or "",
+                dim=dim,
+                options=self._snapshot.output_options,
+                keep_openfoam_time_folders=keep,
+            )
+            self._numerical_cache = {"key": num_key, "report": report}
+        if report.foam_fatal or report.fpe:
+            self._set_status(
+                "; ".join([n for n in report.notes if n] + [
+                    "FOAM FATAL" if report.foam_fatal else "",
+                    "Floating-point exception" if report.fpe else "",
+                ]).strip("; "),
+                "error",
+            )
+        elif report.notes:
+            note = "; ".join(report.notes)
+            level = "info" if "constant" in note.lower() and "amr" in note.lower() else "warning"
+            if "cell count is constant" in note.lower():
+                level = "info"
+            self._set_status(note, level)
         choice = self.combo_num_plot.currentText()
         if "Courant" in choice:
             if report.courant.time and report.courant.values:

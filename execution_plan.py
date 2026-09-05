@@ -120,6 +120,7 @@ def build_execution_plan(
             "No resumable saved time exists. Initialize and run the case before Resume/Exact 1."
         )
 
+    tee = "tee -a log.blastFoam" if resume else "tee log.blastFoam"
     if cores == 1:
         start_mode = "latestTime" if resume else "startTime"
         prep = ""
@@ -130,7 +131,7 @@ def build_execution_plan(
                 prep = "reconstructPar -latestTime > log.reconstructResume 2>&1 && "
         cmd = (
             f"set -o pipefail; foamDictionary system/controlDict -entry startFrom -set {start_mode} "
-            f"> log.prepareSolver 2>&1 && {prep}blastFoam 2>&1 | tee log.blastFoam"
+            f"> log.prepareSolver 2>&1 && {prep}blastFoam 2>&1 | {tee}"
         )
         return ExecutionPlan(intent, cmd, latest)
 
@@ -147,6 +148,6 @@ def build_execution_plan(
     cmd = (
         f"set -o pipefail; foamDictionary system/controlDict -entry startFrom -set {start_mode} "
         f"> log.prepareSolver 2>&1 && {prep}"
-        f"mpirun -np {cores} blastFoam -parallel 2>&1 | tee log.blastFoam"
+        f"mpirun -np {cores} blastFoam -parallel 2>&1 | {tee}"
     )
     return ExecutionPlan(intent, cmd, latest)
