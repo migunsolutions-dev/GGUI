@@ -1,6 +1,7 @@
 """Validation & Verification workspace. Calculation engines live in validation/."""
 from __future__ import annotations
 
+from dataclasses import replace as dc_replace
 import math
 import os
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -46,12 +47,17 @@ from validation.auto_points import (
     SamplingPlan,
     ValidationPoint,
     cache_key,
+    live_fingerprint,
     marker_stride,
     plan_1d,
     plan_2d,
+    sampling_burst_1d,
+    sampling_burst_2d,
+    stamp_plan,
 )
 from validation import conwep as conwep_engine
 from validation import hob as hob_engine
+from validation import kb_overlay
 from validation import kingery_bulmash as kb
 from validation import numerical as numerical_engine
 from validation import rankine_hugoniot as rh
@@ -60,6 +66,15 @@ from validation import ufc_airblast as ufc_ab
 from validation import ufc_ground
 from validation import ufc_hob
 from validation import ufc_waveform
+from validation.history_quality import assess_history, comparable_peak_impulse
+from validation.kb_propagation import (
+    copied_1d2d_radius_m,
+    copied_2d3d_radius_m,
+    kb_propagation_eligible,
+    physical_standoff_m,
+    scaled_z_from_r,
+    series_label,
+)
 from validation.current_run import (
     MISSING_CURRENT_RUN,
     SOURCE_CURRENT,
@@ -79,8 +94,10 @@ from validation.probes import (
     PROBE_FO,
     VALIDATION_FO,
     latest_probe_field_file,
+    match_probe_to_point,
     parse_probe_history,
     peak_and_impulse,
+    radial_distance,
     radii_from_locations,
     series_for_index,
     standoff_m,
@@ -89,6 +106,7 @@ from validation.sampling_io import (
     LEGACY_NO_VALIDATION_HISTORIES,
     PLANNED_NOT_RUN,
     THREE_D_HEMI_NA,
+    load_matching_plan,
     read_sampling_plan,
 )
 from validation.spatial import list_saved_times, load_pressure_rz
@@ -179,6 +197,7 @@ class TabValidation(QWidget):
         self._auto_plans: List[SamplingPlan] = []
         self._auto_defaults_key: Optional[tuple] = None
         self._display_sync_key: Optional[tuple] = None
+        self._sampling_notes: List[str] = []
         self._redraw_timer = QTimer(self)
         self._redraw_timer.setSingleShot(True)
         self._redraw_timer.setInterval(50)
@@ -764,6 +783,54 @@ class TabValidation(QWidget):
             w = 0.0
         return w if w >= 80.0 else DEFAULT_PLOT_WIDTH_PX
 
+    def _remap_receive_2d(self) -> Optional[float]:
+        snap = self._snapshot
+        return copied_1d2d_radius_m(
+            target_2d_case=case_dir_for_dim(snap, "2d"),
+            source_1d_case=snap.mapping_source_2d or case_dir_for_dim(snap, "1d"),
+            widget_mapped_radius=snap.mapped_radius,
+        )
+
+    def _remap_receive_3d(self) -> Optional[float]:
+        snap = self._snapshot
+        return copied_2d3d_radius_m(
+            prepare_path=snap.prepare_3d_transfer,
+            source_2d_case=case_dir_for_dim(snap, "2d") or snap.remap_3d_source,
+        )
+
+    def _live_fingerprint(self, dim: str) -> dict:
+        snap = self._snapshot
+        mass = snap.mass_kg if is_finite_number(snap.mass_kg) and float(snap.mass_kg) > 0.0 else float(self.spin_kb_mass.value())
+        if dim == "1d":
+            burst = sampling_burst_1d()
+            return live_fingerprint(
+                dim="1d",
+                case_path=case_dir_for_dim(snap, "1d"),
+                mass_kg=mass,
+                domain_radius_m=snap.domain_radius_1d,
+                hob_m=0.0,
+                charge_center=(0.0, 0.0, 0.0),
+                cell_size=snap.domain_cell_1d,
+                burst_mode=burst,
+                figure=ufc_ab.figure_id(burst),
+            )
+        burst = sampling_burst_2d(snap.hob_m)
+        hob = float(snap.hob_m) if is_finite_number(snap.hob_m) else 0.0
+        receive = self._remap_receive_2d()
+        return live_fingerprint(
+            dim="2d",
+            case_path=case_dir_for_dim(snap, "2d"),
+            mass_kg=mass,
+            domain_radius_m=snap.domain_radius_2d,
+            domain_height_m=snap.domain_height_2d,
+            hob_m=hob,
+            charge_center=(0.0, hob, 0.0),
+            cell_size=snap.domain_cell_2d,
+            burst_mode=burst,
+            figure=ufc_ab.figure_id(burst),
+            remap_receive_r_max=receive,
+        )
+
     def _collect_auto_plans(self) -> List[SamplingPlan]:
         if self._auto_plans:
             return list(self._auto_plans)
@@ -772,42 +839,64 @@ class TabValidation(QWidget):
         dpi = self._logical_dpi()
         width = DEFAULT_PLOT_WIDTH_PX
         plans: List[SamplingPlan] = []
+        notes: List[str] = []
         want = self._display_dims()
         if "1d" in want and is_finite_number(snap.domain_radius_1d) and float(snap.domain_radius_1d) > 0.0:
             case = case_dir_for_dim(snap, "1d")
-            loaded = read_sampling_plan(case) if case else None
+            loaded, mismatch = load_matching_plan(case or "", self._live_fingerprint("1d")) if case else (None, "")
             if loaded is not None and loaded.dim == "1d" and loaded.points:
                 plans.append(loaded)
             else:
+                if mismatch:
+                    notes.append(mismatch)
+                generated = plan_1d(
+                    mass_kg=mass,
+                    domain_radius_m=float(snap.domain_radius_1d),
+                    cell_size=snap.domain_cell_1d,
+                    usable_width_px=width,
+                    logical_dpi_x=dpi,
+                )
                 plans.append(
-                    plan_1d(
-                        mass_kg=mass,
-                        domain_radius_m=float(snap.domain_radius_1d),
+                    stamp_plan(
+                        generated,
+                        case_path=case,
                         cell_size=snap.domain_cell_1d,
-                        usable_width_px=width,
-                        logical_dpi_x=dpi,
+                        hob_m=0.0,
                     )
                 )
         if "2d" in want and is_finite_number(snap.domain_radius_2d) and float(snap.domain_radius_2d) > 0.0:
             case = case_dir_for_dim(snap, "2d")
-            loaded = read_sampling_plan(case) if case else None
-            if loaded is not None and loaded.dim == "2d" and loaded.points:
+            hob = float(snap.hob_m) if is_finite_number(snap.hob_m) else 0.0
+            height = float(snap.domain_height_2d) if is_finite_number(snap.domain_height_2d) else hob
+            receive = self._remap_receive_2d()
+            loaded, mismatch = load_matching_plan(case or "", self._live_fingerprint("2d")) if case else (None, "")
+            if loaded is not None and loaded.dim == "2d" and (loaded.points or loaded.notes):
                 plans.append(loaded)
             else:
-                hob = float(snap.hob_m) if is_finite_number(snap.hob_m) else 0.0
-                height = float(snap.domain_height_2d) if is_finite_number(snap.domain_height_2d) else hob
+                if mismatch:
+                    notes.append(mismatch)
+                generated = plan_2d(
+                    mass_kg=mass,
+                    domain_radius_m=float(snap.domain_radius_2d),
+                    domain_height_m=height,
+                    hob_m=hob,
+                    cell_size=snap.domain_cell_2d,
+                    usable_width_px=width,
+                    logical_dpi_x=dpi,
+                    remap_receive_r_max=receive,
+                )
                 plans.append(
-                    plan_2d(
-                        mass_kg=mass,
-                        domain_radius_m=float(snap.domain_radius_2d),
-                        domain_height_m=height,
-                        hob_m=hob,
+                    stamp_plan(
+                        generated,
+                        case_path=case,
                         cell_size=snap.domain_cell_2d,
-                        usable_width_px=width,
-                        logical_dpi_x=dpi,
+                        hob_m=hob,
+                        domain_height_m=height,
+                        remap_receive_r_max=receive,
                     )
                 )
-        self._auto_plans = [p for p in plans if p.points]
+        self._sampling_notes = notes
+        self._auto_plans = list(plans)
         return list(self._auto_plans)
 
     def _maybe_apply_auto_config_defaults(self, plans: Sequence[SamplingPlan]) -> None:
@@ -826,6 +915,9 @@ class TabValidation(QWidget):
         spherical = any(
             p.dim == "1d" or p.burst_master == ufc_ab.BURST_SPHERICAL for p in plans
         )
+        hemi = any(p.burst_master == ufc_ab.BURST_HEMISPHERICAL for p in plans)
+        if spherical and hemi:
+            return
         self.radio_kb_sph.blockSignals(True)
         self.radio_kb_hemi.blockSignals(True)
         self.combo_kb_source.blockSignals(True)
@@ -840,49 +932,99 @@ class TabValidation(QWidget):
             self.radio_kb_hemi.blockSignals(False)
             self.combo_kb_source.blockSignals(False)
 
-    def _bf_auto_peak_impulse(self, point: ValidationPoint) -> Tuple[Optional[float], Optional[float], str]:
+    def _case_end_state(self, case: Optional[str], last_time: Optional[float]) -> Tuple[Optional[float], Optional[bool]]:
+        if not case:
+            return None, None
+        end_time = None
+        reached = None
+        try:
+            from result_storage import control_dict_root_end_time, run_reached_configured_end
+
+            end_time = control_dict_root_end_time(case)
+            reached = run_reached_configured_end(case)
+        except Exception:
+            end_time = None
+            reached = None
+        if last_time is not None and end_time is not None:
+            from validation.history_quality import run_reached_end_time
+
+            reached = run_reached_end_time(last_time_s=last_time, end_time_s=end_time, reached_end=reached)
+        return end_time, reached
+
+    def _assess_probe_series(
+        self,
+        times: Sequence[float],
+        pvals: Sequence[float],
+        impulse_vals: Optional[Sequence[float]],
+        case: Optional[str],
+    ) -> Tuple[Optional[float], Optional[float], str, bool]:
+        last_t = times[-1] if times else None
+        end_time, reached = self._case_end_state(case, last_t)
+        validity = assess_history(
+            times,
+            pvals,
+            impulse_vals,
+            p_atm=self._snapshot.p_atm,
+            end_time_s=end_time,
+            reached_end=reached,
+        )
+        peak, impulse, reason = comparable_peak_impulse(validity)
+        return peak, impulse, reason or validity.reason, validity.comparable
+
+    def _bf_auto_peak_impulse(self, point: ValidationPoint) -> Tuple[Optional[float], Optional[float], str, bool]:
         case = case_dir_for_dim(self._snapshot, point.dim)
         if not case:
-            return None, None, PLANNED_NOT_RUN
+            return None, None, PLANNED_NOT_RUN, False
         if point.dim == "1d":
             fo = EXISTING_1D_GRAPH_FO
             p_path = latest_probe_field_file(case, fo, "p")
             i_path = latest_probe_field_file(case, fo, "impulse")
             if not p_path:
-                return None, None, LEGACY_NO_VALIDATION_HISTORIES
+                return None, None, LEGACY_NO_VALIDATION_HISTORIES, False
             locs, times, cols = parse_probe_history(p_path)
             radii = radii_from_locations(locs, dim="1d")
             mapping = map_radius(radii, point.range_m)
             if not mapping.ok:
-                return None, None, mapping.reason or LEGACY_NO_VALIDATION_HISTORIES
+                return None, None, mapping.reason or LEGACY_NO_VALIDATION_HISTORIES, False
             impulse_cols = None
             if i_path:
                 _li, _itimes, impulse_cols = parse_probe_history(i_path)
-            peak, impl, _t, _p = mapped_peak_impulse(
+            peak_raw, impl_raw, t_use, p_use = mapped_peak_impulse(
                 mapping,
                 times,
                 cols,
                 impulse_cols,
                 p_atm=self._snapshot.p_atm,
             )
-            return peak, impl, ""
+            impulse_series = None
+            if impulse_cols is not None and mapping.index_lo is not None:
+                _it0, i_lo = series_for_index(times, impulse_cols, mapping.index_lo)
+                if mapping.kind == KIND_EXACT:
+                    impulse_series = i_lo
+                elif mapping.index_hi is not None and mapping.weight is not None:
+                    _it1, i_hi = series_for_index(times, impulse_cols, int(mapping.index_hi))
+                    n = min(len(i_lo), len(i_hi), len(t_use))
+                    w = float(mapping.weight)
+                    impulse_series = [
+                        float(i_lo[i]) + w * (float(i_hi[i]) - float(i_lo[i])) for i in range(n)
+                    ]
+            return self._assess_probe_series(t_use, p_use, impulse_series, case)
         fo = VALIDATION_FO.get(point.dim, "")
         p_path = latest_probe_field_file(case, fo, "p") if fo else ""
         i_path = latest_probe_field_file(case, fo, "impulse") if fo else ""
         if not p_path:
-            return None, None, LEGACY_NO_VALIDATION_HISTORIES
-        _locs, times, cols = parse_probe_history(p_path)
-        _t, pvals = series_for_index(times, cols, point.index)
-        impulse = None
+            return None, None, LEGACY_NO_VALIDATION_HISTORIES, False
+        locs, times, cols = parse_probe_history(p_path)
+        idx, match_reason = match_probe_to_point(locs, (point.x, point.y, point.z))
+        if idx is None:
+            return None, None, match_reason, False
+        _t, pvals = series_for_index(times, cols, idx)
+        impulse_vals = None
         if i_path:
             _li, itimes, icols = parse_probe_history(i_path)
-            _it, ivals = series_for_index(itimes, icols, point.index)
-            if ivals:
-                impulse = ivals[-1]
-        peak, impl = peak_and_impulse(_t, pvals, None if impulse is None else [impulse], p_atm=self._snapshot.p_atm)
-        if impulse is not None:
-            impl = impulse
-        return peak, impl, ""
+            _it, ivals = series_for_index(itimes, icols, idx)
+            impulse_vals = ivals or None
+        return self._assess_probe_series(_t, pvals, impulse_vals, case)
 
     def _prefill_conwep_standoff(self) -> None:
         if self._conwep_key is None:
@@ -962,132 +1104,248 @@ class TabValidation(QWidget):
         else:
             self._draw_numerical()
 
-    def _bf_peak_impulse(self, row: GaugeRow) -> Tuple[Optional[float], Optional[float]]:
+    def _bf_peak_impulse(self, row: GaugeRow) -> Tuple[Optional[float], Optional[float], str, bool]:
         case = case_dir_for_dim(self._snapshot, row.dim)
         if not case:
-            return None, None
+            return None, None, "", False
         fo = PROBE_FO[row.dim]
         p_path = latest_probe_field_file(case, fo, "p")
         i_path = latest_probe_field_file(case, fo, "impulse")
         if not p_path:
-            return None, None
-        _locs, times, cols = parse_probe_history(p_path)
-        _t, pvals = series_for_index(times, cols, row.index)
-        impulse = None
+            return None, None, "", False
+        locs, times, cols = parse_probe_history(p_path)
+        idx = row.index
+        if row.dim in ("2d", "3d"):
+            matched, reason = match_probe_to_point(locs, (row.x, row.y, row.z))
+            if matched is None:
+                return None, None, reason, False
+            idx = matched
+        _t, pvals = series_for_index(times, cols, idx)
+        impulse_vals = None
         if i_path:
             _li, itimes, icols = parse_probe_history(i_path)
-            _it, ivals = series_for_index(itimes, icols, row.index)
-            if ivals:
-                impulse = ivals[-1]
-        peak, impl = peak_and_impulse(_t, pvals, None if impulse is None else [impulse], p_atm=self._snapshot.p_atm)
-        if impulse is not None:
-            impl = impulse
-        return peak, impl
+            _it, ivals = series_for_index(itimes, icols, idx)
+            impulse_vals = ivals or None
+        return self._assess_probe_series(_t, pvals, impulse_vals, case)
+
+    def _gui_reference_identity(self) -> Tuple[str, str, str]:
+        burst = self._kb_burst()
+        source = kb_overlay.SOURCE_UFC if self._kb_use_ufc() else kb_overlay.SOURCE_SWISDAK
+        figure = ufc_ab.figure_id(burst) if self._kb_use_ufc() else ""
+        return source, burst, figure
 
     def _draw_kb(self) -> None:
         ax = self.plot_canvas.axes
         ax.clear()
         if self._auto_sampling():
             self._maybe_apply_auto_config_defaults(self._collect_auto_plans())
-        mass = float(self.spin_kb_mass.value())
-        burst = self._kb_burst()
-        use_ufc = self._kb_use_ufc()
-        engine = ufc_ab if use_ufc else kb
-        ref_label = (
-            "UFC 3-340-02 Figure 2-7"
-            if use_ufc and burst == ufc_ab.BURST_SPHERICAL
-            else "UFC 3-340-02 Figure 2-15"
-            if use_ufc
-            else "Kingery-Bulmash / Swisdak 1994"
-        )
+        gui_source, gui_burst, gui_figure = self._gui_reference_identity()
         pressure_mode = self.combo_kb_qty.currentIndex() == 0
-        qty = engine.QUANTITY_PEAK_PRESSURE if pressure_mode else engine.QUANTITY_INCIDENT_IMPULSE
         vs_z = self.chk_kb_z.isChecked()
-        xr, yr = (engine.curve_vs_z if vs_z else engine.curve)(qty, mass_kg=mass, burst_type=burst)
-        if xr:
-            if pressure_mode:
-                ax.plot(xr, [pa_to_kpa(v) for v in yr], color="#444444", label=ref_label)
-            else:
-                ax.plot(xr, [pa_s_to_kpa_ms(v) for v in yr], color="#444444", label=ref_label)
-        elif not use_ufc and burst == kb.BURST_SPHERICAL:
-            self._set_status(kb.SPHERICAL_UNAVAILABLE)
-        col_p = "UFC Peak Pressure" if use_ufc else "KB Peak Pressure"
-        col_i = "UFC Positive Impulse" if use_ufc else "KB Positive Impulse"
-        headers = [
-            "Gauge",
-            "Dimension",
-            "Source",
-            "Range",
-            "BF Peak Pressure",
-            col_p,
-            "Error %",
-            "BF Positive Impulse",
-            col_i,
-            "Error %",
-        ]
-        self._init_table(headers)
-        samples = []
+        overlay_samples: List[kb_overlay.OverlaySample] = []
         hist_note = ""
         display = self._display_dims()
+        receive_2d = self._remap_receive_2d()
+        receive_3d = self._remap_receive_3d()
+        dx_2d = self._snapshot.domain_cell_2d
+        mass_ref = float(self.spin_kb_mass.value())
         if self._auto_sampling():
             for plan in self._collect_auto_plans():
                 if plan.dim not in display:
                     continue
+                if plan.notes and not plan.points and not hist_note:
+                    hist_note = plan.notes[-1]
                 for point in plan.points:
-                    bf_p, bf_i, reason = self._bf_auto_peak_impulse(point)
+                    rng = physical_standoff_m(
+                        plan.dim,
+                        (point.x, point.y, point.z),
+                        plan.charge_center,
+                    )
+                    if plan.dim == "2d" and not kb_propagation_eligible(rng, receive_2d, dx_2d):
+                        continue
+                    bf_p, bf_i, reason, comparable = self._bf_auto_peak_impulse(point)
                     has_bf = histories_available(self._snapshot, plan.dim)
-                    if bf_p is not None or bf_i is not None:
+                    probe_ok = "match" not in (reason or "").lower() and "missing" not in (reason or "").lower()
+                    if reason and ("match" in reason.lower() or "missing" in reason.lower()):
+                        probe_ok = False
+                    if comparable:
                         kind = "bf"
-                    elif has_bf:
-                        kind = "missing"
-                    elif case_dir_for_dim(self._snapshot, plan.dim):
-                        kind = "missing"
+                    elif reason and not probe_ok:
+                        kind = "invalid"
+                    elif has_bf or case_dir_for_dim(self._snapshot, plan.dim):
+                        kind = "invalid" if reason else "missing"
                     else:
                         kind = "planned"
                     if reason and not hist_note:
                         hist_note = reason
-                    samples.append((point.point_id, plan.dim, point.range_m, bf_p, bf_i, kind))
+                    sample = kb_overlay.sample_from_plan_point(
+                        plan,
+                        point,
+                        bf_peak=bf_p,
+                        bf_impulse=bf_i,
+                        comparable=comparable,
+                        validity_reason=reason,
+                        kind=kind,
+                        probe_ok=probe_ok,
+                    )
+                    overlay_samples.append(
+                        dc_replace(
+                            sample,
+                            range_m=rng,
+                            scaled_z=scaled_z_from_r(rng, mass_ref),
+                            mass_kg=mass_ref,
+                        )
+                    )
             if "3d" in display:
+                kept_3d = 0
+                skipped_remap = 0
                 for row in self._catalog():
                     if row.dim != "3d":
                         continue
-                    rng = standoff_m((row.x, row.y, row.z), charge_center_for_dim(self._snapshot, "3d"))
-                    bf_p, bf_i = self._bf_peak_impulse(row)
+                    rng = physical_standoff_m(
+                        "3d",
+                        (row.x, row.y, row.z),
+                        charge_center_for_dim(self._snapshot, "3d"),
+                    )
+                    if not kb_propagation_eligible(rng, receive_3d, None):
+                        skipped_remap += 1
+                        continue
+                    kept_3d += 1
+                    bf_p, bf_i, reason, comparable = self._bf_peak_impulse(row)
                     has_bf = histories_available(self._snapshot, "3d")
-                    kind = "bf" if (bf_p is not None or bf_i is not None) else ("planned" if not has_bf else "missing")
-                    samples.append((row.label or row.gauge_id, "3d", rng, bf_p, bf_i, kind))
+                    kind = "bf" if comparable else ("planned" if not has_bf else "invalid")
+                    overlay_samples.append(
+                        kb_overlay.OverlaySample(
+                            point_id=row.label or row.gauge_id,
+                            dim="3d",
+                            mass_kg=mass_ref,
+                            burst=gui_burst,
+                            figure=gui_figure,
+                            reference_source=gui_source,
+                            range_m=rng,
+                            scaled_z=scaled_z_from_r(rng, mass_ref),
+                            bf_peak=bf_p,
+                            bf_impulse=bf_i,
+                            comparable=comparable,
+                            validity_reason=reason,
+                            kind=kind,
+                            probe_ok=not reason or "match" not in reason.lower(),
+                        )
+                    )
+                if kept_3d == 0 and skipped_remap:
+                    hist_note = hist_note or (
+                        "Validation cannot be generated reliably: not enough physical domain "
+                        "outside the remap receiving region."
+                    )
         else:
             for key in self._added:
                 row = self._row_by_key(key)
                 if row is None or row.dim not in display:
                     continue
-                rng = standoff_m((row.x, row.y, row.z), charge_center_for_dim(self._snapshot, row.dim))
-                if row.dim == "1d":
-                    rng = abs(float(row.x))
-                bf_p, bf_i = self._bf_peak_impulse(row)
-                samples.append((row.label or row.gauge_id, row.dim, rng, bf_p, bf_i, "user"))
+                rng = physical_standoff_m(
+                    row.dim,
+                    (row.x, row.y, row.z),
+                    charge_center_for_dim(self._snapshot, row.dim),
+                )
+                if row.dim == "2d" and not kb_propagation_eligible(rng, receive_2d, dx_2d):
+                    continue
+                if row.dim == "3d" and not kb_propagation_eligible(rng, receive_3d, None):
+                    continue
+                bf_p, bf_i, reason, comparable = self._bf_peak_impulse(row)
+                overlay_samples.append(
+                    kb_overlay.OverlaySample(
+                        point_id=row.label or row.gauge_id,
+                        dim=row.dim,
+                        mass_kg=mass_ref,
+                        burst=gui_burst,
+                        figure=gui_figure,
+                        reference_source=gui_source,
+                        range_m=rng,
+                        scaled_z=scaled_z_from_r(rng, mass_ref),
+                        bf_peak=bf_p,
+                        bf_impulse=bf_i,
+                        comparable=comparable,
+                        validity_reason=reason,
+                        kind="user",
+                        probe_ok=not reason or "match" not in reason.lower(),
+                    )
+                )
+        groups = kb_overlay.group_samples(overlay_samples)
+        ref_colors = ("#444444", "#666666", "#888888", "#555555")
+        use_ufc_fallback = self._kb_use_ufc()
+        engine = ufc_ab if use_ufc_fallback else kb
+        qty = engine.QUANTITY_PEAK_PRESSURE if pressure_mode else engine.QUANTITY_INCIDENT_IMPULSE
+        xr = []
+        if groups:
+            for g_i, group in enumerate(groups):
+                g_engine = kb_overlay.engine_for(group.source)
+                g_qty = g_engine.QUANTITY_PEAK_PRESSURE if pressure_mode else g_engine.QUANTITY_INCIDENT_IMPULSE
+                xs, ys = kb_overlay.curve_for_group(group, quantity=g_qty, vs_z=vs_z)
+                if xs:
+                    xr = xs
+                    color = ref_colors[g_i % len(ref_colors)]
+                    if pressure_mode:
+                        ax.plot(xs, [pa_to_kpa(v) for v in ys], color=color, label=group.label)
+                    else:
+                        ax.plot(xs, [pa_s_to_kpa_ms(v) for v in ys], color=color, label=group.label)
+                elif not kb_overlay.is_ufc_source(group.source) and group.burst == kb.BURST_SPHERICAL:
+                    self._set_status(kb.SPHERICAL_UNAVAILABLE)
+        else:
+            mass = float(self.spin_kb_mass.value())
+            ref_label = kb_overlay.reference_label(gui_source, gui_burst, gui_figure)
+            xs, ys = (engine.curve_vs_z if vs_z else engine.curve)(qty, mass_kg=mass, burst_type=gui_burst)
+            if xs:
+                xr = xs
+                if pressure_mode:
+                    ax.plot(xs, [pa_to_kpa(v) for v in ys], color="#444444", label=ref_label)
+                else:
+                    ax.plot(xs, [pa_s_to_kpa_ms(v) for v in ys], color="#444444", label=ref_label)
+            elif not use_ufc_fallback and gui_burst == kb.BURST_SPHERICAL:
+                self._set_status(kb.SPHERICAL_UNAVAILABLE)
+        col_p = "UFC Peak Pressure" if (groups and all(kb_overlay.is_ufc_source(g.source) for g in groups)) or (not groups and use_ufc_fallback) else "KB Peak Pressure"
+        col_i = "UFC Positive Impulse" if col_p.startswith("UFC") else "KB Positive Impulse"
+        self._init_table(
+            [
+                "Gauge",
+                "Dimension",
+                "Source",
+                "Range",
+                "BF Peak Pressure",
+                col_p,
+                "Error %",
+                "BF Positive Impulse",
+                col_i,
+                "Error %",
+            ]
+        )
         series = {}
         hemi_3d_note = False
-        for name, dim, rng, bf_p, bf_i, kind in samples:
-            applicable = self._reference_applicable(dim, burst)
-            if dim == "3d" and not applicable:
+        evals = [kb_overlay.evaluate_sample(sample) for sample in overlay_samples]
+        samples_for_info = []
+        for ev in evals:
+            sample = ev.sample
+            if sample.dim == "3d" and not ev.applicable:
                 hemi_3d_note = True
-            kb_p = engine.evaluate(engine.QUANTITY_PEAK_PRESSURE, range_m=rng, mass_kg=mass, burst_type=burst)
-            kb_i = engine.evaluate(engine.QUANTITY_INCIDENT_IMPULSE, range_m=rng, mass_kg=mass, burst_type=burst)
-            ref_ok_p = bool(applicable and kb_p.ok)
-            ref_ok_i = bool(applicable and kb_i.ok)
-            xval = (rng / (mass ** (1.0 / 3.0))) if vs_z and mass > 0 else rng
-            y_bf = pa_to_kpa(bf_p) if pressure_mode and bf_p is not None else (
-                pa_s_to_kpa_ms(bf_i) if (not pressure_mode and bf_i is not None) else None
+            rng = sample.range_m
+            mass_s = sample.mass_kg
+            xval = sample.scaled_z if vs_z else rng
+            if vs_z and sample.scaled_z is None and is_finite_number(mass_s) and mass_s > 0:
+                xval = rng / (mass_s ** (1.0 / 3.0))
+            show_bf_p = sample.bf_peak if sample.comparable else None
+            show_bf_i = sample.bf_impulse if sample.comparable else None
+            y_bf = pa_to_kpa(show_bf_p) if pressure_mode and show_bf_p is not None else (
+                pa_s_to_kpa_ms(show_bf_i) if (not pressure_mode and show_bf_i is not None) else None
             )
             y_ref = None
-            if pressure_mode and ref_ok_p:
-                y_ref = pa_to_kpa(kb_p.value_si)
-            elif (not pressure_mode) and ref_ok_i:
-                y_ref = pa_s_to_kpa_ms(kb_i.value_si)
-            source_label = {"bf": "BF", "planned": "Planned", "missing": "N/A", "user": "User"}.get(kind, kind)
+            if pressure_mode and ev.ref_peak is not None:
+                y_ref = pa_to_kpa(ev.ref_peak)
+            elif (not pressure_mode) and ev.ref_impulse is not None:
+                y_ref = pa_s_to_kpa_ms(ev.ref_impulse)
+            kind = sample.kind
+            source_label = {"bf": "BF", "planned": "Planned", "missing": "N/A", "user": "User", "invalid": "N/A"}.get(kind, kind)
+            samples_for_info.append((sample.point_id, sample.dim, rng, show_bf_p, show_bf_i, kind))
             if kind == "bf" and is_finite_number(xval) and y_bf is not None:
-                key = self._series_key(dim, name, samples)
+                key = self._series_key(sample.dim, sample.point_id, samples_for_info)
                 series.setdefault(key, ([], []))
                 series[key][0].append(xval)
                 series[key][1].append(y_bf)
@@ -1101,16 +1359,16 @@ class TabValidation(QWidget):
                 series["User Gauges"][1].append(y_bf)
             self._append_table_row(
                 [
-                    name,
-                    dim.upper(),
+                    sample.point_id,
+                    sample.dim.upper(),
                     source_label,
                     fmt(rng, suffix="m"),
-                    fmt(None if bf_p is None else pa_to_kpa(bf_p), suffix="kPa"),
-                    fmt(None if not ref_ok_p else pa_to_kpa(kb_p.value_si), suffix="kPa"),
-                    fmt(relative_error_percent(bf_p, kb_p.value_si if ref_ok_p else None)),
-                    fmt(None if bf_i is None else pa_s_to_kpa_ms(bf_i), suffix="kPa·ms"),
-                    fmt(None if not ref_ok_i else pa_s_to_kpa_ms(kb_i.value_si), suffix="kPa·ms"),
-                    fmt(relative_error_percent(bf_i, kb_i.value_si if ref_ok_i else None)),
+                    fmt(None if show_bf_p is None else pa_to_kpa(show_bf_p), suffix="kPa"),
+                    fmt(None if ev.ref_peak is None else pa_to_kpa(ev.ref_peak), suffix="kPa"),
+                    fmt(ev.error_peak_pct),
+                    fmt(None if show_bf_i is None else pa_s_to_kpa_ms(show_bf_i), suffix="kPa·ms"),
+                    fmt(None if ev.ref_impulse is None else pa_s_to_kpa_ms(ev.ref_impulse), suffix="kPa·ms"),
+                    fmt(ev.error_impulse_pct),
                 ]
             )
         colors = {
@@ -1138,22 +1396,23 @@ class TabValidation(QWidget):
         if ax.get_legend_handles_labels()[0]:
             ax.legend(loc="best")
         self.plot_canvas.draw_idle()
-        self._update_kb_info(ref_label, samples)
+        ref_label = ", ".join(dict.fromkeys(g.label for g in groups)) if groups else kb_overlay.reference_label(gui_source, gui_burst, gui_figure)
+        self._update_kb_info(ref_label, samples_for_info)
+        mismatch_note = next((n for n in self._sampling_notes if n), "")
         if hemi_3d_note and not self.lbl_status.text():
             self._set_status(THREE_D_HEMI_NA)
+        elif mismatch_note and not self.lbl_status.text():
+            self._set_status(mismatch_note)
         elif hist_note and self._auto_sampling() and not self.lbl_status.text():
             self._set_status(hist_note)
-        elif not samples and not xr and not self.lbl_status.text():
+        elif kb_overlay.mixed_references(groups) and not self.lbl_status.text():
+            self._set_status("Multiple references shown; each series uses its own mass, burst, and figure.")
+        elif not overlay_samples and not xr and not self.lbl_status.text():
             if not primary_case_dir(self._snapshot):
                 self._set_status(MISSING_CURRENT_RUN)
 
     def _series_key(self, dim: str, name: str, samples: list) -> str:
-        if dim == "3d":
-            n3 = sum(1 for item in samples if item[1] == "3d")
-            if n3 <= 12:
-                return f"3D — {name}"
-            return "BF 3D"
-        return f"BF {dim.upper()}"
+        return series_label(dim)
 
     def _reference_applicable(self, dim: str, burst: str) -> bool:
         if dim != "3d":
@@ -1193,6 +1452,11 @@ class TabValidation(QWidget):
                 f"Automatic points: {npts}"
                 + (f"\nBF results: {n_bf}" if n_bf else "")
                 + (f"\n{PLANNED_NOT_RUN}" if n_plan and not n_bf else "")
+                + "".join(
+                    f"\n{p.dim.upper()}: W={p.mass_kg:.4g} kg, {p.burst_master}, Fig {p.figure}"
+                    for p in plans
+                    if p.points or p.notes
+                )
             )
         else:
             self.lbl_kb_info.setText(
@@ -1657,9 +1921,17 @@ class TabValidation(QWidget):
             self.plot_canvas.draw_idle()
             return
         field = self._remap_field_key()
-        r_s, v_s = remap_engine.load_line_from_case(src, st or "0", field)
-        r_t, v_t = remap_engine.load_line_from_case(target, tt or "0", field)
-        r_max = float(self._snapshot.mapped_radius or (r_s.max() if r_s.size else 0.0) or 0.0)
+        src_dim = "1d" if self.combo_remap_mode.currentIndex() == 0 else "2d"
+        tgt_dim = "2d" if self.combo_remap_mode.currentIndex() == 0 else "3d"
+        r_s, v_s = remap_engine.load_line_from_case(src, st or "0", field, dim=src_dim)
+        r_t, v_t = remap_engine.load_line_from_case(target, tt or "0", field, dim=tgt_dim)
+        receive = self._remap_receive_2d() if self.combo_remap_mode.currentIndex() == 0 else self._remap_receive_3d()
+        r_max = float(
+            receive
+            or self._snapshot.mapped_radius
+            or (r_s.max() if r_s.size else 0.0)
+            or 0.0
+        )
         if r_max <= 0 and r_s.size:
             r_max = float(r_s.max())
         st_f = None
@@ -1672,6 +1944,22 @@ class TabValidation(QWidget):
             tt_f = float(tt) if tt is not None else None
         except (TypeError, ValueError):
             tt_f = None
+        offset = None
+        plan = read_sampling_plan(target) if target else None
+        if plan and plan.remap_timing:
+            raw = plan.remap_timing.get("physical_time_offset")
+            if is_finite_number(raw):
+                offset = float(raw)
+        if offset is None and self.combo_remap_mode.currentIndex() == 0:
+            recorded = remap_engine.recorded_1d2d_source_time(target or "")
+            if recorded:
+                offset = remap_engine.build_remap_timing(
+                    source_time_label=recorded, target_time_label=tt
+                ).physical_time_offset
+        if offset is None:
+            offset = remap_engine.build_remap_timing(
+                source_time_label=st, target_time_label=tt
+            ).physical_time_offset
         cmp = remap_engine.compare_profiles(
             field=field,
             source_r=r_s,
@@ -1681,12 +1969,15 @@ class TabValidation(QWidget):
             r_max=r_max,
             source_time=st_f,
             target_time=tt_f,
+            physical_time_offset=offset,
         )
         dt_txt = fmt(cmp.delta_t, suffix="s")
         warn = "" if cmp.synchronized else "  (NOT SYNCHRONIZED)"
         self.lbl_remap_times.setText(
-            f"Source Time: {fmt(cmp.source_time, suffix='s')}\n"
-            f"Target Initialization Time: {fmt(cmp.target_time, suffix='s')}\n"
+            f"Source physical time: {fmt(cmp.source_physical_time, suffix='s')}\n"
+            f"Target physical time: {fmt(cmp.target_physical_time, suffix='s')}\n"
+            f"Physical time offset: {fmt(cmp.physical_time_offset, suffix='s')}\n"
+            f"OpenFOAM source/target: {fmt(cmp.source_time, suffix='s')} / {fmt(cmp.target_time, suffix='s')}\n"
             f"Delta t: {dt_txt}{warn}"
         )
         if not cmp.synchronized:

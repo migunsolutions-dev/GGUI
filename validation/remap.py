@@ -75,6 +75,60 @@ class ConservationCompare:
     message: str = ""
 
 
+def _read_json_dict(path: str) -> Dict:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.loads(handle.read())
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _is_specific_mapping_time(mapping_time: Optional[str]) -> bool:
+    text = str(mapping_time or "").strip()
+    if not text or text.lower() == "latest":
+        return False
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
+
+
+def recorded_1d2d_source_time(target_case: str) -> Optional[str]:
+    """Handoff / snapshot time actually used to initialize the target."""
+    if not target_case:
+        return None
+    case2 = _read_json_dict(os.path.join(target_case, "case_2d.json"))
+    timing = case2.get("remap_timing") if isinstance(case2.get("remap_timing"), dict) else {}
+    label = str(timing.get("source_time_label") or "").strip()
+    if label and label.lower() != "latest":
+        return label
+    phys = timing.get("source_physical_time")
+    if is_finite_number(phys):
+        return f"{float(phys):.12g}"
+    region = case2.get("remap_region") if isinstance(case2.get("remap_region"), dict) else {}
+    phys = region.get("source_physical_time")
+    if is_finite_number(phys):
+        return f"{float(phys):.12g}"
+    try:
+        from remap_handoff_1d import read_handoff_metadata
+
+        handoff = read_handoff_metadata(target_case) or {}
+    except Exception:
+        handoff = {}
+    phys = handoff.get("source_physical_time")
+    if phys is None:
+        handoff_geom = handoff.get("actual_remap_geometry")
+        if isinstance(handoff_geom, dict):
+            phys = handoff_geom.get("source_physical_time")
+    if phys is None:
+        phys = handoff.get("handoff_time_s")
+    if is_finite_number(phys):
+        return f"{float(phys):.12g}"
+    return None
+
+
 def resolve_1d_to_2d(
     *,
     target_case: str,
@@ -86,15 +140,15 @@ def resolve_1d_to_2d(
         return None, None, None, "Current run does not contain the required validation data."
     source = str(mapping_source or "").strip()
     meta_path = os.path.join(target_case, "case_2d.json")
-    if (not source) and os.path.isfile(meta_path):
-        try:
-            with open(meta_path, encoding="utf-8") as handle:
-                payload = json.loads(handle.read())
-        except (OSError, json.JSONDecodeError, TypeError):
-            payload = {}
+    if os.path.isfile(meta_path):
+        payload = _read_json_dict(meta_path)
         mapping = payload.get("mapping") if isinstance(payload, dict) else None
         if isinstance(mapping, dict):
-            source = str(mapping.get("case_path") or "").strip()
+            meta_source = str(mapping.get("case_path") or "").strip()
+            if meta_source and os.path.isdir(meta_source):
+                source = meta_source
+            elif not source:
+                source = meta_source
             if not mapping_time:
                 mapping_time = str(mapping.get("specific_time") or mapping.get("time_mode") or "")
     remap_meta = os.path.join(target_case, REMAP_2D_FILENAME)
@@ -104,12 +158,18 @@ def resolve_1d_to_2d(
     if not source or not os.path.isdir(source):
         return None, None, None, "Remap source is not recorded in case metadata."
     target_time = first_initialized_time(target_case)
-    source_time = mapping_time if mapping_time and mapping_time not in ("latest",) else first_initialized_time(source)
-    if mapping_time == "latest":
-        from openfoam_times_2d import list_numeric_time_entries
+    if _is_specific_mapping_time(mapping_time):
+        source_time = str(mapping_time).strip()
+    else:
+        source_time = recorded_1d2d_source_time(target_case)
+        if not source_time:
+            if str(mapping_time or "").strip().lower() == "latest":
+                from openfoam_times_2d import list_numeric_time_entries
 
-        times = list_numeric_time_entries(source)
-        source_time = times[-1][1] if times else source_time
+                times = list_numeric_time_entries(source)
+                source_time = times[-1][1] if times else first_initialized_time(source)
+            else:
+                source_time = first_initialized_time(source)
     if not target_time:
         return source, source_time, None, "Target initialized time is not available."
     return source, source_time, target_time, ""

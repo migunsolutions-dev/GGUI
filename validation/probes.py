@@ -116,6 +116,17 @@ PROBE_MATCH_ABS_TOL = 1.0e-4
 PROBE_MATCH_REL_TOL = 1.0e-5
 PROBE_MISSING = "Probe is missing for this Validation Point; comparison is N/A."
 PROBE_MISMATCH = "Probe location does not match the planned Validation Point; comparison is N/A."
+# OpenFOAM GREAT / VGREAT are IEEE-finite (~1e300) but are unwritten sentinels.
+UNPHYSICAL_PROBE_ABS = 1.0e20
+
+
+def is_physical_probe_value(value: object) -> bool:
+    """True for a usable probe sample; GREAT/NaN/Inf are missing data."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and abs(number) < UNPHYSICAL_PROBE_ABS
 
 
 def match_probe_to_point(
@@ -174,7 +185,7 @@ def series_for_index(
             vf = float(v)
         except (TypeError, ValueError):
             continue
-        if math.isfinite(tf) and math.isfinite(vf):
+        if math.isfinite(tf) and is_physical_probe_value(vf):
             out_t.append(tf)
             out_v.append(vf)
     return out_t, out_v
@@ -188,11 +199,11 @@ def peak_and_impulse(
     p_atm: float = 101325.0,
 ) -> Tuple[Optional[float], Optional[float]]:
     """Peak overpressure (Pa) and last positive-phase impulse (Pa·s) if provided."""
-    over = [float(p) - float(p_atm) for p in pressure_pa]
+    over = [float(p) - float(p_atm) for p in pressure_pa if is_physical_probe_value(p)]
     peak = max(over) if over else None
     impulse = None
     if impulse_pa_s:
-        finite = [float(v) for v in impulse_pa_s if math.isfinite(float(v))]
+        finite = [float(v) for v in impulse_pa_s if is_physical_probe_value(v)]
         if finite:
             impulse = finite[-1]
     return peak, impulse

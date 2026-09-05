@@ -525,6 +525,20 @@ snGradSchemes { default corrected; }
                 mapping_time_mode=getattr(inputs.mapping, "time_mode", None),
                 target_time_label="0",
             )
+            if remap_timing.source_physical_time is None:
+                handoff = read_handoff_metadata(str(inputs.mapping.case_path or "")) or {}
+                phys = handoff.get("source_physical_time")
+                if phys is None:
+                    phys = handoff.get("handoff_time_s")
+                try:
+                    phys_f = float(phys)
+                except (TypeError, ValueError):
+                    phys_f = None
+                if phys_f is not None and phys_f == phys_f and phys_f > 0.0:
+                    remap_timing = build_remap_timing(
+                        source_time_label=f"{phys_f:.12g}",
+                        target_time_label="0",
+                    )
         val_plan = stamp_plan(
             val_plan,
             case_path=case_dir,
@@ -687,15 +701,19 @@ rm -rf 0 2>/dev/null || true
                 time_mode=str(getattr(inputs.mapping, "time_mode", "") or ""),
                 target_time="0",
             )
-            copied = copied_1d2d_radius_m(
-                source_1d_case=str(inputs.mapping.case_path or ""),
-                widget_mapped_radius=float(
-                    getattr(inputs.mapping, "mapped_radius", 0.0) or 0.0
-                ),
-            )
-            if copied is not None:
-                remap_region["copied_radius_m"] = copied
-                remap_region["field_r_max_m"] = copied
+            user_r = float(getattr(inputs.mapping, "mapped_radius", 0.0) or 0.0)
+            if user_r > 0.0:
+                remap_region["copied_radius_m"] = user_r
+                remap_region["requested_mapped_radius_m"] = user_r
+            src_meta = read_handoff_metadata(str(inputs.mapping.case_path or "")) or {}
+            src_extent = src_meta.get("field_r_max_m")
+            if src_extent is None:
+                from remap_snapshot_1d import read_snapshot_metadata
+
+                snap_meta = read_snapshot_metadata(str(inputs.mapping.case_path or "")) or {}
+                src_extent = snap_meta.get("field_r_max_m")
+            if src_extent is not None:
+                remap_region["source_field_r_max_m"] = float(src_extent)
             remap_region["physical_time_offset"] = remap_timing.physical_time_offset
             remap_region["source_physical_time"] = remap_timing.source_physical_time
             remap_region["target_initial_time"] = remap_timing.target_initial_time

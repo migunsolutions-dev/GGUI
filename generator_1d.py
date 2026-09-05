@@ -139,6 +139,16 @@ class Generator1D(BaseGenerator):
         axis_eps = min(max(requested_eps, min_axis_eps), cone_half * 0.5)
         return axis_eps, cone_half, wedge_half
 
+    STANDALONE_OUTLET_PAD = 1.1
+
+    @staticmethod
+    def source_domain_radius_m(inputs: CaseInputs1D) -> float:
+        """Outer mesh radius. Remap 1D must not solve past the user limit."""
+        user = float(inputs.radius)
+        if uses_remap_handoff(inputs):
+            return user
+        return user * Generator1D.STANDALONE_OUTLET_PAD
+
     @staticmethod
     def resolved_stop_radius_m(inputs: CaseInputs1D) -> float:
         domain = float(inputs.radius)
@@ -327,9 +337,10 @@ air
         validation_radii: Tuple[float, ...] = (),
     ) -> None:
         sys_dir = os.path.join(case_dir, "system")
-        # User's target radius (for mapping); domain is buffered so shock can be detected before boundary
+        # Remap: user radius is the physical outer limit. Standalone Terminate
+        # keeps a 10% outlet pad so the stop probe is not on the boundary.
         target_radius = float(inputs.radius)
-        physical_radius = target_radius * 1.1  # 10% buffer to avoid boundary artifacts at target
+        physical_radius = self.source_domain_radius_m(inputs)
         r_max_val = physical_radius
         dx = max(float(inputs.cell_size), 1e-9)
         r_min = rec.r_min
@@ -498,6 +509,11 @@ writeFormat     ascii;
 writePrecision  6;
 writeCompression off;
 runTimeModifiable true;
+OptimisationSwitches
+{{
+    fileModificationSkew 0;
+    fileModificationChecking timeStamp;
+}}
 functions
 {{
 {extras}    probes1d

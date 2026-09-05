@@ -1,8 +1,13 @@
-"""Geometric 1D -> 2D remap handoff: stop 10 source cells before R_remap.
+"""Geometric 1D -> 2D remap handoff: stop 10 source cells before R_user.
 
-The remap field still extends to the requested remap radius. Only the
-watchdog / capture trigger is moved inward so an undisturbed-air strip
-remains between the front and the outer remap boundary.
+R_user (the radius entered for 1D->2D remap) is the maximum radius the
+incident shock may reach in the 1D free-field model. The 10-cell buffer
+is created *inside* that limit:
+
+    R_handoff = R_user - 10 * dr_1D
+
+so undisturbed source-domain air remains between the primary front and
+any target-model geometry that may begin immediately outside R_user.
 
 Handoff fires when the *primary shock* reaches the existing watchdog probe
 at R_handoff. That is a compression-ratio test against the known ambient,
@@ -19,14 +24,14 @@ from typing import Any, Dict, Iterable, Optional, Sequence
 
 REMAP_FRONT_BUFFER_CELLS_1D = 10
 HANDOFF_FILENAME = "ggui_remap_handoff.json"
-HANDOFF_RULE = "R_handoff = R_remap - REMAP_FRONT_BUFFER_CELLS_1D * dr_1D"
+HANDOFF_RULE = "R_handoff = R_user - REMAP_FRONT_BUFFER_CELLS_1D * dr_1D"
 # Strong-shock discriminator: p / p_atm. Acoustic/precursor plateaus stay
 # near 1; the primary blast front is a compression of this order or larger.
 PRIMARY_SHOCK_COMPRESSION_RATIO = 2.0
 HANDOFF_CRITERION = (
     "primary_shock_at_handoff_radius: watchdog_probe at R_handoff "
     "reaches p/p_atm >= PRIMARY_SHOCK_COMPRESSION_RATIO; "
-    "R_handoff = R_remap - REMAP_FRONT_BUFFER_CELLS_1D * dr_1D"
+    "R_handoff = R_user - REMAP_FRONT_BUFFER_CELLS_1D * dr_1D"
 )
 
 
@@ -46,7 +51,7 @@ def handoff_radius_m(
     dr_1d: float,
     buffer_cells: int = REMAP_FRONT_BUFFER_CELLS_1D,
 ) -> float:
-    """Return R_handoff. Does not shrink R_remap."""
+    """Return R_handoff. Does not shrink the user-defined maximum radius."""
     try:
         r = float(r_remap)
         dr = float(dr_1d)

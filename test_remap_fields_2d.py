@@ -212,6 +212,18 @@ class RemapFields2DTests(unittest.TestCase):
             self.assertLess(float(data["r"][1]), 0.12)
             self.assertGreater(float(data["p"][0]), float(data["p"][1]))
 
+    def test_read_1d_data_does_not_linspace_when_mesh_radii_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "constant", "polyMesh"))
+            os.makedirs(os.path.join(td, "0.001"))
+            with open(os.path.join(td, "constant", "polyMesh", "points"), "w", encoding="utf-8") as handle:
+                handle.write("2\n(\n(0 0 0)\n(1.50 0 0)\n)\n")
+            with open(os.path.join(td, "0.001", "p"), "w", encoding="utf-8") as handle:
+                handle.write(
+                    "internalField nonuniform List<scalar>\n2\n(\n 2.0e6\n 1.0e5\n);\n"
+                )
+            self.assertIsNone(_read_1d_data(td, "0.001"))
+
     def test_he_wipe_without_carry_discards_product_mass(self):
         """1D->3D used to zero HE without moving mass into rho.air."""
         alpha = np.array([1.0, 0.0])
@@ -224,9 +236,21 @@ class RemapFields2DTests(unittest.TestCase):
         self.assertAlmostEqual(float(carried[0]), 2.5)
         self.assertAlmostEqual(float(carried[1]), float(wiped[1]))
 
-    def test_mapped_radius_does_not_clip_below_1d_extent(self):
+    def test_mapped_radius_clips_source_padding(self):
         r_1d = np.array([0.0, 0.8, 1.6])
-        self.assertAlmostEqual(effective_mapped_radius(r_1d, mapped_radius=0.5), 1.6)
+        self.assertAlmostEqual(effective_mapped_radius(r_1d, mapped_radius=0.5), 0.5)
+        self.assertAlmostEqual(effective_mapped_radius(r_1d, mapped_radius=0.0), 1.6)
+        self.assertAlmostEqual(effective_mapped_radius(r_1d, mapped_radius=2.0), 1.6)
+
+    def test_user_radius_is_not_silently_replaced_by_1d_padding(self):
+        r_1d = np.array([0.0, 0.3, 0.6, 0.66])
+        p_1d = np.array([4.0e6, 2.0e6, 1.5e6, 1.4e6])
+        p_amb = 101325.0
+        r = np.array([0.55, 0.63])
+        z = np.array([1.0, 1.0])
+        p = map_scalar_profile(r, z, 1.0, r_1d, p_1d, mapped_radius=0.60, ambient=p_amb)
+        self.assertGreater(p[0], p_amb)
+        self.assertAlmostEqual(p[1], p_amb)
 
     def test_region_metadata_agrees_with_target_hob(self):
         meta = remap_region_metadata(1.25, mapped_radius=0.4, source_time="latest", time_mode="latest")

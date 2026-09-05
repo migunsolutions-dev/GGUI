@@ -227,6 +227,7 @@ class SolverWriteNowStopTests(unittest.TestCase):
             text = handle.read()
         self.assertIn("stopAt          writeNow;", text)
         self.assertNotIn("stopAt          endTime;", text)
+        self.assertIn("writeInterval   1e-12;", text)
 
     def test_request_solver_write_and_stop_keeps_complete_header(self):
         from solver_runner import request_solver_write_and_stop
@@ -304,6 +305,8 @@ functions
         self.assertEqual(probe_write_interval_from_control_dict(text), 25)
         self.assertIn("writeInterval   25;", text)
         self.assertEqual(text.count("writeInterval   25;"), 1)
+        self.assertIn("fileModificationSkew 0;", text)
+        self.assertIn("fileModificationChecking timeStamp;", text)
 
     def test_reflect_and_terminate_write_user_end_time_and_watchdog(self):
         from completion_1d import read_completion_record

@@ -32,6 +32,23 @@ End
         self.assertTrue(parsed["foam_fatal"])
         self.assertTrue(parsed["fpe"])
 
+    def test_sigfpe_banner_is_not_a_crash(self):
+        parsed = numerical_engine.parse_solver_log(
+            "sigFpe : Enabling floating point exception trapping (FOAM_SIGFPE).\n"
+            "Time = 0.001\nEnd\n"
+        )
+        self.assertFalse(parsed["fpe"])
+        self.assertTrue(parsed["completed"])
+
+    def test_blastfoam_courant_mean_max_format(self):
+        parsed = numerical_engine.parse_solver_log(
+            "Time = 0.001\n"
+            "deltaT = 1e-6\n"
+            "Courant Number Mean/Max = 0.00078646510724, 0.0050246011046\n"
+            "End\n"
+        )
+        self.assertEqual(parsed["courant_max"], [0.0050246011046])
+
 
 class ReportTests(unittest.TestCase):
     def test_missing_case_is_na_not_pass(self):
@@ -68,6 +85,20 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(report.n_cells, 42)
             self.assertAlmostEqual(report.max_co_configured, 0.5)
             self.assertEqual(report.courant.values, [0.3])
+
+    def test_cell_count_from_mesh_when_checkmesh_absent(self):
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "system"))
+            os.makedirs(os.path.join(td, "constant", "polyMesh"))
+            with open(os.path.join(td, "system", "controlDict"), "w", encoding="utf-8") as handle:
+                handle.write("maxCo 0.4;\n")
+            with open(os.path.join(td, "log.blastFoam"), "w", encoding="utf-8") as handle:
+                handle.write("Time = 0.001\ndeltaT = 1e-6\nEnd\n")
+            with open(os.path.join(td, "constant", "polyMesh", "owner"), "w", encoding="utf-8") as handle:
+                handle.write("nCells: 40000\n")
+            report = numerical_engine.build_report(td, dim="2d", keep_openfoam_time_folders=False)
+            self.assertIsNone(report.checkmesh_ok)
+            self.assertEqual(report.n_cells, 40000)
 
 
 if __name__ == "__main__":

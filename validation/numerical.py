@@ -19,6 +19,16 @@ _COURANT = re.compile(
     r"Courant\s+Number\s+mean:\s*([0-9.eE+-]+)\s+max:\s*([0-9.eE+-]+)",
     re.I,
 )
+_COURANT_MEAN_MAX = re.compile(
+    r"Courant\s+Number\s+Mean/Max\s*=\s*([0-9.eE+-]+)\s*,\s*([0-9.eE+-]+)",
+    re.I,
+)
+_FPE_CRASH = re.compile(
+    r"(caught\s+floating\s+point\s+exception|"
+    r"sigfpe\s*:\s*caught|"
+    r"floating\s+point\s+exception(?!\s+trapping))",
+    re.I,
+)
 _REFINE = re.compile(r"Refined\s+from\s+(\d+)\s+to\s+(\d+)\s+cells")
 _UNREFINE = re.compile(r"Unrefined\s+from\s+(\d+)\s+to\s+(\d+)\s+cells")
 _EXEC = re.compile(r"ExecutionTime\s*=\s*([0-9.]+)\s*s")
@@ -77,7 +87,7 @@ def parse_solver_log(text: str) -> Dict[str, Any]:
     delta = [float(x) for x in _DELTAT.findall(text)]
     courant_max = []
     courant_t = []
-    for match in _COURANT.finditer(text):
+    for match in list(_COURANT.finditer(text)) + list(_COURANT_MEAN_MAX.finditer(text)):
         try:
             courant_max.append(float(match.group(2)))
         except ValueError:
@@ -102,7 +112,7 @@ def parse_solver_log(text: str) -> Dict[str, Any]:
         "wall_time_s": clock_times[-1] if clock_times else None,
         "foam_fatal": bool(re.search(r"FOAM\s+FATAL", text, re.I)),
         "foam_error": "foam error" in low,
-        "fpe": "floating point exception" in low,
+        "fpe": bool(_FPE_CRASH.search(text)),
         "completed": ("end" in low[-1200:] or "finalising" in low[-1200:] or bool(exec_times)),
     }
 
@@ -265,12 +275,15 @@ def build_report(
                 count_match = re.search(r"\n\s*(\d+)\s*\n\s*\(", owner)
                 if count_match:
                     n_fixed = int(count_match.group(1))
-        if n_fixed is not None and times:
-            report.cells = TimeSeries(
-                time=[times[0], times[-1]],
-                values=[float(n_fixed), float(n_fixed)],
-            )
-            report.notes.append("Cell count is constant (no AMR refine lines in the log).")
+        if n_fixed is not None:
+            if report.n_cells is None:
+                report.n_cells = n_fixed
+            if times:
+                report.cells = TimeSeries(
+                    time=[times[0], times[-1]],
+                    values=[float(n_fixed), float(n_fixed)],
+                )
+                report.notes.append("Cell count is constant (no AMR refine lines in the log).")
     recon = _read(os.path.join(case_dir, "log.reconstructPar")) or _read(
         os.path.join(case_dir, "log.reconstructFinal")
     )

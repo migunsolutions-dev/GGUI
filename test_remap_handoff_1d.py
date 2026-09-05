@@ -138,6 +138,14 @@ class RemapHandoffFrontTriggerTests(unittest.TestCase):
 
         self.assertIs(solver_runner.primary_shock_at_probe, primary_shock_at_probe)
         self.assertIs(ggui_run.primary_shock_at_probe, primary_shock_at_probe)
+        from models import BOUNDARY_1D_TERMINATE, RUN_MODE_TERMINATE
+
+        class Standalone:
+            stop_mode = RUN_MODE_TERMINATE
+            right_boundary = BOUNDARY_1D_TERMINATE
+            remap_for_2d = False
+
+        self.assertTrue(ggui_run.allrun_watchdog_default(Standalone()))
 
     def test_invalid_geometry_is_rejected(self):
         with self.assertRaises(HandoffGeometryError) as ctx:
@@ -175,7 +183,9 @@ class RemapHandoffGeneratorTests(unittest.TestCase):
             self.assertAlmostEqual(float(handle.read().strip()), 1.4)
         with open(os.path.join(case_dir, "system", "blockMeshDict"), encoding="utf-8") as handle:
             mesh = handle.read()
-        self.assertIn("(1 1 164)", mesh)
+        # User radius 1.5 m / 0.01 m, no 1.1x padding on remap precursors.
+        self.assertIn("(1 1 149)", mesh)
+        self.assertNotIn("(1 1 164)", mesh)
         self.assertNotIn("(1 1 140)", mesh)
         meta = read_handoff_metadata(case_dir)
         self.assertIsNotNone(meta)
@@ -193,6 +203,8 @@ class RemapHandoffGeneratorTests(unittest.TestCase):
         self.assertAlmostEqual(record.requested_stop_radius_m, 1.5)
         self.assertIsNone(record.handoff_radius_m)
         self.assertEqual(record.criterion, ARRIVAL_CRITERION)
+        self.assertAlmostEqual(Generator1D.source_domain_radius_m(_inputs(remap_for_2d=False)), 1.65)
+        self.assertAlmostEqual(Generator1D.source_domain_radius_m(_inputs(remap_for_2d=True)), 1.5)
         with open(os.path.join(domain_dir, ".watchdog_target_radius"), encoding="utf-8") as handle:
             self.assertAlmostEqual(float(handle.read().strip()), 1.5)
         inner_dir = gen.generate(

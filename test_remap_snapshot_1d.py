@@ -513,6 +513,9 @@ class RemapSnapshot1DTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(case3d, "remap_snapshot_1d.py")))
             self.assertTrue(os.path.isfile(os.path.join(case3d, "remap_fields_2d.py")))
             self.assertIn("carry_mixture_mass_in_air", script)
+            self.assertIn("effective_mapped_radius", script)
+            self.assertIn("remap_radius_m", script)
+            self.assertNotIn("np.linspace", script)
             self.assertNotIn("a4_3d = np.zeros(n_cells)", script)
             self.assertIn(resolved.time_label, script)
 

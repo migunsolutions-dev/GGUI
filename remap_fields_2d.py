@@ -25,7 +25,7 @@ import numpy as np
 
 MAPPING_METHOD = "radial_from_target_charge_center"
 GROUND_CLIP = "domain_z_ge_0_no_mirror"
-RADIUS_POLICY = "source_1d_r_max"
+RADIUS_POLICY = "user_mapped_radius"
 
 _BELOW_GROUND = -1.0e-15
 _R_FLOOR = 1.0e-20
@@ -43,15 +43,22 @@ def source_radius_rz(r_2d, z_2d, hob_m: float):
 
 
 def effective_mapped_radius(r_1d, mapped_radius: float = 0.0) -> float:
-    """Receiving-region radius is the 1D profile extent.
+    """Physical receiving-region radius: the user remap limit.
 
-    ``mapped_radius`` is recorded for metadata/validation but is not used as a
-    clip: the previous rotateFields path remapped the full overlapping 1D field.
+    Source-mesh padding beyond that limit is numerical only and is not copied.
+    If the user radius is unset, fall back to the 1D profile extent.
     """
     r_1d = np.asarray(r_1d, dtype=float)
-    if r_1d.size == 0:
-        return max(float(mapped_radius or 0.0), 0.0)
-    return float(np.max(r_1d))
+    r_max = float(np.max(r_1d)) if r_1d.size else 0.0
+    try:
+        user = float(mapped_radius or 0.0)
+    except (TypeError, ValueError):
+        user = 0.0
+    if not np.isfinite(user) or user <= 0.0:
+        return max(r_max, 0.0)
+    if r_max <= 0.0:
+        return user
+    return min(user, r_max)
 
 
 def interpolate_radial(r_source, r_1d, values_1d):
@@ -362,25 +369,7 @@ def _read_1d_data(source_case: str, time_dir: str) -> Optional[Dict[str, np.ndar
         except Exception:
             r_1d = None
         if r_1d is None or len(r_1d) != n:
-            mesh_dir = os.path.join(source_case, "constant", "polyMesh")
-            points_path = os.path.join(mesh_dir, "points")
-            r_min, r_max = 0.0, 1.0
-            if os.path.isfile(points_path):
-                with open(points_path, "r", encoding="utf-8", errors="replace") as handle:
-                    content = handle.read()
-                pts = [
-                    (float(m.group(1)), float(m.group(2)), float(m.group(3)))
-                    for m in re.finditer(
-                        r"\(\s*([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s*\)",
-                        content[content.find("points") :],
-                    )
-                ]
-                if pts:
-                    radii = np.linalg.norm(np.array(pts), axis=1)
-                    r_min = float(np.min(radii))
-                    r_max = float(np.max(radii))
-            span = r_max - r_min
-            r_1d = np.linspace(r_min + span / (2 * n), r_max - span / (2 * n), n)
+            return None
     if p_arr is None:
         p_arr = np.full(n, 101325.0 if p_def is None else p_def)
     if t_arr is None:

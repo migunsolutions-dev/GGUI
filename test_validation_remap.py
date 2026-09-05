@@ -40,6 +40,47 @@ class RemapResolveTests(unittest.TestCase):
             self.assertEqual(st, "0.001")
             self.assertEqual(tt, "0")
 
+    def test_recorded_handoff_time_beats_widget_latest_and_folder_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = os.path.join(td, "src1d")
+            target = os.path.join(td, "tgt2d")
+            leftover = os.path.join(td, "other1d")
+            os.makedirs(os.path.join(source, "0"))
+            os.makedirs(os.path.join(source, "0.000184005"))
+            os.makedirs(os.path.join(leftover, "0"))
+            os.makedirs(os.path.join(leftover, "0.005"))
+            os.makedirs(os.path.join(target, "0"))
+            with open(os.path.join(target, "case_2d.json"), "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "mapping": {"case_path": source, "time_mode": "latest"},
+                        "remap_timing": {
+                            "source_time_label": "0.000184005",
+                            "source_physical_time": 0.000184005,
+                            "physical_time_offset": 0.000184005,
+                            "target_time_label": "0",
+                        },
+                    },
+                    handle,
+                )
+            src, st, tt, msg = remap_engine.resolve_1d_to_2d(
+                target_case=target,
+                mapping_source=leftover,
+                mapping_time="latest",
+            )
+            self.assertEqual(msg, "")
+            self.assertEqual(os.path.normpath(src), os.path.normpath(source))
+            self.assertEqual(st, "0.000184005")
+            self.assertEqual(tt, "0")
+            src2, st2, tt2, msg2 = remap_engine.resolve_1d_to_2d(
+                target_case=target,
+                mapping_source=source,
+                mapping_time=None,
+            )
+            self.assertEqual(msg2, "")
+            self.assertEqual(st2, "0.000184005")
+            self.assertNotEqual(st2, "0")
+
     def test_2d_to_3d_refuses_1d_radial_source(self):
         src, st, tt, msg = remap_engine.resolve_2d_to_3d(
             target_case="anywhere",

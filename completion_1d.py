@@ -26,6 +26,11 @@ RUN_MODE_TERMINATE = "terminate"
 RUN_MODE_REFLECT = "reflect"
 RUN_MODE_OPTIONS = (RUN_MODE_TERMINATE, RUN_MODE_REFLECT)
 
+# Shared GUI / Allrun-harness poll while waiting for the arrival probe.
+# 1D remap steps ~300/s; 0.25 s of latency lets the front travel several cells
+# past R_handoff before writeNow is published.
+WATCHDOG_POLL_S = 0.10
+
 # Legacy aliases kept so older tests/projects still import a name.
 STOP_MODE_TERMINATE = RUN_MODE_TERMINATE
 STOP_MODE_REFLECT = RUN_MODE_REFLECT
