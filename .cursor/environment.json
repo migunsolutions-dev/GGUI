@@ -1,0 +1,4 @@
+{
+  "name": "BlastFoam GUI Manager",
+  "install": "bash .cursor/install.sh"
+}
