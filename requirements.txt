@@ -1,0 +1,16 @@
+# Runtime + test dependencies for the BlastFoam GUI Manager.
+#
+# The application is a PyQt5 desktop tool for authoring OpenFOAM / blastFoam
+# CFD cases, with an embedded 3D viewer built on VTK / PyVista. The OpenFOAM
+# solver itself is an external toolbox invoked at run time and is not a Python
+# dependency.
+PyQt5==5.15.11
+numpy==1.26.4
+matplotlib==3.9.2
+vtk==9.3.1
+pyvista==0.44.1
+pyvistaqt==0.11.1
+PyOpenGL==3.1.7
+
+# Testing
+pytest==8.3.3
