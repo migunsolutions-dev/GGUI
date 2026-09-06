@@ -542,5 +542,29 @@ class WaveWatchdogModeTests(unittest.TestCase):
             self.assertFalse(runner._stop_requested)
 
 
+class SourceModelPersistenceTests(unittest.TestCase):
+    def test_initial_record_defaults_to_jwl(self) -> None:
+        record = initial_completion_record(
+            mode=RUN_MODE_TERMINATE, requested_stop_radius_m=1.0
+        )
+        self.assertEqual(record.source_model, "JWL_DETONATION")
+
+    def test_ig_source_model_survives_write_and_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as case:
+            write_completion_record(
+                case,
+                initial_completion_record(
+                    mode=RUN_MODE_TERMINATE,
+                    requested_stop_radius_m=1.0,
+                    source_model="IG_ISOTHERMAL_BURST",
+                ),
+            )
+            stored = read_completion_record(case)
+            self.assertIsNotNone(stored)
+            self.assertEqual(stored.source_model, "IG_ISOTHERMAL_BURST")
+            reset = reset_completion_for_new_run(case)
+            self.assertEqual(reset.source_model, "IG_ISOTHERMAL_BURST")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -23,6 +23,10 @@ MATERIALS: Dict[str, Dict[str, Any]] = {
 }
 
 
+# ``E0`` here is LEGACY provenance only (pre-V2 written initiation values).
+# V2 activation energy is always ``E0_Pa = rho0 * MATERIALS[name]["energy"]``
+# via ``jwl_activation_energy.v2_activation``. Do not read these E0 values
+# as the production activation energy.
 JWL_PARAMETERS: Dict[str, Dict[str, Any]] = {
     "TNT": {
         "A": 373.77e9, "B": 3.7471e9, "R1": 4.15, "R2": 0.90,

@@ -11,6 +11,11 @@ import os
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Optional, Sequence, Tuple
 
+from models import (
+    SOURCE_MODEL_JWL,
+    SOURCE_MODEL_SCHEMA_VERSION,
+    normalize_source_model,
+)
 from validation.map_1d import KIND_EXACT, map_radius
 from validation.metrics import is_finite_number
 from validation.probes import (
@@ -81,6 +86,10 @@ class CompletionRecord:
     dr_1d_m: Optional[float] = None
     remap_front_buffer_cells: Optional[int] = None
     handoff_radius_m: Optional[float] = None
+    # Which blast source produced this run. Records written before the IG feature
+    # have no such key and resolve to JWL, which is what they were.
+    source_model: str = SOURCE_MODEL_JWL
+    source_model_schema_version: int = SOURCE_MODEL_SCHEMA_VERSION
 
     def as_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -196,6 +205,10 @@ def read_completion_record(case_dir: str) -> Optional[CompletionRecord]:
             dr_1d_m=_opt_float(data.get("dr_1d_m")),
             remap_front_buffer_cells=_opt_int(data.get("remap_front_buffer_cells")),
             handoff_radius_m=_opt_float(data.get("handoff_radius_m")),
+            source_model=normalize_source_model(data.get("source_model")),
+            source_model_schema_version=_opt_int(
+                data.get("source_model_schema_version")
+            ) or SOURCE_MODEL_SCHEMA_VERSION,
         )
     except (TypeError, ValueError):
         return None
@@ -215,6 +228,7 @@ def initial_completion_record(
     remap_front_buffer_cells: Optional[int] = None,
     handoff_radius_m: Optional[float] = None,
     criterion: Optional[str] = None,
+    source_model: Optional[str] = None,
 ) -> CompletionRecord:
     resolved = normalize_run_mode(mode or stop_mode, right_boundary)
     remap = bool(remap_for_2d)
@@ -249,6 +263,8 @@ def initial_completion_record(
         dr_1d_m=_opt_float(dr_1d_m),
         remap_front_buffer_cells=_opt_int(remap_front_buffer_cells),
         handoff_radius_m=_opt_float(handoff_radius_m),
+        source_model=normalize_source_model(source_model),
+        source_model_schema_version=SOURCE_MODEL_SCHEMA_VERSION,
     )
 
 
@@ -272,6 +288,9 @@ def reset_completion_for_new_run(case_dir: str) -> CompletionRecord:
             remap_front_buffer_cells=existing.remap_front_buffer_cells,
             handoff_radius_m=existing.handoff_radius_m,
             criterion=existing.criterion,
+            # Carried, not re-derived: a re-run of an existing case must not silently
+            # switch source model just because the arrival evidence was cleared.
+            source_model=existing.source_model,
         )
         record.threshold_overpressure_pa = existing.threshold_overpressure_pa
     write_completion_record(case_dir, record)

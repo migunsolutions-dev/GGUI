@@ -17,6 +17,7 @@ from axisymmetric_2d import (
 )
 from base_generator import ALPHA_C4_CHECK_SCRIPT, BaseGenerator
 from charge_capture import CAPTURE_CELL_SAFETY, auto_charge_capture_radius_m
+import jwl_activation_energy as jwl_act
 from material_catalog import jwl_parameters
 from material_validation import validate_required_values
 from models_2d import CaseInputs2D, HOB_SOURCE_USER_TARGET
@@ -273,6 +274,12 @@ mergePatchPairs ();
         ).raise_if_invalid()
         j = jwl_parameters(inputs.material_name, inputs.material_props)
         cv = j["CvCoeffs"]
+        act = jwl_act.v2_activation(
+            float(inputs.energy_j_per_kg),
+            float(inputs.rho_charge),
+            material_name=str(inputs.material_name or ""),
+            dimension="2D",
+        )
         remap = inputs.initialization_source != DIRECT_SOURCE
         use_com = "no" if remap else "yes"
         points = (
@@ -304,7 +311,7 @@ c4
     activationModel {'none' if remap else 'pressureBased'};
     initiation
     {{
-        E0 {j['E0']:.12g};
+        E0 {act.E0_pa:.12g};
         I 4.0e6; a 0.0367; b 0.667; x 7.0; maxLambdaI 0.022;
         G1 1.4997e-7; c 0.667; d 0.33; y 2.0; minLambda1 0.022;
         G2 0.0; e 0.667; f 0.667; z 3.0; minLambda2 0.022;
@@ -781,3 +788,14 @@ rm -rf 0 2>/dev/null || true
             os.path.join(case_dir, "case_2d.json"),
             json.dumps(data, indent=2, sort_keys=True) + "\n",
         )
+        if inputs.energy_j_per_kg is not None and inputs.rho_charge is not None:
+            jwl_act.write_jwl_energy_audit(
+                case_dir,
+                jwl_act.v2_activation(
+                    float(inputs.energy_j_per_kg),
+                    float(inputs.rho_charge),
+                    material_name=str(inputs.material_name or ""),
+                    dimension="2D",
+                ),
+                mass_kg=None if inputs.mass_kg is None else float(inputs.mass_kg),
+            )

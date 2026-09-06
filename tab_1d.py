@@ -17,7 +17,13 @@ from models import (
     CaseInputs1D,
     RUN_MODE_REFLECT,
     RUN_MODE_TERMINATE,
+    SOURCE_MODEL_IG,
+    SOURCE_MODEL_JWL,
+    SOURCE_MODEL_LABELS,
+    is_ideal_gas_source,
+    normalize_source_model,
 )
+import ig_source_state as igs
 from completion_1d import normalize_run_mode
 from ui_metrics import (
     COMPUTATIONAL_LEFT_PANEL_WIDTH,
@@ -253,6 +259,7 @@ class Tab1D(QWidget):
             ),
             stop_radius_m=float(self.spin_radius.value()),
             remap_for_2d=bool(self.radio_yes.isChecked()),
+            source_model=self.selected_source_model(),
         )
 
     def set_case_inputs(self, data: dict) -> None:
@@ -292,8 +299,33 @@ class Tab1D(QWidget):
                 remap = bool(values.get("remap_for_2d"))
                 self.radio_yes.setChecked(remap)
                 self.radio_no.setChecked(not remap)
+            self._apply_source_model_radios(values.get("source_model"))
         finally:
             self.combo_comp.blockSignals(False)
+        self.recalc_stats()
+
+    def selected_source_model(self) -> str:
+        if getattr(self, "radio_ig", None) is not None and self.radio_ig.isChecked():
+            return SOURCE_MODEL_IG
+        return SOURCE_MODEL_JWL
+
+    def _apply_source_model_radios(self, value) -> None:
+        model = normalize_source_model(value)
+        self.radio_jwl.setChecked(model == SOURCE_MODEL_JWL)
+        self.radio_ig.setChecked(model == SOURCE_MODEL_IG)
+        self.on_source_model_changed()
+
+    def on_source_model_changed(self, *_args) -> None:
+        ig = is_ideal_gas_source(self.selected_source_model())
+        if hasattr(self, "btn_edit_comp"):
+            self.btn_edit_comp.setEnabled(
+                (not ig) and self.combo_comp.currentText() == "Custom"
+            )
+            self.btn_edit_comp.setToolTip(
+                "JWL coefficients are unused for the Ideal-Gas Isothermal Burst."
+                if ig
+                else ""
+            )
         self.recalc_stats()
 
     def apply_output_gauges(self, fields: tuple, *, impulse: bool, dynamic_pressure: bool) -> None:
@@ -326,7 +358,7 @@ class Tab1D(QWidget):
         if self.combo_comp.currentText() != "Custom":
             self.spin_density.setValue(props["rho"])
             self.edit_energy.setText(f"{props['E0']:.2e}")
-        self.recalc_stats()
+        self.on_source_model_changed()
 
     def create_input_row(self, unit_text, default_val, decimals=2, step=1.0):
         layout = QHBoxLayout()
@@ -403,6 +435,19 @@ class Tab1D(QWidget):
         energy_lay.addWidget(QLabel("(J/kg)"))
         energy_lay.addStretch()
         charge_layout.addRow("Energy", energy_lay)
+
+        source_layout = QHBoxLayout()
+        self.radio_jwl = QRadioButton(SOURCE_MODEL_LABELS[SOURCE_MODEL_JWL])
+        self.radio_ig = QRadioButton(SOURCE_MODEL_LABELS[SOURCE_MODEL_IG])
+        self.radio_jwl.setChecked(True)
+        self._source_model_group = QButtonGroup(self)
+        self._source_model_group.addButton(self.radio_jwl)
+        self._source_model_group.addButton(self.radio_ig)
+        self.radio_jwl.toggled.connect(self.on_source_model_changed)
+        source_layout.addWidget(self.radio_jwl)
+        source_layout.addWidget(self.radio_ig)
+        source_layout.addStretch()
+        charge_layout.addRow("Source model", source_layout)
 
         remap_layout = QHBoxLayout()
         self.radio_yes = QRadioButton("Yes")
@@ -621,6 +666,9 @@ class Tab1D(QWidget):
             energy = float(self.edit_energy.text())
         except (TypeError, ValueError):
             energy = float(self.get_selected_material_properties().get("E0") or 0.0)
+        if is_ideal_gas_source(self.selected_source_model()):
+            e_source = igs.CV_IDEAL_GAS * float(self.spin_temp.value()) + energy
+            return ideal_gas_charge_pressure_pa(rho, e_source)
         return ideal_gas_charge_pressure_pa(rho, energy)
 
     def initial_overpressure_profile(self):

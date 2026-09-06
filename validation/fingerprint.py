@@ -5,6 +5,7 @@ import os
 from dataclasses import replace
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
+from models import normalize_source_model
 from validation.metrics import is_finite_number
 
 FLOAT_ABS = 1.0e-9
@@ -23,6 +24,9 @@ CONFIG_KEYS = (
     "reference_mode",
     "n_points",
     "remap_receive_r_max",
+    # A JWL plan must never be reused for an IG run at the same geometry, and
+    # vice versa. Plans cached before this key existed miss once and replan.
+    "source_model",
 )
 
 
@@ -69,6 +73,7 @@ def build_fingerprint(
     reference_mode: str,
     points: Sequence[Any] = (),
     remap_receive_r_max: Optional[float] = None,
+    source_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     coords = coordinates_payload(points)
     domain = {
@@ -91,6 +96,7 @@ def build_fingerprint(
         "reference_mode": str(reference_mode or ""),
         "n_points": len(coords),
         "coordinates": [list(item) for item in coords],
+        "source_model": normalize_source_model(source_model),
     }
     if is_finite_number(remap_receive_r_max) and float(remap_receive_r_max) > 0.0:
         payload["remap_receive_r_max"] = _round_float(remap_receive_r_max)

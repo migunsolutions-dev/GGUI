@@ -44,6 +44,59 @@ END { exit (found ? 0 : 1); }
 }
 '''
 
+# Ideal-Gas Isothermal Burst has no explosive phase, so there is no alpha.c4 to
+# check. The equivalent failure is an empty burst sphere: setFields writes p = p_atm
+# everywhere and then overwrites the sphere, so if no cell centre fell inside it,
+# p stays `internalField uniform` and the solver would quietly integrate a still
+# atmosphere instead of a blast. Same awk dialect constraints as the alpha check.
+IG_SOURCE_CHECK_SCRIPT = r'''#!/usr/bin/env bash
+# Pre-solver sanity: the ideal-gas burst region must actually exist in 0/p.
+for f in 0/p 0/rho; do
+  if [ ! -f "$f" ]; then
+    echo "FATAL: $f is missing. The ideal-gas burst source was not initialized."
+    exit 1
+  fi
+done
+awk -v pmin=__P_THRESHOLD__ '
+BEGIN { in_list = 0; found = 0; }
+# A uniform field means setFields matched no cells inside the burst sphere.
+/^internalField[ \t]+uniform[ \t]/ {
+  exit;
+}
+/^internalField[ \t]+nonuniform/ {
+  in_list = 0;
+  next;
+}
+in_list && /^[ \t]*\)/ {
+  next;
+}
+in_list && /^[0-9eE+.\t -]+/ {
+  for (i = 1; i <= NF; i++) {
+    if ($i + 0 > pmin) { found = 1; break; }
+  }
+  next;
+}
+/\(/ {
+  in_list = 1;
+  next;
+}
+END { exit (found ? 0 : 1); }
+' 0/p || {
+  echo "FATAL: No cells captured inside the ideal-gas burst sphere. Reduce Cell Size so at least one cell centre lies inside the charge radius."
+  exit 1
+}
+'''
+
+
+def ig_source_check_script(p_atm: float) -> str:
+    """Bind the burst-detection threshold to the case ambient pressure.
+
+    The burst is ~4 orders of magnitude above ambient, so 10x p_atm separates it
+    from any plausible ambient without depending on the charge.
+    """
+    return IG_SOURCE_CHECK_SCRIPT.replace("__P_THRESHOLD__", f"{10.0 * float(p_atm):.10g}")
+
+
 class BaseGenerator:
     """
     Base class containing shared utilities for OpenFOAM case generation.
@@ -116,6 +169,8 @@ class BaseGenerator:
         charge_region_empty_message: Optional[str] = None,
         placement_use_setfields: bool = False,
         fast_run_mode: bool = True,
+        use_ig_source_check: bool = False,
+        ig_source_check_p_atm: float = 101325.0,
     ) -> None:
         """
         Write Allrun and Allclean scripts.
@@ -128,6 +183,8 @@ class BaseGenerator:
           - check_internal_patch.sh
         check_alpha_c4.sh remains in both modes (it gates the solver against
         "no mass in domain" failures, which is a real correctness guard).
+        When use_ig_source_check is True the case has no explosive phase, so
+        check_ig_source.sh replaces it and gates on a non-empty burst sphere in 0/p.
         Charge-region check (writeCellCentres + check_charge_region.py) follows
         use_charge_region_check independently.
         When init_from_1d is True, mapped_source_dir_linux and mapped_source_time must be set;
@@ -163,7 +220,7 @@ touch case.foam
             # without producing log.stageVerification or per-stage spew. Saves ~5-8s.
             script_head += "stage_check () { :; }\n"
         else:
-            script_head += r"""# Stage verification: tee all output to log.stageVerification and define stage_check
+            stage_verification = r"""# Stage verification: tee all output to log.stageVerification and define stage_check
 # alpha_check only meaningful AFTER setRefinedFields/setFields (stages 5/6); before that 0/alpha.c4 is still 0 from 0.orig
 exec > >(tee log.stageVerification) 2>&1
 stage_check () {
@@ -185,6 +242,15 @@ stage_check () {
 }
 stage_check "1_after_restore_0_from_0.orig"
 """
+            if use_ig_source_check:
+                # Retarget the same diagnostics at the IG fields; leaving them pointed
+                # at alpha.c4 would report a permanent FAIL on a healthy IG case.
+                stage_verification = (
+                    stage_verification.replace("0/alpha.c4", "0/p")
+                    .replace("check_alpha_c4.sh", "check_ig_source.sh")
+                    .replace("alpha_check", "ig_source_check")
+                )
+            script_head += stage_verification
         use_mapping = init_from_1d and mapped_source_dir_linux and mapped_source_time
         inert_continuation = use_mapping and (solver_app == "rhoCentralFoam")
         if use_mapping:
@@ -209,9 +275,20 @@ postProcess -func writeCellCentres > log.writeCellCentres 2>&1
 python3 remap_radial.py > log.remap_radial 2>&1
 """
         else:
-            # Sanity check: alpha.c4 must have at least one positive internalField value (uniform or nonuniform)
-            self._write_text(os.path.join(case_dir, "check_alpha_c4.sh"), ALPHA_C4_CHECK_SCRIPT)
-            alpha_check_block = """
+            if use_ig_source_check:
+                # No explosive phase exists, so gate on a non-empty burst sphere in 0/p.
+                self._write_text(
+                    os.path.join(case_dir, "check_ig_source.sh"),
+                    ig_source_check_script(ig_source_check_p_atm),
+                )
+                alpha_check_block = """
+# Pre-solver sanity: the ideal-gas burst sphere must have captured at least one cell
+bash ./check_ig_source.sh || exit 1
+"""
+            else:
+                # Sanity check: alpha.c4 must have at least one positive internalField value (uniform or nonuniform)
+                self._write_text(os.path.join(case_dir, "check_alpha_c4.sh"), ALPHA_C4_CHECK_SCRIPT)
+                alpha_check_block = """
 # Pre-solver sanity: alpha.c4 must have at least one positive value (no explosive mass -> blastFoam "No mass was found in the domain")
 bash ./check_alpha_c4.sh || exit 1
 """

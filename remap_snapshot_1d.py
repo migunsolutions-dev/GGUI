@@ -192,6 +192,7 @@ def _completion_info(case_dir: str) -> Dict[str, Any]:
             "dr_1d_m": None,
             "remap_front_buffer_cells": None,
             "handoff_radius_m": None,
+            "source_model": SOURCE_MODEL_JWL,
         }
     try:
         from completion_1d import read_completion_record
@@ -215,6 +216,7 @@ def _completion_info(case_dir: str) -> Dict[str, Any]:
             "dr_1d_m": record.dr_1d_m,
             "remap_front_buffer_cells": record.remap_front_buffer_cells,
             "handoff_radius_m": record.handoff_radius_m,
+            "source_model": normalize_source_model(record.source_model),
         }
     )
     return info
@@ -284,6 +286,10 @@ def write_snapshot(
         "handoff_radius_m": completion.get("handoff_radius_m"),
         "handoff_time_s": completion.get("detected_arrival_time_s") or phys,
         "source_1d_case": canonical_case_path(case_dir),
+        # A 2D/3D receiver has to know which source produced the profile: the IG
+        # state is already an ideal gas, so the JWL air-carry step does not apply.
+        "source_model": completion.get("source_model") or SOURCE_MODEL_JWL,
+        "source_model_schema_version": SOURCE_MODEL_SCHEMA_VERSION,
     }
     if extra_metadata:
         metadata.update(extra_metadata)

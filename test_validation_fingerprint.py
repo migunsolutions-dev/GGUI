@@ -121,6 +121,34 @@ class SamplingFingerprintTests(unittest.TestCase):
             self.assertIsNotNone(loaded)
             self.assertEqual(loaded.n_points, plan.n_points)
 
+    def test_jwl_plan_is_rejected_for_an_ig_run(self):
+        from models import SOURCE_MODEL_IG, SOURCE_MODEL_JWL
+
+        with tempfile.TemporaryDirectory() as td:
+            plan = stamp_plan(
+                plan_1d(mass_kg=1.0, domain_radius_m=2.0, cell_size=0.05),
+                case_path=td,
+                cell_size=0.05,
+                hob_m=0.0,
+                source_model=SOURCE_MODEL_JWL,
+            )
+            write_sampling_plan(td, plan)
+            expected = live_fingerprint(
+                dim="1d",
+                case_path=td,
+                mass_kg=1.0,
+                domain_radius_m=2.0,
+                hob_m=0.0,
+                charge_center=(0.0, 0.0, 0.0),
+                cell_size=0.05,
+                burst_mode=BURST_SPHERICAL,
+                figure=figure_id(BURST_SPHERICAL),
+                source_model=SOURCE_MODEL_IG,
+            )
+            loaded, msg = load_matching_plan(td, expected)
+            self.assertIsNone(loaded)
+            self.assertEqual(msg, SAMPLING_MISMATCH)
+
 
 if __name__ == "__main__":
     unittest.main()

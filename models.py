@@ -32,6 +32,43 @@ BOUNDARY_1D_RIGHT_OPTIONS = (
     BOUNDARY_1D_REFLECT,
 )
 
+# Blast source model. JWL detonates an explosive phase; IG replaces the charge
+# volume with a single ideal gas after adding E_charge to the ambient sensible
+# energy. Total initialized internal energy is not W*E_charge.
+SOURCE_MODEL_JWL = "JWL_DETONATION"
+SOURCE_MODEL_IG = "IG_ISOTHERMAL_BURST"
+SOURCE_MODEL_OPTIONS = (SOURCE_MODEL_JWL, SOURCE_MODEL_IG)
+SOURCE_MODEL_SCHEMA_VERSION = 1
+SOURCE_MODEL_LABELS = {
+    SOURCE_MODEL_JWL: "JWL Detonation",
+    SOURCE_MODEL_IG: "Ideal-Gas Isothermal Burst",
+}
+
+
+class SourceModelError(ValueError):
+    """Raised when a persisted source model cannot be resolved."""
+
+
+def normalize_source_model(value: Optional[str]) -> str:
+    """Resolve a stored source model. ``None``/blank means a pre-feature case, which
+    was always JWL. Anything else must match exactly so a wrong case is never generated.
+    """
+    if value is None:
+        return SOURCE_MODEL_JWL
+    text = str(value).strip()
+    if not text:
+        return SOURCE_MODEL_JWL
+    if text in SOURCE_MODEL_OPTIONS:
+        return text
+    raise SourceModelError(
+        f"Unknown blast source model {value!r}; expected one of {SOURCE_MODEL_OPTIONS}"
+    )
+
+
+def is_ideal_gas_source(value: Optional[str]) -> bool:
+    return normalize_source_model(value) == SOURCE_MODEL_IG
+
+
 RUN_MODE_TERMINATE = "terminate"
 RUN_MODE_REFLECT = "reflect"
 STOP_MODE_TERMINATE = RUN_MODE_TERMINATE
@@ -70,6 +107,8 @@ class CaseInputs1D:
     stop_radius_m: Optional[float] = None
     # True when this 1D run is a 2D/3D remap precursor (GUI "Remap? Yes").
     remap_for_2d: bool = False
+    # Defaulted so pre-feature saved models load as JWL, which is what they were.
+    source_model: str = SOURCE_MODEL_JWL
 
 @dataclass(frozen=True)
 class ObstacleData:

@@ -697,6 +697,7 @@ def expected_plan_fingerprint(
     domain_height_m: Optional[float] = None,
     remap_receive_r_max: Optional[float] = None,
     include_coordinates: bool = True,
+    source_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     domain: Dict[str, Optional[float]] = {"radius": plan.domain_r_max}
     if plan.dim == "2d":
@@ -717,6 +718,7 @@ def expected_plan_fingerprint(
         reference_mode=f"{SOURCE_UFC} Figure {plan.figure}".strip(),
         points=plan.points if include_coordinates else (),
         remap_receive_r_max=receive,
+        source_model=source_model,
     )
     if not include_coordinates:
         payload.pop("coordinates", None)
@@ -733,6 +735,7 @@ def stamp_plan(
     domain_height_m: Optional[float] = None,
     remap_receive_r_max: Optional[float] = None,
     remap_timing: Optional[Dict[str, Any]] = None,
+    source_model: Optional[str] = None,
 ) -> SamplingPlan:
     fingerprint = expected_plan_fingerprint(
         plan,
@@ -742,6 +745,7 @@ def stamp_plan(
         domain_height_m=domain_height_m,
         remap_receive_r_max=remap_receive_r_max,
         include_coordinates=True,
+        source_model=source_model,
     )
     return replace(
         attach_plan_fingerprint(plan, fingerprint),
@@ -765,6 +769,7 @@ def live_fingerprint(
     burst_mode: str = "",
     figure: str = "",
     remap_receive_r_max: Optional[float] = None,
+    source_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     domain: Dict[str, Optional[float]] = {"radius": domain_radius_m}
     if str(dim).strip().lower() == "2d":
@@ -781,6 +786,7 @@ def live_fingerprint(
         reference_mode=f"{SOURCE_UFC} Figure {figure}".strip() if figure else SOURCE_UFC,
         points=(),
         remap_receive_r_max=remap_receive_r_max,
+        source_model=source_model,
     )
     payload.pop("coordinates", None)
     payload.pop("n_points", None)

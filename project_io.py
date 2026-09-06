@@ -10,7 +10,13 @@ from types import SimpleNamespace
 from typing import Any, Dict, Protocol
 
 from charge_seed_plan import charge_dims_from_inputs, migrate_case_inputs_seed_fields
-from models import CaseInputs1D, CaseInputs3D, ObstacleData
+from models import (
+    CaseInputs1D,
+    CaseInputs3D,
+    ObstacleData,
+    SourceModelError,
+    normalize_source_model,
+)
 from models_2d import CaseInputs2D, MappingSource2D, ProbePoint2D
 from output_options import OutputFileOptions
 
@@ -522,6 +528,13 @@ def _case_inputs_1d_from_dict(data: Dict[str, Any]) -> CaseInputs1D:
                 tuple(item) if isinstance(item, list) else item
                 for item in values[key]
             )
+    # Projects saved before the IG feature have no source_model; they were JWL.
+    # An unrecognised value is an error rather than a silent fallback, because
+    # loading it as the wrong model would generate the wrong case.
+    try:
+        values["source_model"] = normalize_source_model(values.get("source_model"))
+    except SourceModelError as exc:
+        raise ProjectFormatError(str(exc)) from exc
     try:
         return CaseInputs1D(**values)
     except (TypeError, ValueError) as exc:

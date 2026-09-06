@@ -6,7 +6,28 @@ and obstacle IDs are kept where the screenshots require them.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from models import is_ideal_gas_source
+
+
+# Fields that only exist when an explosive phase is present. The Ideal-Gas
+# Isothermal Burst path is single-material, so probing these would abort the run.
+PHASE_ONLY_FOAM_FIELDS: Tuple[str, ...] = ("alpha.c4", "rho.c4", "rho.air", "lambda.c4")
+
+
+def phase_fields_available(source_model: Optional[str] = None) -> bool:
+    """False for a single-material source model, where no per-phase field exists."""
+    return not is_ideal_gas_source(source_model)
+
+
+def drop_unavailable_phase_fields(
+    names: Iterable[str], source_model: Optional[str] = None
+) -> Tuple[str, ...]:
+    """Strip phase-only field names that the given source model does not produce."""
+    if phase_fields_available(source_model):
+        return tuple(names)
+    return tuple(n for n in names if n not in PHASE_ONLY_FOAM_FIELDS)
 
 
 # Dialog row key -> OpenFOAM field name sampled by probes.
@@ -162,7 +183,9 @@ class GaugeFlags:
     peak_overpressure: bool = False
     peak_impulse: bool = False
 
-    def foam_probe_fields(self, *, always_p: bool = False) -> Tuple[str, ...]:
+    def foam_probe_fields(
+        self, *, always_p: bool = False, source_model: Optional[str] = None
+    ) -> Tuple[str, ...]:
         names: List[str] = []
         if always_p or self.overpressure or self.pressure:
             names.append("p")
@@ -183,7 +206,7 @@ class GaugeFlags:
         # Preserve order, drop duplicates.
         seen = set()
         out: List[str] = []
-        for name in names:
+        for name in drop_unavailable_phase_fields(names, source_model):
             if name not in seen:
                 seen.add(name)
                 out.append(name)
@@ -496,10 +519,15 @@ def obstacle_monitor_block(patches: Sequence[str]) -> str:
     return "\n".join(chunks) + "\n"
 
 
-def remap2d_snapshot_contents(time_value: str = "latest") -> str:
+def remap2d_snapshot_contents(
+    time_value: str = "latest", source_model: Optional[str] = None
+) -> str:
+    fields_txt = " ".join(
+        drop_unavailable_phase_fields(("p", "rho", "U", "T", "alpha.c4"), source_model)
+    )
     return (
         f"/* GGUI 2D remap snapshot ({REMAP_2D_FILENAME}) */\n"
         f"time            {time_value};\n"
         'sourceCase      ".";\n'
-        "fields          (p rho U T alpha.c4);\n"
+        f"fields          ({fields_txt});\n"
     )

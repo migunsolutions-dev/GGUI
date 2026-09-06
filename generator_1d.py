@@ -1,7 +1,10 @@
+import json
 import os
 import math
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
+import ig_source_state as igs
+import jwl_activation_energy as jwl_act
 from base_generator import BaseGenerator
 from models import (
     BOUNDARY_1D_REFLECT,
@@ -9,8 +12,10 @@ from models import (
     CaseInputs1D,
     RecommendedParams1D,
     RUN_MODE_REFLECT,
+    is_ideal_gas_source,
+    normalize_source_model,
 )
-from output_options import extra_function_objects
+from output_options import drop_unavailable_phase_fields, extra_function_objects
 from completion_1d import (
     initial_completion_record,
     normalize_run_mode,
@@ -47,18 +52,26 @@ class Generator1D(BaseGenerator):
         
         # 2. Derived Calculations
         charge_radius = self.calculate_charge_radius(inputs.mass_kg, inputs.rho_charge)
-        
+        # IG needs r_min and dx up front: the burst state depends on which radial
+        # shell the source cells occupy, so it cannot be derived per-file.
+        ig_state = self.ig_state(inputs, rec)
+
         # 3. Write Files
-        self.write_initial_conditions(case_dir, inputs)
-        
-        self.write_constant_files(
-            case_dir, 
-            inputs.material_props, 
-            inputs.energy_j_per_kg, 
-            charge_radius, 
-            self.ignition_point_in_wedge(inputs, rec),
-            rec.ignition_radius
-        )
+        self.write_initial_conditions(case_dir, inputs, ig_state)
+
+        if ig_state is not None:
+            self.write_ig_constant_files(case_dir, ig_state)
+        else:
+            self.write_constant_files(
+                case_dir,
+                inputs.material_props,
+                inputs.energy_j_per_kg,
+                charge_radius,
+                self.ignition_point_in_wedge(inputs, rec),
+                rec.ignition_radius,
+                rho_charge=float(inputs.rho_charge),
+                material_name=str(getattr(inputs, "material_name", "") or ""),
+            )
 
         val_plan = None
         try:
@@ -78,12 +91,17 @@ class Generator1D(BaseGenerator):
                     cell_size=float(inputs.cell_size),
                     hob_m=0.0,
                     domain_height_m=None,
+                    source_model=self.source_model(inputs),
                 )
             except (TypeError, ValueError):
                 pass
 
         val_radii = tuple(pt.range_m for pt in val_plan.points) if val_plan is not None else ()
-        self.write_system_files(case_dir, inputs, rec, charge_radius, validation_radii=val_radii)
+        self.write_system_files(
+            case_dir, inputs, rec, charge_radius,
+            validation_radii=val_radii,
+            ig_state=ig_state,
+        )
         self._write_completion_request(case_dir, inputs)
         if uses_remap_handoff(inputs):
             write_handoff_metadata(
@@ -96,7 +114,17 @@ class Generator1D(BaseGenerator):
             )
         
         # --- FIX: Write Scripts ---
-        self.write_scripts(case_dir, self.openfoam_bashrc)
+        self.write_scripts(
+            case_dir,
+            self.openfoam_bashrc,
+            use_ig_source_check=ig_state is not None,
+            ig_source_check_p_atm=float(inputs.p_atm),
+        )
+
+        if ig_state is not None:
+            self.write_ig_source_audit(case_dir, inputs, ig_state)
+        else:
+            self.write_jwl_energy_audit(case_dir, inputs)
 
         try:
             if val_plan is not None and val_plan.points:
@@ -109,6 +137,56 @@ class Generator1D(BaseGenerator):
         pathlib.Path(case_dir, "case.foam").touch()
         
         return case_dir
+
+    @staticmethod
+    def source_model(inputs: CaseInputs1D) -> str:
+        return normalize_source_model(getattr(inputs, "source_model", None))
+
+    @staticmethod
+    def ig_state(
+        inputs: CaseInputs1D, rec: RecommendedParams1D
+    ) -> Optional[igs.IgBurstState]:
+        """The burst state for an IG case, or ``None`` for JWL.
+
+        ``None`` is what keeps every JWL dictionary byte-identical to the pre-feature
+        generator: the IG code paths are only reachable through this object.
+        """
+        if not is_ideal_gas_source(getattr(inputs, "source_model", None)):
+            return None
+        return igs.derive_ig_state(
+            mass_kg=float(inputs.mass_kg),
+            rho_charge=float(inputs.rho_charge),
+            energy_j_per_kg=float(inputs.energy_j_per_kg),
+            p_atm=float(inputs.p_atm),
+            t_atm=float(inputs.t_atm),
+            r_min_m=float(rec.r_min),
+            cell_size_m=float(inputs.cell_size),
+        )
+
+    def write_jwl_energy_audit(self, case_dir: str, inputs: CaseInputs1D) -> None:
+        state = jwl_act.v2_activation(
+            float(inputs.energy_j_per_kg),
+            float(inputs.rho_charge),
+            material_name=str(getattr(inputs, "material_name", "") or ""),
+            dimension="1D",
+        )
+        jwl_act.write_jwl_energy_audit(
+            case_dir, state, mass_kg=float(inputs.mass_kg)
+        )
+
+    def write_ig_source_audit(
+        self, case_dir: str, inputs: CaseInputs1D, state: igs.IgBurstState
+    ) -> None:
+        """Sidecar so an old case can be identified without reading its dictionaries."""
+        payload = igs.audit_dict(
+            state,
+            case_path=case_dir,
+            material_name=str(getattr(inputs, "material_name", "") or ""),
+        )
+        self._write_text(
+            os.path.join(case_dir, "ggui_ig_source_audit.json"),
+            json.dumps(payload, indent=2, sort_keys=False) + "\n",
+        )
 
     @staticmethod
     def _run_mode(inputs: CaseInputs1D) -> str:
@@ -198,6 +276,7 @@ class Generator1D(BaseGenerator):
                 ),
                 handoff_radius_m=None if plan is None else plan["handoff_radius_m"],
                 criterion=HANDOFF_CRITERION if remap else None,
+                source_model=Generator1D.source_model(inputs),
             ),
         )
 
@@ -218,7 +297,12 @@ class Generator1D(BaseGenerator):
             r = max(float(rec.r_min), 1.0e-6)
         return self._vtx_spherical(r, theta_mid, 0.0)
 
-    def write_initial_conditions(self, case_dir: str, inputs: CaseInputs1D) -> None:
+    def write_initial_conditions(
+        self,
+        case_dir: str,
+        inputs: CaseInputs1D,
+        ig_state: Optional[igs.IgBurstState] = None,
+    ) -> None:
         # Write to 0.orig so Allrun's "cp -r 0.orig 0" restores initial conditions (same as 3D flow).
         zero_dir = os.path.join(case_dir, "0.orig")
         rho_air = 1.225
@@ -260,17 +344,69 @@ class Generator1D(BaseGenerator):
 
         self._write_text(os.path.join(zero_dir, "p"), self._foam_header("p", "volScalarField", "0") + f"dimensions [1 -1 -2 0 0 0 0]; internalField uniform {inputs.p_atm};\n" + scalar_bcs("p", inputs.p_atm))
         self._write_text(os.path.join(zero_dir, "T"), self._foam_header("T", "volScalarField", "0") + f"dimensions [0 0 0 1 0 0 0]; internalField uniform {inputs.t_atm};\n" + scalar_bcs("T", inputs.t_atm))
-        self._write_text(os.path.join(zero_dir, "rho.c4"), self._foam_header("rho.c4", "volScalarField", "0") + f"dimensions [1 -3 0 0 0 0 0]; internalField uniform {inputs.rho_charge};\n" + scalar_bcs("rho", inputs.rho_charge))
-        self._write_text(os.path.join(zero_dir, "rho.air"), self._foam_header("rho.air", "volScalarField", "0") + f"dimensions [1 -3 0 0 0 0 0]; internalField uniform {rho_air};\n" + scalar_bcs("rho", rho_air))
-        self._write_text(os.path.join(zero_dir, "alpha.c4"), self._foam_header("alpha.c4", "volScalarField", "0") + f"dimensions [0 0 0 0 0 0 0]; internalField uniform 0;\n" + scalar_bcs("alpha", 0))
+        if ig_state is not None:
+            # Single phase: one unsuffixed rho, at the EOS-consistent ambient density.
+            # A hard-coded 1.225 would contradict p_atm/T_atm away from 101325 Pa / 288 K
+            # and seed a spurious wave, because blastFoam derives e from p and rho.
+            rho_atm = ig_state.ambient.rho
+            self._write_text(os.path.join(zero_dir, "rho"), self._foam_header("rho", "volScalarField", "0") + f"dimensions [1 -3 0 0 0 0 0]; internalField uniform {rho_atm:.12g};\n" + scalar_bcs("rho", rho_atm))
+        else:
+            self._write_text(os.path.join(zero_dir, "rho.c4"), self._foam_header("rho.c4", "volScalarField", "0") + f"dimensions [1 -3 0 0 0 0 0]; internalField uniform {inputs.rho_charge};\n" + scalar_bcs("rho", inputs.rho_charge))
+            self._write_text(os.path.join(zero_dir, "rho.air"), self._foam_header("rho.air", "volScalarField", "0") + f"dimensions [1 -3 0 0 0 0 0]; internalField uniform {rho_air};\n" + scalar_bcs("rho", rho_air))
+            self._write_text(os.path.join(zero_dir, "alpha.c4"), self._foam_header("alpha.c4", "volScalarField", "0") + f"dimensions [0 0 0 0 0 0 0]; internalField uniform 0;\n" + scalar_bcs("alpha", 0))
         self._write_text(os.path.join(zero_dir, "U"), self._foam_header("U", "volVectorField", "0") + f"dimensions [0 1 -1 0 0 0 0]; internalField uniform (0 0 0);\n" + vector_bcs())
 
-    def write_constant_files(self, case_dir: str, mat_props: Dict, energy: float, charge_radius: float, ignition_point: Tuple, ignition_radius: float) -> None:
+    def write_ig_constant_files(self, case_dir: str, state: igs.IgBurstState) -> None:
+        """Single-material ideal gas, in the form blastFoam's own Sedov case uses.
+
+        Omitting the ``phases`` entry is what selects the single-phase path:
+        ``compressibleSystemNew`` reads ``phases`` with a default of an empty list and
+        builds ``singlePhaseCompressibleSystem`` when fewer than two are present. A
+        confirmation run logs ``Selecting thermodynamics package
+        fluid<basic<const<eConst<idealGas<specie>>>>>`` -- ``fluid<basic<...>>`` rather
+        than a two-phase package. There is no activation model and no detonation point,
+        because the charge is already fully detonated at t = 0.
+        """
+        const_dir = os.path.join(case_dir, "constant")
+        self._write_text(
+            os.path.join(const_dir, "turbulenceProperties"),
+            self._foam_header("turbulenceProperties", "dictionary", "constant")
+            + "simulationType laminar;\n",
+        )
+
+        pp_content = self._foam_header("phaseProperties", "dictionary", location="constant") + f"""
+type            basic;
+thermoType {{ transport const; thermo eConst; equationOfState idealGas; }}
+equationOfState {{ gamma {state.ambient.gamma:.10g}; }}
+specie          {{ molWeight 28.97; }}
+transport       {{ mu 0; Pr 1; }}
+thermodynamics  {{ Cv {state.ambient.cv:.10g}; Hf 0; }}
+"""
+        self._write_text(os.path.join(const_dir, "phaseProperties"), pp_content)
+        self._write_text(
+            os.path.join(const_dir, "dynamicMeshDict"),
+            self._foam_header("dynamicMeshDict", "dictionary", "constant")
+            + "dynamicFvMesh staticFvMesh;\n",
+        )
+
+    def write_constant_files(
+        self,
+        case_dir: str,
+        mat_props: Dict,
+        energy: float,
+        charge_radius: float,
+        ignition_point: Tuple,
+        ignition_radius: float,
+        rho_charge: Optional[float] = None,
+        material_name: str = "",
+    ) -> None:
         const_dir = os.path.join(case_dir, "constant")
         self._write_text(os.path.join(const_dir, "turbulenceProperties"), 
                          self._foam_header("turbulenceProperties", "dictionary", "constant") + "simulationType laminar;\n")
 
         ign_str = f"({ignition_point[0]:.10g} {ignition_point[1]:.10g} {ignition_point[2]:.10g})"
+        rho0 = float(rho_charge) if rho_charge is not None else float(mat_props["rho"])
+        act = jwl_act.v2_activation(energy, rho0, material_name=material_name, dimension="1D")
         
         pp_content = self._foam_header("phaseProperties", "dictionary", location="constant") + f"""
 phases (c4 air);
@@ -280,7 +416,7 @@ c4
     reactants
     {{
         thermoType {{ transport const; thermo eConst; equationOfState BirchMurnaghan3; }}
-        equationOfState {{ rho0 {mat_props['rho']}; Gamma 0.25; pRef 101298; K0 8.04e9; K0Prime 7.97; }}
+        equationOfState {{ rho0 {rho0:.12g}; Gamma 0.25; pRef 101298; K0 8.04e9; K0Prime 7.97; }}
         specie {{ molWeight 55.0; }}
         transport {{ mu 0; Pr 1; }}
         thermodynamics {{ Cv 1400; Hf 0.0; }}
@@ -290,7 +426,7 @@ c4
         thermoType {{ transport const; thermo ePolynomial; equationOfState JWL; }}
         equationOfState 
         {{ 
-            rho0 {mat_props['rho']}; 
+            rho0 {rho0:.12g}; 
             A {mat_props['A']}; B {mat_props['B']}; 
             R1 {mat_props['R1']}; R2 {mat_props['R2']}; omega {mat_props['omega']}; 
         }}
@@ -301,7 +437,7 @@ c4
     activationModel pressureBased;
     initiation
     {{
-        E0 {energy}; 
+        E0 {act.E0_pa:.12g}; 
         I 4.0e6; a 0.0367; b 0.667; x 7.0; maxLambdaI 0.022;
         G1 1.4997e-7; c 0.667; d 0.33; y 2.0; minLambda1 0.022;
         G2 0.0; e 0.667; f 0.667; z 3.0; minLambda2 0.022;
@@ -335,6 +471,7 @@ air
         rec: RecommendedParams1D,
         charge_radius: float,
         validation_radii: Tuple[float, ...] = (),
+        ig_state: Optional[igs.IgBurstState] = None,
     ) -> None:
         sys_dir = os.path.join(case_dir, "system")
         # Remap: user radius is the physical outer limit. Standalone Terminate
@@ -412,7 +549,22 @@ PIMPLE { nCorrectors 3; nNonOrthogonalCorrectors 0; }
 """
         self._write_text(os.path.join(sys_dir, "fvSolution"), fv_sol)
 
-        fv_sch = self._foam_header("fvSchemes", "dictionary", "system") + r"""
+        if ig_state is not None:
+            # No alpha.c4 and no lambda.c4 exist on the single-phase path, so their
+            # scheme entries are dropped. `divSchemes { default none; }` alone is
+            # accepted: the confirmation run completed with no unresolved-scheme error,
+            # because the single-phase system takes all its fluxes from fluxScheme.
+            fv_sch = self._foam_header("fvSchemes", "dictionary", "system") + r"""
+fluxScheme      Tadmor;
+ddtSchemes      { default Euler; timeIntegrator Euler; }
+gradSchemes     { default cellMDLimited leastSquares 1.0; }
+divSchemes      { default none; }
+laplacianSchemes { default Gauss linear corrected; }
+interpolationSchemes { default linear; "reconstruct(rho)" vanLeer; "reconstruct(U)" vanLeer; "reconstruct(e)" vanLeer; "reconstruct(p)" vanLeer; "reconstruct(T)" vanLeer; "reconstruct(speedOfSound)" vanLeer; }
+snGradSchemes   { default corrected; }
+"""
+        else:
+            fv_sch = self._foam_header("fvSchemes", "dictionary", "system") + r"""
 fluxScheme      Tadmor;
 ddtSchemes      { default Euler; timeIntegrator Euler; }
 gradSchemes     { default cellMDLimited leastSquares 1.0; }
@@ -423,7 +575,16 @@ snGradSchemes   { default corrected; }
 """
         self._write_text(os.path.join(sys_dir, "fvSchemes"), fv_sch)
 
-        sf = self._foam_header("setFieldsDict", "dictionary", "system") + f"""
+        if ig_state is not None:
+            # The burst radius is snapped to a cell face, so sphereToCell selects
+            # exactly n_source_cells whichever way OpenFOAM places cell centres.
+            # p and rho are the only fields set; blastFoam derives e and T from them.
+            sf = self._foam_header("setFieldsDict", "dictionary", "system") + f"""
+defaultFieldValues ( volScalarFieldValue rho {ig_state.ambient.rho:.12g} volScalarFieldValue p {float(inputs.p_atm):.10g} );
+regions ( sphereToCell {{ centre (0 0 0); radius {ig_state.shell.set_fields_radius_m:.12g}; fieldValues ( volScalarFieldValue rho {ig_state.rho_source:.12g} volScalarFieldValue p {ig_state.p_source:.12g} ); }} );
+"""
+        else:
+            sf = self._foam_header("setFieldsDict", "dictionary", "system") + f"""
 defaultFieldValues ( volScalarFieldValue alpha.c4 0 );
 regions ( sphereToCell {{ centre (0 0 0); radius {float(charge_radius):.10g}; fieldValues ( volScalarFieldValue alpha.c4 1 ); }} );
 """
@@ -436,6 +597,12 @@ regions ( sphereToCell {{ centre (0 0 0); radius {float(charge_radius):.10g}; fi
         field_write_interval = user_write if user_write > 0.0 else end_time
         probe_steps = max(1, int(inputs.probe_write_interval_steps))
         foam_fields = tuple(getattr(inputs, "probe_fields", ("p",)) or ("p",))
+        # Authoritative guard: the Output Options dialog does not know the source
+        # model, so a stale alpha.c4 request would abort an IG run at the first
+        # probe write. Filter here, where the model is certain.
+        foam_fields = drop_unavailable_phase_fields(
+            foam_fields, self.source_model(inputs)
+        ) or ("p",)
         if "p" not in foam_fields:
             foam_fields = ("p",) + foam_fields
         fields_txt = " ".join(foam_fields)

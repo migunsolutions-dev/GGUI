@@ -20,6 +20,7 @@ from initialization_plan import (
     outer_band_level_string,
 )
 from mesh_domain import align_domain_to_cell_size
+import jwl_activation_energy as jwl_act
 from material_catalog import jwl_parameters
 from models import CaseInputs3D
 from output_options import extra_function_objects, obstacle_monitor_block, section_plane_point, surfaces_vtk_block
@@ -2089,7 +2090,13 @@ dumpLevel      true;
         eos = f"equationOfState {{ rho0 {inputs.rho_charge}; A {j['A']:.4g}; B {j['B']:.4g}; R1 {j['R1']}; R2 {j['R2']}; omega {j['omega']}; }}"
         cv_coeffs = j.get("CvCoeffs", (413.15, 2.1538))
         thermo = f"thermodynamics {{ CvCoeffs<8> ({cv_coeffs[0]} {cv_coeffs[1]} 0 0 0 0 0 0); Sf 0.0; Hf 0.0; }}"
-        e0_val = j["E0"]
+        act = jwl_act.v2_activation(
+            float(inputs.energy_j_per_kg),
+            float(inputs.rho_charge),
+            material_name=str(inputs.material_name or ""),
+            dimension="3D",
+        )
+        e0_val = act.E0_pa
 
         remap_enabled = getattr(inputs, "remap_enabled", False)
         R_charge = dims.get("radius", 0.05)
@@ -2164,7 +2171,7 @@ c4
     activationModel {"none" if remap_enabled else (getattr(inputs, "activation_model_ui", None) or "pressureBased")};
     initiation
     {{
-        E0 {e0_val}; I 4.0e6; a 0.0367; b 0.667; x 7.0; maxLambdaI 0.022;
+        E0 {e0_val:.12g}; I 4.0e6; a 0.0367; b 0.667; x 7.0; maxLambdaI 0.022;
         G1 1.4997e-7; c 0.667; d 0.33; y 2.0; minLambda1 0.022;
         G2 0.0; e 0.667; f 0.667; z 3.0; minLambda2 0.022;
         pMin {inputs.p_atm};
@@ -2184,6 +2191,9 @@ air
 }}
 """
         self._write_text(os.path.join(const_dir, "phaseProperties"), pp_content)
+        jwl_act.write_jwl_energy_audit(
+            case_dir, act, mass_kg=float(inputs.mass_kg)
+        )
 
     def _build_set_fields_dict_3d(
         self, inputs: CaseInputs3D, dims: Dict[str, float],
