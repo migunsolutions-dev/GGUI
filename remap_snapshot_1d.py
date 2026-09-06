@@ -178,6 +178,8 @@ def _as_1d(values, name: str) -> np.ndarray:
 
 
 def _completion_info(case_dir: str) -> Dict[str, Any]:
+    from models import SOURCE_MODEL_JWL, normalize_source_model
+
     info: Dict[str, Any] = {
         "mode": "",
         "stop_reason": "",
@@ -230,6 +232,8 @@ def write_snapshot(
     extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Write npz + json. *arrays* must include r, p, T, U_mag."""
+    from models import SOURCE_MODEL_JWL, SOURCE_MODEL_SCHEMA_VERSION
+
     packed = {name: _as_1d(values, name) for name, values in arrays.items()}
     n = packed["r"].size
     for name in REQUIRED_ARRAYS:

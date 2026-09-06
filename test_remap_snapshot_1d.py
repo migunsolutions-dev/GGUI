@@ -11,6 +11,7 @@ import numpy as np
 
 from axisymmetric_2d import REMAP_SOURCE, validate_mapping_source
 from completion_1d import (
+    COMPLETION_FILENAME,
     RUN_MODE_REFLECT,
     RUN_MODE_TERMINATE,
     STOP_REASON_END_TIME_REACHED,
@@ -19,6 +20,7 @@ from completion_1d import (
     reset_completion_for_new_run,
     write_completion_record,
 )
+from models import SOURCE_MODEL_IG, SOURCE_MODEL_JWL, SOURCE_MODEL_SCHEMA_VERSION
 from generator_2d import Generator2D
 from generator_3d import Generator3D
 from models_2d import CaseInputs2D, MappingSource2D
@@ -30,6 +32,7 @@ from remap_snapshot_1d import (
     SNAPSHOT_NPZ,
     SOURCE_OPENFOAM,
     SOURCE_SNAPSHOT,
+    _completion_info,
     availability_for_case,
     canonical_case_path,
     declared_remap_radius_m,
@@ -127,6 +130,15 @@ def _arrived_completion(case_dir: str, final_t: float = FINAL_T) -> CompletionRe
     )
     write_completion_record(case_dir, record)
     return record
+
+
+def _snapshot_arrays(n: int = 6) -> dict:
+    return {
+        "r": np.linspace(0.0, 1.0, n),
+        "p": np.full(n, 2.0e5),
+        "T": np.full(n, 300.0),
+        "U_mag": np.zeros(n),
+    }
 
 
 def _mapping_inputs(case_dir: str) -> CaseInputs2D:
@@ -677,6 +689,59 @@ class RemapSnapshot1DTests(unittest.TestCase):
             notes = transfer_limit_notes(td, 0.6)
             self.assertTrue(any("R_remap = 0.6" in item for item in notes))
             self.assertFalse(any("Remap = No" in item for item in notes))
+
+    def test_write_snapshot_records_source_model_for_legacy_jwl_and_ig(self):
+        cases = (
+            ("legacy", None, SOURCE_MODEL_JWL),
+            ("jwl", SOURCE_MODEL_JWL, SOURCE_MODEL_JWL),
+            ("ig", SOURCE_MODEL_IG, SOURCE_MODEL_IG),
+        )
+        for name, stored_model, expected in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as td:
+                    if stored_model is None:
+                        with open(
+                            os.path.join(td, COMPLETION_FILENAME),
+                            "w",
+                            encoding="utf-8",
+                            newline="\n",
+                        ) as handle:
+                            json.dump(
+                                {
+                                    "mode": RUN_MODE_TERMINATE,
+                                    "stop_reason": STOP_REASON_WAVE_RADIUS_REACHED,
+                                    "wave_radius_reached": True,
+                                    "final_solver_time_s": FINAL_T,
+                                },
+                                handle,
+                            )
+                    else:
+                        write_completion_record(
+                            td,
+                            CompletionRecord(
+                                mode=RUN_MODE_TERMINATE,
+                                stop_reason=STOP_REASON_WAVE_RADIUS_REACHED,
+                                wave_radius_reached=True,
+                                final_solver_time_s=FINAL_T,
+                                source_model=stored_model,
+                            ),
+                        )
+                    info = _completion_info(td)
+                    self.assertEqual(info["source_model"], expected)
+                    metadata = write_snapshot(
+                        td, _snapshot_arrays(), physical_time=FINAL_T
+                    )
+                    self.assertEqual(metadata["source_model"], expected)
+                    self.assertEqual(
+                        metadata["source_model_schema_version"],
+                        SOURCE_MODEL_SCHEMA_VERSION,
+                    )
+                    stored = read_snapshot_metadata(td)
+                    self.assertEqual(stored["source_model"], expected)
+                    self.assertEqual(
+                        stored["source_model_schema_version"],
+                        SOURCE_MODEL_SCHEMA_VERSION,
+                    )
 
 
 if __name__ == "__main__":
