@@ -73,6 +73,25 @@ class TabValidationTests(unittest.TestCase):
         self.assertEqual(tab.tbl_gauges.horizontalHeaderItem(0).text(), "ID")
         self.assertEqual(tab.tbl_gauges.columnCount(), 5)
 
+    def test_mode_switch_drops_previous_plot_series(self):
+        tab = self._tab(RunSnapshot(mass_kg=1.0, material_name="TNT"))
+        tab._redraw()
+        right = tab.plot_canvas.axes.twinx()
+        right.plot([0.0, 1.0], [1.0, 2.0], label="BF Impulse")
+        self.assertEqual(len(tab.plot_canvas.figure.axes), 2)
+        tab.combo_mode.setCurrentText(MODE_CONWEP)
+        tab._on_mode_changed(MODE_CONWEP)
+        tab._redraw()
+        self.assertEqual(len(tab.plot_canvas.figure.axes), 1)
+        labels = [line.get_label() for line in tab.plot_canvas.axes.get_lines()]
+        self.assertNotIn("BF Impulse", labels)
+        tab.combo_mode.setCurrentText(MODE_KB)
+        tab._on_mode_changed(MODE_KB)
+        tab._redraw()
+        labels = [line.get_label() for line in tab.plot_canvas.axes.get_lines()]
+        self.assertNotIn("BF Impulse", labels)
+        self.assertEqual(len(tab.plot_canvas.figure.axes), 1)
+
     def test_mode_switch_hides_gauges_except_kb_conwep(self):
         tab = self._tab()
         tab.combo_mode.setCurrentText(MODE_CONWEP)
@@ -223,6 +242,11 @@ class TabValidationTests(unittest.TestCase):
         self.assertGreater(tab.table.rowCount(), 0)
         self.assertTrue(tab.radio_kb_log.isChecked())
         self.assertEqual(tab.plot_canvas.axes.get_xscale(), "log")
+        x_fmt = tab.plot_canvas.axes.xaxis.get_major_formatter()
+        self.assertEqual(x_fmt.format_data(1.0), "1")
+        self.assertEqual(x_fmt.format_data(10.0), "10")
+        self.assertNotIn("^", x_fmt.format_data(10.0))
+        self.assertNotIn("e", x_fmt.format_data(10.0).lower())
         self.assertIn("Automatic points", tab.lbl_kb_info.text())
         self.assertFalse(tab.stack_mode.isAncestorOf(tab.lbl_kb_info))
         self.assertTrue(tab._summary_host.isVisible())
@@ -255,6 +279,74 @@ class TabValidationTests(unittest.TestCase):
         self.assertLess(tab._plot_host.height(), plot_before)
         self.assertLessEqual(tab._plot_host.height(), VALIDATION_PLOT_MIN_HEIGHT + 8)
         self.assertGreaterEqual(tab.table.height(), VALIDATION_TABLE_BAND_HEIGHT - 8)
+
+    def test_radius_termination_enables_kb_probe_comparison(self):
+        from completion_1d import (
+            RUN_MODE_TERMINATE,
+            STOP_REASON_USER_STOPPED,
+            STOP_REASON_WAVE_RADIUS_REACHED,
+            CompletionRecord,
+            write_completion_record,
+        )
+
+        tab = self._tab(RunSnapshot(p_atm=101325.0))
+        n = 20
+        t_end = 0.01
+        times = [t_end * i / (n - 1) for i in range(n)]
+        p_atm = 101325.0
+        peak = 2.0e5
+        t_arr, t_pos = 0.002, 0.007
+        pressure, impulse, acc = [], [], 0.0
+        dt = times[1] - times[0]
+        for t in times:
+            if t < t_arr:
+                over = 0.0
+            elif t <= t_pos:
+                frac = (t - t_arr) / (t_pos - t_arr)
+                over = peak * max(0.0, 1.0 - 0.5 * frac)
+            else:
+                over = -500.0
+            pressure.append(p_atm + over)
+            if over > 0.0:
+                acc += over * dt
+            impulse.append(acc)
+        with tempfile.TemporaryDirectory() as case:
+            os.makedirs(os.path.join(case, "system"))
+            with open(os.path.join(case, "system", "controlDict"), "w", encoding="utf-8") as handle:
+                handle.write("endTime 1.0;\n")
+            _end, reached = tab._case_end_state(case, t_end)
+            self.assertFalse(reached)
+            blocked = tab._assess_probe_series(times, pressure, impulse, case)
+            self.assertFalse(blocked[3])
+            self.assertIn("endtime", blocked[2].lower())
+            write_completion_record(
+                case,
+                CompletionRecord(
+                    mode=RUN_MODE_TERMINATE,
+                    stop_reason=STOP_REASON_USER_STOPPED,
+                    wave_radius_reached=False,
+                ),
+            )
+            _end, reached = tab._case_end_state(case, t_end)
+            self.assertFalse(reached)
+            write_completion_record(
+                case,
+                CompletionRecord(
+                    mode=RUN_MODE_TERMINATE,
+                    stop_reason=STOP_REASON_WAVE_RADIUS_REACHED,
+                    wave_radius_reached=True,
+                    detected_arrival_time_s=t_end,
+                ),
+            )
+            _end, reached = tab._case_end_state(case, t_end)
+            self.assertTrue(reached)
+            peak_pa, impulse_pa_s, reason, comparable = tab._assess_probe_series(
+                times, pressure, impulse, case
+            )
+        self.assertTrue(comparable)
+        self.assertIsNotNone(peak_pa)
+        self.assertIsNotNone(impulse_pa_s)
+        self.assertNotIn("endtime", reason.lower())
 
     def test_range_vs_z_and_log_linear_are_display_only(self):
         snap = RunSnapshot(

@@ -7,6 +7,7 @@ import os
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from matplotlib.ticker import FuncFormatter, NullFormatter
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -128,6 +129,20 @@ VALIDATION_TABLE_BAND_HEIGHT = 180
 VALIDATION_SUMMARY_MIN_HEIGHT = 120
 VALIDATION_SUMMARY_MAX_HEIGHT = 190
 MODE_NUMERICAL = "Numerical"
+
+
+def _plain_axis_number(value, _pos=None) -> str:
+    """Tick text as a plain number, never 10^n or 1eN."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(number):
+        return ""
+    text = f"{number:.8g}"
+    if "e" in text.lower():
+        text = f"{number:.8f}".rstrip("0").rstrip(".")
+    return text or "0"
 
 ERROR_TOOLTIP = (
     "Error % = (BF - Reference) / Reference * 100. "
@@ -1050,7 +1065,19 @@ class TabValidation(QWidget):
             from validation.history_quality import run_reached_end_time
 
             reached = run_reached_end_time(last_time_s=last_time, end_time_s=end_time, reached_end=reached)
+        # Terminate-at-radius is a successful 1D finish. Probe histories from that
+        # stop are eligible for Kingery-Bulmash even though endTime was only an upper bound.
+        if reached is not True and self._radius_termination_complete(case):
+            reached = True
         return end_time, reached
+
+    def _radius_termination_complete(self, case: str) -> bool:
+        try:
+            from completion_1d import read_completion_record, wave_radius_stop_is_success
+        except Exception:
+            return False
+        record = read_completion_record(case)
+        return record is not None and wave_radius_stop_is_success(record)
 
     def _assess_probe_series(
         self,
@@ -1250,9 +1277,19 @@ class TabValidation(QWidget):
         else:
             self.lbl_status.setStyleSheet(INFO_STATUS_STYLE)
 
+    def _reset_plot_canvas(self) -> None:
+        """Drop twin axes and previous series before a mode draws its own figure."""
+        fig = self.plot_canvas.figure
+        for ax in list(fig.axes):
+            ax.set_xscale("linear")
+            ax.set_yscale("linear")
+        fig.clear()
+        self.plot_canvas.axes = fig.add_subplot(111)
+
     def _redraw(self) -> None:
         mode = self._mode()
         self._set_status("")
+        self._reset_plot_canvas()
         if mode == MODE_KB:
             self._draw_kb()
         elif mode == MODE_CONWEP:
@@ -1589,6 +1626,9 @@ class TabValidation(QWidget):
         if log_scale:
             ax.set_xscale("log")
             ax.set_yscale("log")
+            # Distance ticks are plain numbers (1, 10), not powers of ten.
+            ax.xaxis.set_major_formatter(FuncFormatter(_plain_axis_number))
+            ax.xaxis.set_minor_formatter(NullFormatter())
         else:
             ax.set_xscale("linear")
             ax.set_yscale("linear")
