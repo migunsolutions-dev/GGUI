@@ -24,6 +24,8 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QScrollArea,
+    QSizePolicy,
     QSlider,
     QSplitter,
     QStackedWidget,
@@ -118,6 +120,13 @@ MODE_KB = "Kingery-Bulmash"
 MODE_CONWEP = "CONWEP"
 MODE_HOB = "HOB / Single Reflection"
 MODE_REMAP = "Remap Validation"
+# Plot band can be dragged or window-shrunk down to this floor.
+VALIDATION_PLOT_MIN_HEIGHT = 48
+# Results table keeps the lower band (red-line split) while the plot shrinks.
+VALIDATION_TABLE_MIN_HEIGHT = 96
+VALIDATION_TABLE_BAND_HEIGHT = 180
+VALIDATION_SUMMARY_MIN_HEIGHT = 120
+VALIDATION_SUMMARY_MAX_HEIGHT = 190
 MODE_NUMERICAL = "Numerical"
 
 ERROR_TOOLTIP = (
@@ -255,6 +264,8 @@ class TabValidation(QWidget):
         self._schedule_redraw()
 
     def _build_ui(self) -> None:
+        self.setMinimumSize(0, 0)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
@@ -294,8 +305,13 @@ class TabValidation(QWidget):
     def _build_left(self) -> QWidget:
         page = QWidget()
         page.setMinimumWidth(COMPUTATIONAL_LEFT_PANEL_MIN)
+        page.setMinimumHeight(0)
+        page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
+        controls = QWidget()
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
         self.grp_sampling = QGroupBox("Sampling")
         samp = QVBoxLayout(self.grp_sampling)
         self.radio_auto_points = QRadioButton("Automatic Validation Points")
@@ -319,9 +335,9 @@ class TabValidation(QWidget):
             dim_row.addWidget(chk)
         dim_row.addStretch(1)
         samp.addLayout(dim_row)
-        layout.addWidget(self.grp_sampling)
+        controls_layout.addWidget(self.grp_sampling)
         self.grp_gauges = self._build_gauges()
-        layout.addWidget(self.grp_gauges)
+        controls_layout.addWidget(self.grp_gauges)
         self.stack_mode = QStackedWidget()
         self.page_kb = self._build_kb_controls()
         self.page_conwep = self._build_conwep_controls()
@@ -330,7 +346,33 @@ class TabValidation(QWidget):
         self.page_num = self._build_numerical_controls()
         for page_w in (self.page_kb, self.page_conwep, self.page_hob, self.page_remap, self.page_num):
             self.stack_mode.addWidget(page_w)
-        layout.addWidget(self.stack_mode, 1)
+        controls_layout.addWidget(self.stack_mode, 1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setMinimumHeight(0)
+        scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        scroll.setWidget(controls)
+        self._left_scroll = scroll
+        layout.addWidget(scroll, 1)
+        self.lbl_kb_info = QLabel("")
+        self.lbl_kb_info.setWordWrap(True)
+        self.lbl_kb_info.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.lbl_kb_info.setStyleSheet(SECONDARY_INFO_STYLE)
+        self.lbl_kb_info.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        summary = QScrollArea()
+        summary.setWidgetResizable(True)
+        summary.setFrameShape(QScrollArea.NoFrame)
+        summary.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        summary.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        summary.setMinimumHeight(VALIDATION_SUMMARY_MIN_HEIGHT)
+        summary.setMaximumHeight(VALIDATION_SUMMARY_MAX_HEIGHT)
+        summary.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        summary.setWidget(self.lbl_kb_info)
+        self._summary_host = summary
+        layout.addWidget(summary, 0)
         return page
 
     def _build_gauges(self) -> QGroupBox:
@@ -425,10 +467,6 @@ class TabValidation(QWidget):
         sc_l.addWidget(self.radio_kb_log)
         sc_l.addWidget(self.radio_kb_lin)
         layout.addWidget(sc_box)
-        self.lbl_kb_info = QLabel("")
-        self.lbl_kb_info.setWordWrap(True)
-        self.lbl_kb_info.setStyleSheet(SECONDARY_INFO_STYLE)
-        layout.addWidget(self.lbl_kb_info)
         layout.addStretch(1)
         return w
 
@@ -602,19 +640,45 @@ class TabValidation(QWidget):
 
     def _build_right(self) -> QWidget:
         page = QWidget()
+        page.setMinimumHeight(0)
+        page.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.spatial_canvas = MplCanvas(self, width=6, height=3, dpi=100)
+        layout.setSpacing(0)
+        plots = QWidget()
+        plots.setMinimumHeight(VALIDATION_PLOT_MIN_HEIGHT)
+        plots.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        plots_layout = QVBoxLayout(plots)
+        plots_layout.setContentsMargins(0, 0, 0, 0)
+        plots_layout.setSpacing(4)
+        self.spatial_canvas = MplCanvas(
+            self, width=6, height=3, dpi=100, min_height=VALIDATION_PLOT_MIN_HEIGHT
+        )
         self.spatial_canvas.tight_layout_rect = (0.0, 0.0, 1.0, 1.0)
-        self.plot_canvas = MplCanvas(self, width=6, height=4, dpi=100)
+        self.plot_canvas = MplCanvas(
+            self, width=6, height=4, dpi=100, min_height=VALIDATION_PLOT_MIN_HEIGHT
+        )
         self.plot_canvas.tight_layout_rect = (0.08, 0.12, 0.98, 0.92)
         self.spatial_canvas.hide()
-        layout.addWidget(self.spatial_canvas, 1)
-        layout.addWidget(self.plot_canvas, 1)
+        plots_layout.addWidget(self.spatial_canvas, 1)
+        plots_layout.addWidget(self.plot_canvas, 1)
         self.table = QTableWidget(0, 1)
         self.table.setToolTip(ERROR_TOOLTIP)
         self.table.verticalHeader().setVisible(False)
-        layout.addWidget(self.table, 0)
+        self.table.setMinimumHeight(VALIDATION_TABLE_MIN_HEIGHT)
+        self.table.setMinimumWidth(0)
+        self.table.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        splitter = QSplitter(Qt.Vertical)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(6)
+        splitter.addWidget(plots)
+        splitter.addWidget(self.table)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([800, VALIDATION_TABLE_BAND_HEIGHT])
+        self._plot_host = plots
+        self._right_splitter = splitter
+        layout.addWidget(splitter, 1)
         return page
 
     def _mode(self) -> str:
@@ -1199,6 +1263,8 @@ class TabValidation(QWidget):
             self._draw_remap()
         else:
             self._draw_numerical()
+        if mode != MODE_KB:
+            self._update_persistent_summary()
 
     def _bf_peak_impulse(self, row: GaugeRow) -> Tuple[Optional[float], Optional[float], str, bool]:
         case = case_dir_for_dim(self._snapshot, row.dim)
@@ -1526,6 +1592,55 @@ class TabValidation(QWidget):
         else:
             ax.set_xscale("linear")
             ax.set_yscale("linear")
+
+    def _summary_charge_mass(self, mass: Optional[float] = None) -> str:
+        charge = self._snapshot.material_name or "—"
+        if mass is None:
+            raw = self._snapshot.mass_kg
+            mass_txt = (
+                f"{float(raw):.4g} kg"
+                if is_finite_number(raw) and float(raw) > 0.0
+                else "—"
+            )
+        else:
+            mass_txt = f"{float(mass):.4g} kg"
+        return f"Charge: {charge}\nMass: {mass_txt}"
+
+    def _update_persistent_summary(self) -> None:
+        """Bottom-left run summary, kept outside the mode stack so every mode shows it."""
+        mode = self._mode()
+        if mode == MODE_CONWEP:
+            src = self.lbl_cw_standoff_src.text().strip()
+            extra = f"\n{src}" if src else ""
+            self.lbl_kb_info.setText(
+                f"{self._summary_charge_mass(float(self.spin_cw_mass.value()))}\n"
+                f"Standoff: {float(self.spin_cw_standoff.value()):.4g} m\n"
+                f"Pressure type: {self.combo_cw_ptype.currentText()}\n"
+                "Reference: CONWEP scalars (Swisdak 1994). Waveform: N/A"
+                f"{extra}"
+            )
+            return
+        if mode == MODE_HOB:
+            source = "2D Axisymmetric" if self.radio_hob_2d.isChecked() else "3D Section"
+            self.lbl_kb_info.setText(
+                f"{self._summary_charge_mass()}\n"
+                f"Source: {source}\n"
+                f"Validation: {self.combo_hob_kind.currentText()}"
+            )
+            return
+        if mode == MODE_REMAP:
+            self.lbl_kb_info.setText(
+                f"{self._summary_charge_mass()}\n"
+                f"Remap: {self.combo_remap_mode.currentText()}\n"
+                f"Field: {self.combo_remap_field.currentText()}\n"
+                f"{self.lbl_remap_times.text()}"
+            )
+            return
+        self.lbl_kb_info.setText(
+            f"{self._summary_charge_mass()}\n"
+            "Diagnostics: solver log, checkMesh, Output File Options\n"
+            f"Plot: {self.combo_num_plot.currentText()}"
+        )
 
     def _update_kb_info(self, ref_label: str, samples: list) -> None:
         charge = self._snapshot.material_name or "—"

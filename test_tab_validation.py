@@ -12,6 +12,7 @@ import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
 
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication
 
 from models_2d import ProbePoint2D
@@ -22,6 +23,8 @@ from tab_validation import (
     MODE_KB,
     MODE_NUMERICAL,
     MODE_REMAP,
+    VALIDATION_PLOT_MIN_HEIGHT,
+    VALIDATION_TABLE_BAND_HEIGHT,
     TabValidation,
 )
 from ui_metrics import ERROR_STATUS_STYLE, INFO_STATUS_STYLE, WARNING_STYLE
@@ -221,6 +224,37 @@ class TabValidationTests(unittest.TestCase):
         self.assertTrue(tab.radio_kb_log.isChecked())
         self.assertEqual(tab.plot_canvas.axes.get_xscale(), "log")
         self.assertIn("Automatic points", tab.lbl_kb_info.text())
+        self.assertFalse(tab.stack_mode.isAncestorOf(tab.lbl_kb_info))
+        self.assertTrue(tab._summary_host.isVisible())
+
+    def test_summary_stays_visible_in_every_mode(self):
+        tab = self._tab(RunSnapshot(mass_kg=1.0, material_name="TNT"))
+        self.assertFalse(tab.stack_mode.isAncestorOf(tab.lbl_kb_info))
+        for mode in (MODE_KB, MODE_CONWEP, MODE_HOB, MODE_REMAP, MODE_NUMERICAL):
+            tab.combo_mode.setCurrentText(mode)
+            tab._on_mode_changed(mode)
+            tab._redraw()
+            self.assertTrue(tab._summary_host.isVisible(), mode)
+            self.assertTrue(tab.lbl_kb_info.isVisible(), mode)
+            self.assertIn("Charge:", tab.lbl_kb_info.text(), mode)
+            self.assertIn("Mass:", tab.lbl_kb_info.text(), mode)
+
+    def test_plot_band_shrinks_and_table_keeps_lower_band(self):
+        tab = self._tab(RunSnapshot(mass_kg=1.0, material_name="TNT"))
+        tab.resize(1100, 860)
+        QApplication.instance().processEvents()
+        splitter = tab._right_splitter
+        self.assertEqual(splitter.orientation(), Qt.Vertical)
+        splitter.setSizes([640, VALIDATION_TABLE_BAND_HEIGHT])
+        QApplication.instance().processEvents()
+        plot_before = tab._plot_host.height()
+        self.assertGreater(plot_before, VALIDATION_PLOT_MIN_HEIGHT + 40)
+        total = sum(splitter.sizes())
+        splitter.setSizes([VALIDATION_PLOT_MIN_HEIGHT, total - VALIDATION_PLOT_MIN_HEIGHT])
+        QApplication.instance().processEvents()
+        self.assertLess(tab._plot_host.height(), plot_before)
+        self.assertLessEqual(tab._plot_host.height(), VALIDATION_PLOT_MIN_HEIGHT + 8)
+        self.assertGreaterEqual(tab.table.height(), VALIDATION_TABLE_BAND_HEIGHT - 8)
 
     def test_range_vs_z_and_log_linear_are_display_only(self):
         snap = RunSnapshot(

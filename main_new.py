@@ -494,8 +494,9 @@ class BlastFoamApp(QMainWindow):
             license_status="Active"
         )
         self._apply_default_opening_geometry()
-        # Explicitly clear any widget-driven floor so the window stays shrinkable.
-        self.setMinimumWidth(0)
+        # Explicitly clear any widget-driven floor so the window stays shrinkable
+        # in both width and height.
+        self.setMinimumSize(0, 0)
 
     def _apply_default_opening_geometry(self) -> None:
         """First-show default size ≈1685×1060, fitted inside availableGeometry.
@@ -521,8 +522,7 @@ class BlastFoamApp(QMainWindow):
 
     def minimumSizeHint(self):
         """Do not let toolbar/tab size hints impose a large top-level floor."""
-        sh = super().minimumSizeHint()
-        return QSize(0, sh.height())
+        return QSize(0, 0)
 
     def showEvent(self, event):
         # Ensure the first real show uses the review opening size even if a
@@ -642,7 +642,8 @@ class BlastFoamApp(QMainWindow):
         # ElideNone must NOT be used — it reintroduces a large top-level minimumWidth.
         self.tabs.tabBar().setUsesScrollButtons(True)
         self.tabs.tabBar().setElideMode(Qt.ElideRight)
-        self.tabs.setMinimumWidth(0)
+        self.tabs.setMinimumSize(0, 0)
+        self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
         
         # Initialize shared data models
         self.probes_model = ProbesModel()

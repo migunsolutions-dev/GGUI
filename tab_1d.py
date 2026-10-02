@@ -113,9 +113,10 @@ def _qimage_from_rgba(rgba: np.ndarray, width: int, height: int) -> QImage:
 class MplCanvas(QLabel):
     """Raster matplotlib figure. Avoids Qt5Agg OpenGL swaps that abort on Windows."""
 
-    def __init__(self, parent=None, width=5, height=4, dpi=100):
+    def __init__(self, parent=None, width=5, height=4, dpi=100, min_height=120):
         super().__init__(parent)
         self._dpi = float(dpi)
+        self._min_height = max(1, int(min_height))
         self.figure = Figure(figsize=(width, height), dpi=dpi, facecolor="white")
         self.axes = self.figure.add_subplot(111)
         self._agg = FigureCanvasAgg(self.figure)
@@ -124,17 +125,17 @@ class MplCanvas(QLabel):
         self._draw_timer.setSingleShot(True)
         self._draw_timer.setInterval(0)
         self._draw_timer.timeout.connect(self._render_to_label)
-        self.setMinimumHeight(120)
+        self.setMinimumHeight(self._min_height)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setAlignment(Qt.AlignCenter)
         self.setScaledContents(False)
         self.tight_layout_rect = None
 
     def sizeHint(self):
-        return QSize(400, 300)
+        return QSize(400, max(300, self._min_height))
 
     def minimumSizeHint(self):
-        return QSize(40, 120)
+        return QSize(40, self._min_height)
 
     def draw(self):
         self._render_to_label()

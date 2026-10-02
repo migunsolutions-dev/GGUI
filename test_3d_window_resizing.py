@@ -16,7 +16,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
 
-from PyQt5.QtCore import QRect, Qt
+from PyQt5.QtCore import QRect, QSize, Qt
 from PyQt5.QtWidgets import QApplication, QLabel
 
 from ui_metrics import STATUS_METRICS_POINT_SIZE
@@ -135,6 +135,18 @@ class Test3DWindowResizing(unittest.TestCase):
         self.status.start_et_timing()
         self.status.stop_et_timing()
         self.qapp.processEvents()
+
+    def test_window_height_and_width_can_shrink(self):
+        self.assertEqual(self.app.minimumSizeHint(), QSize(0, 0))
+        self.app.tabs.setCurrentWidget(self.app.tab_validation)
+        self.qapp.processEvents()
+        self.app.resize(1100, 520)
+        self.qapp.processEvents()
+        self.assertLessEqual(abs(self.app.width() - 1100), 40)
+        self.assertLessEqual(abs(self.app.height() - 520), 40)
+        tab = self.app.tab_validation
+        self.assertTrue(tab.lbl_kb_info.isVisible())
+        self.assertFalse(tab.stack_mode.isAncestorOf(tab.lbl_kb_info))
 
     def test_toplevel_resize_shrinks_right_keeps_left(self):
         self.app.resize(2048, 900)
