@@ -30,6 +30,16 @@ class Tab2DWorkflowTests(unittest.TestCase):
     def tearDown(self):
         self.tab.close()
 
+    def test_stop_mode_round_trip_defaults_to_end_time(self):
+        self.assertTrue(self.tab.radio_stop_end.isChecked())
+        self.assertFalse(self.tab.radio_stop_radius.isChecked())
+        self.assertEqual(self.tab.get_case_inputs().stop_mode, "end_time")
+        self.tab.radio_stop_radius.setChecked(True)
+        self.assertEqual(self.tab.get_case_inputs().stop_mode, "terminate")
+        self.tab.set_case_inputs({"stop_mode": "end_time"})
+        self.assertTrue(self.tab.radio_stop_end.isChecked())
+        self.assertEqual(self.tab.get_case_inputs().stop_mode, "end_time")
+
     def test_direct_remap_gating(self):
         self.assertTrue(self.tab.grp_charge.isEnabled())
         self.assertTrue(self.tab.spin_hob.isEnabled())

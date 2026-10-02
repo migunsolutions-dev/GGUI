@@ -51,6 +51,7 @@ STOP_REASON_USER_INTERRUPT = STOP_REASON_USER_STOPPED
 STOP_REASON_SOLVER_ERROR = "solver_error"
 
 COMPLETION_FILENAME = "ggui_1d_run_completion.json"
+COMPLETION_FILENAME_2D = "ggui_2d_wave_stop.json"
 ARRIVAL_OVERPRESSURE_PA = 8000.0
 ARRIVAL_CRITERION = (
     "overpressure_above_ambient: first probe sample with "
@@ -102,6 +103,10 @@ def completion_path(case_dir: str) -> str:
     return os.path.join(case_dir or "", COMPLETION_FILENAME)
 
 
+def completion_path_2d(case_dir: str) -> str:
+    return os.path.join(case_dir or "", COMPLETION_FILENAME_2D)
+
+
 def normalize_run_mode(
     value: Optional[str] = None,
     right_boundary: Optional[str] = None,
@@ -143,8 +148,7 @@ def is_reflect_mode(record: CompletionRecord) -> bool:
     return not is_terminate_mode(record)
 
 
-def write_completion_record(case_dir: str, record: CompletionRecord) -> str:
-    path = completion_path(case_dir)
+def _dump_completion_record(path: str, record: CompletionRecord) -> str:
     payload = record.as_dict()
     payload["requested_radius_m"] = record.requested_stop_radius_m
     payload["endTime"] = record.end_time_s
@@ -155,8 +159,38 @@ def write_completion_record(case_dir: str, record: CompletionRecord) -> str:
     return path
 
 
+def write_completion_record(case_dir: str, record: CompletionRecord) -> str:
+    return _dump_completion_record(completion_path(case_dir), record)
+
+
+def write_2d_wave_stop(case_dir: str, record: CompletionRecord) -> str:
+    return _dump_completion_record(completion_path_2d(case_dir), record)
+
+
 def read_completion_record(case_dir: str) -> Optional[CompletionRecord]:
-    path = completion_path(case_dir)
+    return _read_completion_file(completion_path(case_dir))
+
+
+def read_2d_wave_stop(case_dir: str) -> Optional[CompletionRecord]:
+    return _read_completion_file(completion_path_2d(case_dir))
+
+
+def load_wave_stop(case_dir: str) -> Tuple[Optional[CompletionRecord], str]:
+    """Return the active stop record and which file it came from ('2d', '1d', or '')."""
+    if os.path.isfile(completion_path_2d(case_dir)):
+        return read_2d_wave_stop(case_dir), "2d"
+    if os.path.isfile(completion_path(case_dir)):
+        return read_completion_record(case_dir), "1d"
+    return None, ""
+
+
+def save_wave_stop(case_dir: str, record: CompletionRecord, kind: str) -> str:
+    if kind == "2d":
+        return write_2d_wave_stop(case_dir, record)
+    return write_completion_record(case_dir, record)
+
+
+def _read_completion_file(path: str) -> Optional[CompletionRecord]:
     if not os.path.isfile(path):
         return None
     try:
@@ -266,6 +300,29 @@ def initial_completion_record(
         source_model=normalize_source_model(source_model),
         source_model_schema_version=SOURCE_MODEL_SCHEMA_VERSION,
     )
+
+
+def reset_2d_wave_stop_for_new_run(case_dir: str) -> Optional[CompletionRecord]:
+    """Clear stale 2D arrival evidence without touching a 1D completion file."""
+    existing = read_2d_wave_stop(case_dir)
+    if existing is None:
+        return None
+    record = initial_completion_record(
+        mode=existing.mode,
+        requested_stop_radius_m=existing.requested_stop_radius_m,
+        p_atm=existing.p_atm,
+        right_boundary=existing.right_boundary,
+        end_time_s=existing.end_time_s,
+        criterion=existing.criterion,
+        source_model=existing.source_model,
+    )
+    record.threshold_overpressure_pa = existing.threshold_overpressure_pa
+    record.probe_function_object = existing.probe_function_object
+    record.probe_index = existing.probe_index
+    record.probe_location = existing.probe_location
+    record.probe_radius_m = existing.probe_radius_m
+    write_2d_wave_stop(case_dir, record)
+    return record
 
 
 def reset_completion_for_new_run(case_dir: str) -> CompletionRecord:
@@ -410,7 +467,7 @@ def resolve_arrival_probe(
     if not is_finite_number(requested_radius) or float(requested_radius) <= 0.0:
         return None
     target = float(requested_radius)
-    for fo in (WATCHDOG_FO, PROBES1D_FO):
+    for fo in (WATCHDOG_FO, PROBES1D_FO, "watchdog2d", "probes2d", "validationGauges2d"):
         found = _probe_ref_from_file(case_dir, fo, target)
         if found is not None:
             index, loc, radius = found
@@ -473,11 +530,17 @@ def finalize_completion_record(
     reached_end_time: bool,
     foam_fatal: bool = False,
     end_time_s: Optional[float] = None,
+    write=None,
 ) -> CompletionRecord:
     """Persist stop reason and arrival evidence after the solver process exits."""
+    persist = write or write_completion_record
     record = read_completion_record(case_dir) or initial_completion_record(
         mode=RUN_MODE_TERMINATE, requested_stop_radius_m=None
     )
+    if write is not None:
+        loaded, _kind = load_wave_stop(case_dir)
+        if loaded is not None:
+            record = loaded
     record.return_code = return_code
     if is_finite_number(end_time_s):
         record.end_time_s = float(end_time_s)
@@ -486,11 +549,11 @@ def finalize_completion_record(
     record = detect_arrival_in_case(case_dir, record)
     if user_stopped:
         record.stop_reason = STOP_REASON_USER_STOPPED
-        write_completion_record(case_dir, record)
+        persist(case_dir, record)
         return record
     if foam_fatal:
         record.stop_reason = STOP_REASON_SOLVER_ERROR
-        write_completion_record(case_dir, record)
+        persist(case_dir, record)
         return record
     if is_terminate_mode(record):
         if record.wave_radius_reached:
@@ -504,7 +567,7 @@ def finalize_completion_record(
             record.stop_reason = STOP_REASON_END_TIME_REACHED
         else:
             record.stop_reason = STOP_REASON_SOLVER_ERROR
-    write_completion_record(case_dir, record)
+    persist(case_dir, record)
     return record
 
 

@@ -55,6 +55,7 @@ from external_case_workflow_2d import ImportMode2D, import_mode_label
 from imported_case_mapping_2d import FieldProvenance
 from material_catalog import materials_copy
 from material_validation import REQUIRED_IMPORTED_PHYSICS_KEYS, UNSUPPORTED_IMPORT_KEYS
+from completion_1d import RUN_MODE_TERMINATE
 from models_2d import (
     DEFAULT_REFINE_INTERVAL,
     CaseInputs2D,
@@ -1056,10 +1057,26 @@ class Tab2D(QWidget):
             self._fill_boundary_combo(combo)
             combo.setMaximumWidth(boundary_width)
         self._set_combo_stored_value(self.cmb_bottom, BOUNDARY_SLIP)
+        self.radio_stop_end = QRadioButton("Run to End Time")
+        self.radio_stop_radius = QRadioButton(
+            "Terminate at outer radius: stop when the wave reaches the domain edge "
+            "farthest from the axis; End Time is the upper bound"
+        )
+        self.radio_stop_end.setChecked(True)
+        self.radio_stop_end.setToolTip("Run until End Time or a manual stop.")
+        self.radio_stop_radius.setToolTip(
+            "Stop when the wave reaches the outer radius. End Time is the upper bound."
+        )
+        self._stop_mode_group = QButtonGroup(group)
+        self._stop_mode_group.setExclusive(True)
+        self._stop_mode_group.addButton(self.radio_stop_end)
+        self._stop_mode_group.addButton(self.radio_stop_radius)
         form.addRow("Axis:", self.lbl_axis)
         form.addRow("Outer Radius:", self.cmb_outer)
         form.addRow("Top:", self.cmb_top)
         form.addRow("Ground / Bottom:", self.cmb_bottom)
+        form.addRow(self.radio_stop_end)
+        form.addRow(self.radio_stop_radius)
         layout.addWidget(group)
         layout.addWidget(self.grp_mapping)
         layout.addStretch()
@@ -2382,6 +2399,9 @@ class Tab2D(QWidget):
             p_atm=self.spin_pressure.value(),
             t_atm=self.spin_temperature.value(),
             outer_boundary=self._combo_stored_value(self.cmb_outer),
+            stop_mode=(
+                RUN_MODE_TERMINATE if self.radio_stop_radius.isChecked() else "end_time"
+            ),
             top_boundary=self._combo_stored_value(self.cmb_top),
             bottom_boundary=self._combo_stored_value(self.cmb_bottom),
             max_co=self.spin_max_co.value(),
@@ -2539,6 +2559,10 @@ class Tab2D(QWidget):
             if "balance_interval" in values and values.get("balance_interval") is not None:
                 self.chk_balancing.setChecked(True)
                 self.spin_balance_interval.setValue(int(values["balance_interval"]))
+            if "stop_mode" in values:
+                terminate = str(values.get("stop_mode") or "") == RUN_MODE_TERMINATE
+                self.radio_stop_radius.setChecked(terminate)
+                self.radio_stop_end.setChecked(not terminate)
             if "mirrored_view" in values:
                 self.cmb_view_mode.setCurrentText(
                     "Mirrored View" if values.get("mirrored_view", True)

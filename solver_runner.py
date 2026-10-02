@@ -25,10 +25,13 @@ from completion_1d import (
     finalize_completion_record,
     is_terminate_mode,
     overpressure_arrived,
+    load_wave_stop,
     read_completion_record,
+    reset_2d_wave_stop_for_new_run,
     reset_completion_for_new_run,
     resolve_arrival_probe,
-    write_completion_record,
+    save_wave_stop,
+    write_2d_wave_stop,
 )
 from remap_handoff_1d import primary_shock_at_probe
 from foam_dictionary import with_write_now
@@ -589,7 +592,8 @@ class SolverRunner(QThread):
         """Record wave arrival; stop only in Terminate mode."""
         if self._wave_arrival_recorded:
             return
-        record = read_completion_record(case_dir)
+        record, stop_kind = load_wave_stop(case_dir)
+        self._wave_stop_kind = stop_kind
         if record is None:
             return
         requested = record.requested_stop_radius_m
@@ -615,7 +619,7 @@ class SolverRunner(QThread):
             record.probe_index = int(index)
             record.probe_location = loc
             record.probe_radius_m = probe_r
-            write_completion_record(case_dir, record)
+            save_wave_stop(case_dir, record, stop_kind)
 
         try:
             with open(self._wave_probe_file, "rb") as handle:
@@ -647,7 +651,7 @@ class SolverRunner(QThread):
         record.wave_radius_reached = True
         record.detected_arrival_time_s = float(sample_time)
         record = detect_arrival_in_case(case_dir, record)
-        write_completion_record(case_dir, record)
+        save_wave_stop(case_dir, record, stop_kind)
         self._wave_arrival_recorded = True
         stop_r = record.handoff_radius_m if record.handoff_radius_m is not None else requested
         radius_str = f"{float(stop_r):.6g}"
@@ -736,6 +740,8 @@ class SolverRunner(QThread):
         self._run_started_at = time.time()
         if is_generated_1d_case(self.win_case_dir):
             reset_completion_for_new_run(self.win_case_dir)
+        else:
+            reset_2d_wave_stop_for_new_run(self.win_case_dir)
         try:
             with self._process_lock:
                 if self._stop_requested or not self.keep_running:
@@ -841,7 +847,19 @@ class SolverRunner(QThread):
         reached_end = logged_time_reached_end(self.win_case_dir, log_text)
         configured_end = control_dict_root_end_time(self.win_case_dir)
         completion = None
-        if is_generated_1d_case(self.win_case_dir):
+        _stop_record, stop_kind = load_wave_stop(self.win_case_dir)
+        if stop_kind == "2d":
+            completion = finalize_completion_record(
+                self.win_case_dir,
+                return_code=rc,
+                user_stopped=user_stopped,
+                final_solver_time_s=last_t,
+                reached_end_time=reached_end,
+                foam_fatal=foam_fatal,
+                end_time_s=configured_end,
+                write=write_2d_wave_stop,
+            )
+        elif is_generated_1d_case(self.win_case_dir):
             completion = finalize_completion_record(
                 self.win_case_dir,
                 return_code=rc,

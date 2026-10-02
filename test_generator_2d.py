@@ -215,6 +215,31 @@ class Generator2DTests(unittest.TestCase):
             self.assertEqual(surface_plan.figure, "2-15")
             self.assertAlmostEqual(surface_plan.line_z, 0.0)
 
+    def test_end_time_mode_has_no_outer_radius_watchdog(self):
+        with tempfile.TemporaryDirectory() as td:
+            _inputs, case = self._generate(td, "endtime")
+            control = _read(case, os.path.join("system", "controlDict"))
+            self.assertNotIn("watchdog2d", control)
+            self.assertFalse(os.path.isfile(os.path.join(case, "ggui_2d_wave_stop.json")))
+            self.assertFalse(os.path.isfile(os.path.join(case, "ggui_1d_run_completion.json")))
+
+    def test_terminate_mode_places_watchdog_inside_outer_radius(self):
+        from completion_1d import read_2d_wave_stop
+
+        with tempfile.TemporaryDirectory() as td:
+            inputs, case = self._generate(td, "stop", stop_mode="terminate")
+            control = _read(case, os.path.join("system", "controlDict"))
+            self.assertIn("watchdog2d", control)
+            record = read_2d_wave_stop(case)
+            self.assertIsNotNone(record)
+            self.assertEqual(record.mode, "terminate")
+            probe_r = 1.5 - 0.025
+            probe_z = 0.5
+            self.assertIn(f"({probe_r:.12g} {probe_z:.12g} 0)", control)
+            self.assertAlmostEqual(record.requested_stop_radius_m, (probe_r**2 + probe_z**2) ** 0.5)
+            self.assertFalse(os.path.isfile(os.path.join(case, "ggui_1d_run_completion.json")))
+            self.assertGreater(inputs.radius, probe_r)
+
     def test_probe_maps_radius_height_to_wedge_centre_plane(self):
         with tempfile.TemporaryDirectory() as td:
             _, case = self._generate(

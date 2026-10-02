@@ -79,6 +79,8 @@ class CaseInputs2D:
 
     # Logical physical boundaries. Wedge faces and the axis are never user editable.
     outer_boundary: str = "Open"
+    # terminate: stop when the wave reaches the outer radius. end_time: run until End Time.
+    stop_mode: str = "end_time"
     top_boundary: str = "Open"
     bottom_boundary: str = "Reflecting slip wall"
 

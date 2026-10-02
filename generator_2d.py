@@ -34,6 +34,13 @@ from validation.auto_points import FO_2D_VALIDATION, plan_2d, runtime_logical_dp
 from validation.kb_propagation import copied_1d2d_radius_m
 from validation.remap_timing import build_remap_timing, remap_timing_from_mapping
 from validation.sampling_io import write_sampling_plan
+from completion_1d import (
+    COMPLETION_FILENAME_2D,
+    RUN_MODE_TERMINATE,
+    completion_path_2d,
+    initial_completion_record,
+    write_2d_wave_stop,
+)
 
 
 WEDGE_HALF_ANGLE_DEG = 5.0  # exact blastFoam 6.2.0 axisymmetricCharge convention
@@ -593,6 +600,7 @@ snGradSchemes { default corrected; }
         );
     }}
 """
+        watchdog_block = self._write_outer_radius_stop(case_dir, inputs)
         validation_block = ""
         if val_plan.points:
             val_pts = [
@@ -637,7 +645,7 @@ timePrecision 10;
 runTimeModifiable true;
 functions
 {{
-{extras}{probes_block}{validation_block}{remap_block}}}
+{extras}{probes_block}{watchdog_block}{validation_block}{remap_block}}}
 """
         self._write_text(os.path.join(system, "controlDict"), control)
         if val_plan.points or val_plan.notes:
@@ -647,6 +655,49 @@ functions
             + f"numberOfSubdomains {inputs.cores};\nmethod scotch;\n"
         )
         self._write_text(os.path.join(system, "decomposeParDict"), decompose)
+
+    def _write_outer_radius_stop(self, case_dir: str, inputs: CaseInputs2D) -> str:
+        """Watchdog probe at the outer radius, or remove a stale 2D stop record."""
+        stop_path = completion_path_2d(case_dir)
+        if str(getattr(inputs, "stop_mode", "end_time") or "end_time") != RUN_MODE_TERMINATE:
+            try:
+                if os.path.isfile(stop_path):
+                    os.remove(stop_path)
+            except OSError:
+                pass
+            return ""
+        radius = max(float(inputs.radius), 1e-9)
+        height = max(float(inputs.height), 0.0)
+        cell = float(inputs.cell_size or 0.0)
+        inset = 0.5 * cell if cell > 0.0 else max(radius * 1e-4, 1e-6)
+        probe_r = min(max(radius - inset, inset), max(radius - 1e-9, inset))
+        z_lo = min(max(inset, 0.0), height) if height > 0.0 else 0.0
+        z_hi = max(height - inset, z_lo)
+        probe_z = min(max(float(inputs.height_of_burst), z_lo), z_hi)
+        requested = math.hypot(probe_r, probe_z)
+        write_2d_wave_stop(
+            case_dir,
+            initial_completion_record(
+                mode=RUN_MODE_TERMINATE,
+                requested_stop_radius_m=requested,
+                p_atm=float(inputs.p_atm),
+                end_time_s=float(inputs.end_time_s),
+            ),
+        )
+        return f"""
+    watchdog2d
+    {{
+        type probes;
+        libs ("libfieldFunctionObjects.so");
+        fields (p);
+        writeControl timeStep;
+        writeInterval 1;
+        probeLocations
+        (
+            ({probe_r:.12g} {probe_z:.12g} 0)
+        );
+    }}
+"""
 
     def _write_scripts_2d(self, case_dir: str, inputs: CaseInputs2D) -> None:
         self._write_text(os.path.join(case_dir, "check_alpha_c4.sh"), ALPHA_C4_CHECK_SCRIPT)
@@ -679,7 +730,7 @@ latest=$(ls -1d [0-9]* 0.[0-9]* 2>/dev/null | sort -g | tail -1)
         allclean = f"""#!/usr/bin/env bash
 cd "$(dirname "$0")" || exit 1
 rm -rf processor* [1-9]* 0.[0-9]* constant/polyMesh postProcessing dynamicCode 2>/dev/null || true
-rm -f log.* *.foam {REMAP_2D_FILENAME} 2>/dev/null || true
+rm -f log.* *.foam {REMAP_2D_FILENAME} {COMPLETION_FILENAME_2D} 2>/dev/null || true
 rm -rf 0 2>/dev/null || true
 """
         self._write_text(os.path.join(case_dir, "Allrun"), allrun)

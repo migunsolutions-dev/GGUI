@@ -11,6 +11,7 @@ from output_options import REMAP_2D_FILENAME
 from completion_1d import (
     COMPLETION_FILENAME,
     is_terminate_mode,
+    read_2d_wave_stop,
     read_completion_record,
     reflect_end_time_is_success,
     wave_radius_stop_is_success,
@@ -200,7 +201,7 @@ def solver_run_succeeded(
         log_text = ""
     if "FOAM FATAL" in log_text:
         return False
-    record = read_completion_record(case_dir)
+    record = read_completion_record(case_dir) or read_2d_wave_stop(case_dir)
     if record is not None:
         if is_terminate_mode(record):
             return wave_radius_stop_is_success(record)

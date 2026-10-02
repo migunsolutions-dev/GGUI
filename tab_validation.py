@@ -1073,10 +1073,14 @@ class TabValidation(QWidget):
 
     def _radius_termination_complete(self, case: str) -> bool:
         try:
-            from completion_1d import read_completion_record, wave_radius_stop_is_success
+            from completion_1d import (
+                read_2d_wave_stop,
+                read_completion_record,
+                wave_radius_stop_is_success,
+            )
         except Exception:
             return False
-        record = read_completion_record(case)
+        record = read_completion_record(case) or read_2d_wave_stop(case)
         return record is not None and wave_radius_stop_is_success(record)
 
     def _assess_probe_series(

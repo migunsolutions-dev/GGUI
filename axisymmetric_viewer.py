@@ -31,6 +31,32 @@ from viewer_widget import BlastViewerWidget, FieldViewSettings, HAS_PV, pv
 _LOG = logging.getLogger("ggui.axisymmetric_viewer")
 
 
+def _meridional_left_down(style) -> None:
+    style.OnMiddleButtonDown()
+
+
+def _meridional_left_up(style) -> None:
+    style.OnMiddleButtonUp()
+
+
+def _install_meridional_mouse(plotter) -> None:
+    """Pan with the left button and zoom with the wheel or right button.
+
+    The image style keeps the camera in the meridional plane. Its default left
+    button changes window/level, so that button is bound to pan instead.
+    """
+    from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+
+    class _MeridionalMouse(vtkInteractorStyleImage):
+        def OnLeftButtonDown(self):  # noqa: N802 - VTK virtual name
+            _meridional_left_down(self)
+
+        def OnLeftButtonUp(self):  # noqa: N802 - VTK virtual name
+            _meridional_left_up(self)
+
+    plotter.interactor.SetInteractorStyle(_MeridionalMouse())
+
+
 def _scalar_bar_kwargs(**requested):
     """Compatibility alias used by focused unit tests."""
     return scalar_bar_kwargs(**requested)
@@ -239,9 +265,16 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         self._plotter = create_embedded_interactor(self.plotter_frame, auto_update=False)
         self._plotter.set_background("#F0F2F5")
         try:
-            self._plotter.enable_trackball_style()
-        except RuntimeError:
-            pass
+            # Left drag pans and the wheel or right drag zooms, staying in the meridional plane.
+            _install_meridional_mouse(self._plotter)
+        except Exception:
+            try:
+                self._plotter.enable_image_style()
+            except Exception:
+                try:
+                    self._plotter.enable_trackball_style()
+                except RuntimeError:
+                    pass
         try:
             self._plotter.enable_parallel_projection()
         except Exception:
@@ -738,19 +771,19 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
     def _clear_dynamic_actors(self) -> None:
         for actor in list(self._dynamic_actors):
             try:
-                self._plotter.remove_actor(actor)
+                self._plotter.remove_actor(actor, reset_camera=False, render=False)
             except Exception:
                 pass
         self._dynamic_actors.clear()
         for actor in list(self._probe_actors):
             try:
-                self._plotter.remove_actor(actor)
+                self._plotter.remove_actor(actor, reset_camera=False, render=False)
             except Exception:
                 pass
         self._probe_actors = []
         if self._scalar_bar_actor is not None:
             try:
-                self._plotter.remove_actor(self._scalar_bar_actor)
+                self._plotter.remove_actor(self._scalar_bar_actor, reset_camera=False, render=False)
             except Exception:
                 pass
             self._scalar_bar_actor = None
@@ -890,6 +923,7 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
                     reset_camera=False,
                     log_scale=use_log_scale if field_ok else False,
                     show_scalar_bar=False,
+                    render=False,
                 )
                 try:
                     field_actor.GetProperty().EdgeVisibilityOff()
@@ -910,6 +944,7 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
                     lighting=False,
                     reset_camera=False,
                     render_lines_as_tubes=False,
+                    render=False,
                 )
                 self._dynamic_actors.append(edge_actor)
 
@@ -957,6 +992,7 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
                 color="#2c3e50",
                 line_width=2,
                 reset_camera=False,
+                render=False,
             )
             self._dynamic_actors.append(axis_actor)
             if self._charge_center:
@@ -966,6 +1002,7 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
                     pv.Sphere(radius=marker_r, center=(float(cx), float(cy), 0.0)),
                     color="#e67e22",
                     reset_camera=False,
+                    render=False,
                 )
                 self._dynamic_actors.append(charge_actor)
             self._add_meridional_bounds(r0, radius, 0.0, height)
@@ -981,14 +1018,22 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
                     y = float(pt[1])
                     sphere = pv.Sphere(radius=marker_r, center=(r, y, 0.0))
                     actor = self._plotter.add_mesh(
-                        sphere, color="yellow", opacity=0.9, reset_camera=False
+                        sphere,
+                        color="yellow",
+                        opacity=0.9,
+                        reset_camera=False,
+                        render=False,
                     )
                     self._probe_actors.append(actor)
                     if self.mirrored_view and r > 0:
                         mirror = pv.Sphere(radius=marker_r, center=(-r, y, 0.0))
                         actor = self._plotter.add_mesh(
-                            mirror, color="yellow", opacity=0.45, reset_camera=False
-                        )
+                        mirror,
+                        color="yellow",
+                        opacity=0.45,
+                        reset_camera=False,
+                        render=False,
+                    )
                         self._probe_actors.append(actor)
 
             self._apply_meridional_camera(force=self._first_load)
@@ -1049,6 +1094,9 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
         if not self._plotter or self._shutdown:
             return
         self._plotter.enable_parallel_projection()
+        # Live refreshes keep the camera the user set with the mouse (position and zoom).
+        if not force:
+            return
         if self._axisymmetric_domain is not None:
             radius, height = self._axisymmetric_domain
         elif self._mesh_bounds is not None:

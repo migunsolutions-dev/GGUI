@@ -348,6 +348,39 @@ class TabValidationTests(unittest.TestCase):
         self.assertIsNotNone(impulse_pa_s)
         self.assertNotIn("endtime", reason.lower())
 
+    def test_2d_outer_radius_stop_enables_comparison(self):
+        from completion_1d import (
+            RUN_MODE_TERMINATE,
+            STOP_REASON_USER_STOPPED,
+            STOP_REASON_WAVE_RADIUS_REACHED,
+            CompletionRecord,
+            write_2d_wave_stop,
+        )
+
+        tab = self._tab(RunSnapshot(p_atm=101325.0))
+        with tempfile.TemporaryDirectory() as case:
+            write_2d_wave_stop(
+                case,
+                CompletionRecord(
+                    mode=RUN_MODE_TERMINATE,
+                    stop_reason=STOP_REASON_USER_STOPPED,
+                    wave_radius_reached=True,
+                    detected_arrival_time_s=0.01,
+                ),
+            )
+            self.assertFalse(tab._radius_termination_complete(case))
+            write_2d_wave_stop(
+                case,
+                CompletionRecord(
+                    mode=RUN_MODE_TERMINATE,
+                    stop_reason=STOP_REASON_WAVE_RADIUS_REACHED,
+                    wave_radius_reached=True,
+                    detected_arrival_time_s=0.01,
+                ),
+            )
+            self.assertTrue(tab._radius_termination_complete(case))
+            self.assertFalse(os.path.isfile(os.path.join(case, "ggui_1d_run_completion.json")))
+
     def test_range_vs_z_and_log_linear_are_display_only(self):
         snap = RunSnapshot(
             live_mode="2d",
