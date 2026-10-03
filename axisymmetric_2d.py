@@ -230,7 +230,10 @@ def validate_case_inputs_2d(inputs: CaseInputs2D) -> ValidationResult2D:
         if source.time_mode == "specific" and not (source.specific_time or "").strip():
             errors.append("A specific source time is required.")
         if source.mapped_radius <= 0:
-            errors.append("Mapped radius must be > 0.")
+            errors.append(
+                "A valid 1D remap is required. The mapped radius is taken from "
+                "the linked 1D remap radius."
+            )
         if domain is not None and source.mapped_radius > min(
             domain.effective_radius, domain.effective_height
         ):

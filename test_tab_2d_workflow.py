@@ -151,14 +151,11 @@ class Tab2DWorkflowTests(unittest.TestCase):
         }
         self.assertEqual(set(labels), hidden_labels)
         self.assertTrue(all(label.isHidden() for label in labels.values()))
-        mapped_labels = [
-            label
-            for label in self.tab.grp_mapping.findChildren(QLabel)
-            if label.text() == "Mapped radius:"
-        ]
-        self.assertTrue(mapped_labels)
-        self.assertFalse(any(label.isHidden() for label in mapped_labels))
-        self.assertFalse(self.tab.spin_mapped_radius.isHidden())
+        self.assertNotIn(
+            "Mapped radius:",
+            [label.text() for label in self.tab.grp_mapping.findChildren(QLabel)],
+        )
+        self.assertFalse(hasattr(self.tab, "spin_mapped_radius"))
         self.assertTrue(self.tab.cmb_source_time_mode.isHidden())
         self.assertTrue(self.tab.txt_source_time.isHidden())
         form = self.tab.grp_mapping.layout()
@@ -376,6 +373,9 @@ class Tab2DWorkflowTests(unittest.TestCase):
                     "p": np.full(n, 2.0e5),
                     "T": np.full(n, 300.0),
                     "U_mag": np.linspace(0.0, 100.0, n),
+                    "rho.air": np.zeros(n),
+                    "rho.c4": np.zeros(n),
+                    "alpha.c4": np.zeros(n),
                 },
                 physical_time=0.000639296,
             )
@@ -387,13 +387,15 @@ class Tab2DWorkflowTests(unittest.TestCase):
             self.assertIn("last solver state", text)
             self.assertIn("0.000639296", self.tab.lbl_remap_status.text())
 
-    def test_mapped_radius_is_visible_for_from_1d(self):
+    def test_mapped_radius_control_is_absent_for_from_1d(self):
         self.tab.cmb_source.setCurrentText(REMAP_SOURCE)
         self.app.processEvents()
-        self.assertFalse(self.tab.spin_mapped_radius.isHidden())
+        labels = [label.text() for label in self.tab.grp_mapping.findChildren(QLabel)]
+        self.assertNotIn("Mapped radius:", labels)
+        self.assertFalse(hasattr(self.tab, "spin_mapped_radius"))
         self.assertTrue(self.tab.grp_mapping.isEnabled())
 
-    def test_remap_no_source_does_not_replace_mapped_radius_with_domain(self):
+    def test_remap_no_source_does_not_invent_a_mapped_radius(self):
         import numpy as np
 
         from completion_1d import RUN_MODE_TERMINATE, CompletionRecord, write_completion_record
@@ -415,30 +417,40 @@ class Tab2DWorkflowTests(unittest.TestCase):
                     "p": np.full(8, 2.0e5),
                     "T": np.full(8, 300.0),
                     "U_mag": np.linspace(0.0, 100.0, 8),
+                    "rho.air": np.zeros(8),
+                    "rho.c4": np.zeros(8),
+                    "alpha.c4": np.zeros(8),
                 },
                 physical_time=0.0010659,
             )
             self.tab.cmb_source.setCurrentText(REMAP_SOURCE)
-            self.tab.spin_mapped_radius.setValue(0.5)
-            self.tab._set_remap_case_path(td, from_last_1d=True)
+            self.tab.set_case_inputs(
+                {
+                    "initialization_source": REMAP_SOURCE,
+                    "mapping": {"case_path": td, "mapped_radius": 0.5},
+                }
+            )
             self.app.processEvents()
-            self.assertAlmostEqual(self.tab.spin_mapped_radius.value(), 0.5)
+            self.assertEqual(self.tab.get_case_inputs().mapping.mapped_radius, 0.0)
             text = self.tab.lbl_remap_status.text()
             self.assertIn("Remap = No", text)
-            self.assertIn("Current 1D model", text)
-            self.assertIn("0.5", text)
+            self.assertIn("valid 1D remap is required", text)
             self.assertIn("1.5", text)
 
-    def test_declared_remap_radius_fills_mapped_radius_spin(self):
+    def test_declared_remap_radius_supplies_mapped_radius(self):
         from remap_handoff_1d import write_handoff_metadata
 
         with tempfile.TemporaryDirectory() as td:
-            write_handoff_metadata(td, {"remap_radius_m": 0.6})
+            write_handoff_metadata(td, {"remap_radius_m": 0.6, "handoff_radius_m": 0.5})
             self.tab.cmb_source.setCurrentText(REMAP_SOURCE)
-            self.tab.spin_mapped_radius.setValue(0.5)
-            self.tab._set_remap_case_path(td, from_last_1d=False)
+            self.tab.set_case_inputs(
+                {
+                    "initialization_source": REMAP_SOURCE,
+                    "mapping": {"case_path": td, "mapped_radius": 0.2},
+                }
+            )
             self.app.processEvents()
-            self.assertAlmostEqual(self.tab.spin_mapped_radius.value(), 0.6)
+            self.assertAlmostEqual(self.tab.get_case_inputs().mapping.mapped_radius, 0.6)
             self.assertIn("R_remap = 0.6", self.tab.lbl_remap_status.text())
 
 

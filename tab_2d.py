@@ -1000,12 +1000,6 @@ class Tab2D(QWidget):
         self.cmb_source_time_mode.addItems(["latest", "specific"])
         self.txt_source_time = QComboBox()
         self.txt_source_time.setEditable(True)
-        self.spin_mapped_radius = self._double(0.5, 1e-9)
-        self.spin_mapped_radius.setToolTip(
-            "Physical radius transferred from the 1D source about the 2D charge "
-            "centre. This is R_remap, not the 1D Domain Radius, unless you set "
-            "them equal."
-        )
         self.spin_source_resolution = self._double(0.01, 1e-9)
         self.lbl_mapping_note = QLabel(
             "Radial mapping about the target charge centre [0, HOB, 0] is not conservative; "
@@ -1016,9 +1010,7 @@ class Tab2D(QWidget):
         form.addRow("Remap from:", source_row)
         form.addRow("Source time:", self.cmb_source_time_mode)
         form.addRow("Specific time:", self.txt_source_time)
-        mapped_radius_row = self._with_unit(self.spin_mapped_radius, "m")
         source_resolution_row = self._with_unit(self.spin_source_resolution, "m")
-        form.addRow("Mapped radius:", mapped_radius_row)
         form.addRow("Source resolution:", source_resolution_row)
         self.lbl_remap_status = QLabel("")
         self.lbl_remap_status.setWordWrap(True)
@@ -1619,7 +1611,6 @@ class Tab2D(QWidget):
     def _connect_signals(self) -> None:
         self.cmb_source.currentTextChanged.connect(self._on_source_changed)
         self.btn_edit_remap.clicked.connect(self._open_remap_from_dialog)
-        self.spin_mapped_radius.valueChanged.connect(self.refresh_remap_status)
         self.cmb_shape.currentTextChanged.connect(self._apply_enablement)
         self.cmb_mesh_mode.currentTextChanged.connect(self._apply_enablement)
         self.cmb_mesh_mode.currentTextChanged.connect(self._sync_mesh_mode_radios)
@@ -1780,6 +1771,16 @@ class Tab2D(QWidget):
         self._last_1d_case_dir = os.path.normpath(path)
         self.apply_last_1d_remap_default()
 
+    def _linked_mapped_radius_m(self) -> float:
+        """R_remap from the linked 1D handoff. Never a typed GUI value."""
+        from remap_snapshot_1d import declared_remap_radius_m
+
+        path = (self._remap_case_path or "").strip()
+        if not path:
+            return 0.0
+        found = declared_remap_radius_m(path)
+        return float(found) if found is not None else 0.0
+
     def _set_remap_case_path(self, path: str, *, from_last_1d: bool) -> None:
         path = os.path.normpath(path) if path else ""
         self._remap_case_path = path
@@ -1792,11 +1793,6 @@ class Tab2D(QWidget):
             else:
                 self.txt_source_case.setText(os.path.basename(path))
             self.txt_source_case.setToolTip(path)
-            from remap_snapshot_1d import declared_remap_radius_m
-
-            declared = declared_remap_radius_m(path)
-            if declared is not None:
-                self.spin_mapped_radius.setValue(declared)
         else:
             self.txt_source_case.setText("")
             self.txt_source_case.setToolTip("")
@@ -1825,7 +1821,11 @@ class Tab2D(QWidget):
                 parts.append(f"Source: {source_name}.")
             if avail.physical_time is not None:
                 parts.append(f"Source physical time: {avail.physical_time:.6g} s.")
-        parts.extend(transfer_limit_notes(source_path, self.spin_mapped_radius.value()))
+        parts.extend(transfer_limit_notes(source_path, self._linked_mapped_radius_m()))
+        if source_path and self._linked_mapped_radius_m() <= 0.0:
+            parts.append(
+                "A valid 1D remap is required. Mapped radius is taken from the linked 1D remap radius."
+            )
         label.setText(" ".join(p for p in parts if p).strip())
         warn = (
             avail.status in ("invalid", "stale", "missing") and not avail.snapshot_available
@@ -2379,7 +2379,7 @@ class Tab2D(QWidget):
             case_path=self._remap_case_path or self.txt_source_case.text().strip(),
             time_mode="latest",
             specific_time="",
-            mapped_radius=self.spin_mapped_radius.value(),
+            mapped_radius=self._linked_mapped_radius_m(),
             source_resolution=self.spin_source_resolution.value(),
         )
         return CaseInputs2D(
@@ -2575,8 +2575,6 @@ class Tab2D(QWidget):
                     self._set_remap_case_path(loaded_case, from_last_1d=False)
                 self.cmb_source_time_mode.setCurrentText("latest")
                 self.txt_source_time.setEditText("")
-                if mapping.get("mapped_radius") is not None:
-                    self.spin_mapped_radius.setValue(float(mapping.get("mapped_radius", 0.5)))
                 if mapping.get("source_resolution") is not None:
                     self.spin_source_resolution.setValue(
                         float(mapping.get("source_resolution") or 0.01)
