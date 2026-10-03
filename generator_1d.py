@@ -557,7 +557,7 @@ PIMPLE { nCorrectors 3; nNonOrthogonalCorrectors 0; }
             # because the single-phase system takes all its fluxes from fluxScheme.
             fv_sch = self._foam_header("fvSchemes", "dictionary", "system") + r"""
 fluxScheme      Tadmor;
-ddtSchemes      { default Euler; timeIntegrator Euler; }
+ddtSchemes      { default Euler; timeIntegrator RK2SSP; }
 gradSchemes     { default cellMDLimited leastSquares 1.0; }
 divSchemes      { default none; }
 laplacianSchemes { default Gauss linear corrected; }
@@ -567,7 +567,7 @@ snGradSchemes   { default corrected; }
         else:
             fv_sch = self._foam_header("fvSchemes", "dictionary", "system") + r"""
 fluxScheme      Tadmor;
-ddtSchemes      { default Euler; timeIntegrator Euler; }
+ddtSchemes      { default Euler; timeIntegrator RK2SSP; }
 gradSchemes     { default cellMDLimited leastSquares 1.0; }
 divSchemes      { default none; div(alphaRhoPhi.c4,lambda.c4) Gauss linear; }
 laplacianSchemes { default Gauss linear corrected; }

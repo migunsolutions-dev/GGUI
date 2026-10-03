@@ -75,6 +75,17 @@ class Generator1DIGTests(unittest.TestCase):
         self.assertIn(f"volScalarFieldValuep{state.p_source:.12g}", compact)
         self.assertNotIn("alpha.c4", sf)
 
+    def test_both_1d_models_use_rk2ssp_and_keep_tadmor(self):
+        for source in (SOURCE_MODEL_IG, SOURCE_MODEL_JWL):
+            case_dir, _inputs_case = self._generate(source)
+            schemes = self._read(case_dir, "system", "fvSchemes")
+            self.assertIn("timeIntegrator RK2SSP;", schemes)
+            self.assertNotIn("timeIntegrator Euler;", schemes)
+            self.assertIn("fluxScheme      Tadmor;", schemes)
+            self.assertIn('"reconstruct(p)" vanLeer;', schemes)
+            control = self._read(case_dir, "system", "controlDict")
+            self.assertIn("maxCo           0.5;", control)
+
     def test_jwl_case_still_writes_two_phase_dictionaries(self):
         case_dir, inputs_jwl = self._generate(SOURCE_MODEL_JWL)
         pp = self._read(case_dir, "constant", "phaseProperties")
