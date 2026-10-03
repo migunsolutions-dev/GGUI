@@ -12,6 +12,63 @@ EXISTING_1D_GRAPH_FO = "probes1d"
 _PROBE_HEADER = re.compile(r"Probe\s+(\d+)\s+\(([^)]+)\)")
 
 
+def probe_time_files(case_dir: str, fo_name: str, field: str) -> List[str]:
+    """Every postProcessing/<fo>/<time>/<field> file, oldest time first."""
+    root = os.path.join(case_dir or "", "postProcessing", fo_name)
+    found: List[Tuple[float, str]] = []
+    if not os.path.isdir(root):
+        return []
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    for name in names:
+        path = os.path.join(root, name, field)
+        if not os.path.isfile(path):
+            continue
+        try:
+            found.append((float(name), path))
+        except ValueError:
+            continue
+    found.sort(key=lambda item: item[0])
+    return [path for _time, path in found]
+
+
+def merged_probe_history(
+    case_dir: str, fo_name: str, field: str
+) -> Tuple[List[str], List[float], List[List[float]]]:
+    """Join probe time directories in order, dropping a repeated restart sample.
+
+    OpenFOAM starts a new time directory when a run resumes. The new file
+    begins at the restart time. A reader that opens only the newest directory
+    drops the earlier history.
+    """
+    locations: List[str] = []
+    times: List[float] = []
+    columns: List[List[float]] = []
+    last = None
+    for path in probe_time_files(case_dir, fo_name, field):
+        locs, part_times, part_columns = parse_probe_history(path)
+        if locs and not any(locations):
+            locations = locs
+        for index, time_value in enumerate(part_times):
+            if last is not None and time_value <= last:
+                continue
+            last = time_value
+            times.append(time_value)
+            width = max(len(columns), len(part_columns))
+            while len(columns) < width:
+                columns.append([float("nan")] * (len(times) - 1))
+            for column_index in range(width):
+                if column_index >= len(columns):
+                    continue
+                if column_index < len(part_columns) and index < len(part_columns[column_index]):
+                    columns[column_index].append(part_columns[column_index][index])
+                else:
+                    columns[column_index].append(float("nan"))
+    return locations, times, columns
+
+
 def latest_probe_field_file(case_dir: str, fo_name: str, field: str) -> str:
     root = os.path.join(case_dir or "", "postProcessing", fo_name)
     if not os.path.isdir(root):

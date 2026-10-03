@@ -908,7 +908,7 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
 
             self._last_surface_cells = int(surface.n_cells)
             field_actor = None
-            if display.n_points > 0:
+            if display.n_points > 0 and field_ok:
                 # Never use show_edges on the filled surface: VTK triangulates
                 # for rasterization and would draw false diagonals (and mirrored
                 # winding reverses the diagonal direction).
@@ -931,7 +931,7 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
                     pass
                 self._dynamic_actors.append(field_actor)
 
-            if self.show_mesh_lines and surface.n_cells > 0:
+            if self.show_mesh_lines and surface.n_cells > 0 and field_ok:
                 edges = extract_meridional_cell_edges(surface)
                 if self.mirrored_view:
                     edges = mirror_meridional(edges)
@@ -1093,10 +1093,12 @@ class AxisymmetricViewerWidget(BlastViewerWidget):
     def _apply_meridional_camera(self, force: bool = True) -> None:
         if not self._plotter or self._shutdown:
             return
-        self._plotter.enable_parallel_projection()
-        # Live refreshes keep the camera the user set with the mouse (position and zoom).
+        # Live refreshes keep the camera the user set with the mouse.
+        # enable_parallel_projection recomputes parallel_scale from the
+        # view angle, which undoes a wheel zoom, so it runs only on a fit.
         if not force:
             return
+        self._plotter.enable_parallel_projection()
         if self._axisymmetric_domain is not None:
             radius, height = self._axisymmetric_domain
         elif self._mesh_bounds is not None:

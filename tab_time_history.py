@@ -38,6 +38,7 @@ from PyQt5.QtWidgets import (
 )
 
 from models_2d import ProbePoint2D
+from validation.probes import merged_probe_history
 from probes_model import ProbePoint
 from tab_1d import MplCanvas
 from ui_metrics import COMPUTATIONAL_LEFT_PANEL_MIN, COMPUTATIONAL_LEFT_PANEL_WIDTH
@@ -735,7 +736,7 @@ class TabTimeHistory(QWidget):
                 path = latest_probe_field_file(case_dir, fo_name, field_name)
                 if not path:
                     continue
-                locations, times, columns = parse_probe_history(path)
+                locations, times, columns = merged_probe_history(case_dir, fo_name, field_name)
                 for index, column in enumerate(columns):
                     count = min(len(times), len(column))
                     if count <= 0:
@@ -933,8 +934,12 @@ class TabTimeHistory(QWidget):
     def refresh_plot(self) -> None:
         self._plot_timer.start()
 
-    def begin_run(self, mode: str, case_dir: str) -> None:
-        """Start a viewer session without exposing samples from an earlier run."""
+    def begin_run(self, mode: str, case_dir: str, *, keep_existing: bool = False) -> None:
+        """Start a viewer session without exposing samples from an earlier run.
+
+        Resume keeps the samples already written for this case. A new solve
+        hides them so a previous case is not drawn as the current run.
+        """
         dim = _DIM_FROM_MODE.get(str(mode), "")
         if not dim:
             return
@@ -943,11 +948,10 @@ class TabTimeHistory(QWidget):
         self._sim_time[dim] = 0.0
         for field in ("p", "impulse"):
             path = latest_probe_field_file(case_dir, PROBE_FO[dim], field)
-            count = 0
+            _locs, times, _columns = merged_probe_history(case_dir, PROBE_FO[dim], field)
+            count = 0 if keep_existing else len(times)
             size = 0
             if path:
-                _locs, times, _columns = parse_probe_history(path)
-                count = len(times)
                 try:
                     size = os.path.getsize(path)
                 except OSError:
@@ -1028,7 +1032,7 @@ class TabTimeHistory(QWidget):
                 times: List[float] = []
                 values: List[float] = []
                 if path:
-                    _locs, times, columns = parse_probe_history(path)
+                    _locs, times, columns = merged_probe_history(case_dir, fo_name, field)
                     if row.index < len(columns) and times:
                         values = list(columns[row.index])
                         if field == "p":

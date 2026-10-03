@@ -409,6 +409,13 @@ def _parse_phase_properties(case_dir: str) -> Dict[str, Any]:
     e0 = re.search(r"\bE0\s+([-+]?(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][-+]?\d+)?)", text)
     if e0:
         out["E0"] = float(e0.group(1))
+    for key in ("A", "B", "R1", "R2", "omega"):
+        match = re.search(
+            rf"\b{key}\s+([-+]?(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][-+]?\d+)?)",
+            text,
+        )
+        if match:
+            out[key] = float(match.group(1))
     points = re.search(r"points\s*\(\(([^)]+)\)\)", text)
     if points:
         out["initiation_point"] = tuple(float(x) for x in points.group(1).split())
@@ -480,6 +487,26 @@ def _map_material(phase_field: Optional[str], phases: List[str]) -> Tuple[Option
     if candidates:
         return None, f"phase '{candidates[0]}' has no GGUI catalog entry — case-defined"
     return None, "explosive phase not recovered"
+
+
+def _catalog_name_from_jwl(phases: Dict[str, Any]) -> Optional[str]:
+    """Match written JWL coefficients. The phase is named c4 for every explosive."""
+    from material_catalog import JWL_PARAMETERS
+
+    keys = ("A", "B", "R1", "R2", "omega")
+    if any(phases.get(key) is None for key in keys):
+        return None
+    hits = []
+    for name, params in JWL_PARAMETERS.items():
+        if all(
+            abs(float(phases[key]) - float(params[key]))
+            <= 1e-4 * max(abs(float(params[key])), 1.0)
+            for key in keys
+        ):
+            hits.append(name)
+    if len(hits) == 1:
+        return hits[0]
+    return None
 
 
 def _add(
@@ -928,6 +955,13 @@ def map_material(result: ImportMappingResult, setfields: dict, phases: dict, not
     # --- Material ---
     phase_field = setfields.get("phase_field")
     material, mat_reason = _map_material(phase_field, phases.get("phases") or [])
+    jwl_name = _catalog_name_from_jwl(phases)
+    if jwl_name:
+        material = jwl_name
+        mat_reason = (
+            "JWL product coefficients match the material catalog. "
+            "Generated cases name the explosive phase c4 regardless of material."
+        )
     if material:
         _add(
             result,

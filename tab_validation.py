@@ -100,6 +100,7 @@ from validation.probes import (
     VALIDATION_FO,
     latest_probe_field_file,
     match_probe_to_point,
+    merged_probe_history,
     parse_probe_history,
     peak_and_impulse,
     radial_distance,
@@ -1280,7 +1281,14 @@ class TabValidation(QWidget):
         hit = self._probe_file_cache.get(key)
         if hit is not None:
             return hit
-        parsed = parse_probe_history(path)
+        parent = os.path.basename(os.path.dirname(path))
+        fo_name = os.path.basename(os.path.dirname(os.path.dirname(path)))
+        case_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(path))))
+        try:
+            float(parent)
+            parsed = merged_probe_history(case_dir, fo_name, os.path.basename(path))
+        except ValueError:
+            parsed = parse_probe_history(path)
         self._probe_file_cache[key] = parsed
         return parsed
 

@@ -1,5 +1,7 @@
 import glob
+import json
 import os
+import math
 import re
 import tempfile
 import time
@@ -27,14 +29,14 @@ from completion_1d import (
     overpressure_arrived,
     load_wave_stop,
     read_completion_record,
-    reset_2d_wave_stop_for_new_run,
     reset_completion_for_new_run,
     resolve_arrival_probe,
+    reset_2d_wave_stop_for_new_run,
     save_wave_stop,
     write_2d_wave_stop,
 )
 from remap_handoff_1d import primary_shock_at_probe
-from foam_dictionary import with_write_now
+from foam_dictionary import with_write_now, update_top_level_entries
 from result_storage import (
     ResultStoragePolicy,
     control_dict_root_end_time,
@@ -133,7 +135,7 @@ def _publish_control_dict(temp_path: str, dest_path: str) -> None:
     publish_case_file(temp_path, dest_path)
 
 
-def request_solver_write_and_stop(case_dir: str) -> bool:
+def request_solver_write_and_stop(case_dir: str, *, preserve_write_interval: bool = False) -> bool:
     """Ask a running OpenFOAM solver to dump the current time and exit.
 
     1D field dumps are sparse (one interval at endTime). A verified
@@ -146,7 +148,8 @@ def request_solver_write_and_stop(case_dir: str) -> bool:
     try:
         with open(cd_path, "r", encoding="utf-8") as handle:
             text = handle.read()
-        new_text = with_write_now(text)
+        new_text = (update_top_level_entries(text, {"stopAt": "writeNow"})[0]
+                    if preserve_write_interval else with_write_now(text))
         sys_dir = os.path.dirname(cd_path)
         fd, temp_path = tempfile.mkstemp(
             prefix=".ggui-cd-", suffix=".tmp", dir=sys_dir
@@ -303,24 +306,57 @@ class SolverRunner(QThread):
         path = to_wsl_path_and_distro(win_case_dir)
         self._wsl_distro, self._linux_case_dir = path.distro, path.linux_path
 
+    def _capture_final_snapshot(self, completion, *, user_stopped=False):
+        """Keep optional snapshot capture failures separate from solver outcome."""
+        self.snapshot_error = ""
+        try:
+            message = write_snapshot_after_run(
+                self.win_case_dir, completion, user_stopped=user_stopped
+            )
+            diagnostic = {"status": "checked", "message": message}
+        except Exception as exc:
+            self.snapshot_error = f"{type(exc).__name__}: {exc}"
+            message = "Solver outcome preserved; remap snapshot capture failed: " + self.snapshot_error
+            diagnostic = {"status": "failed", "error": self.snapshot_error}
+        try:
+            with open(os.path.join(self.win_case_dir, "ggui_snapshot_status.json"), "w", encoding="utf-8") as handle:
+                json.dump(diagnostic, handle, indent=2)
+        except OSError as exc:
+            self.status_signal.emit(f"Could not save snapshot diagnostic: {exc}")
+        if message:
+            self.status_signal.emit(message)
+        return message
+
     def stop(self) -> None:
-        self.keep_running = False
+        """Queue a write-and-stop request; all process work stays on the worker."""
         self._stop_requested = True
-        with self._process_lock:
-            solver = self._proc
-            reconstruct = self._reconstruct_proc
-        if solver and solver.poll() is None:
-            self.status_signal.emit("Stopping solver...")
-            terminate_process_tree(solver)
-        if (
-            reconstruct is not None
-            and reconstruct is not solver
-            and reconstruct.poll() is None
-        ):
-            terminate_process_tree(reconstruct)
-        with self._process_lock:
-            if self._reconstruct_proc is reconstruct:
+
+    def _maybe_stop_after_manual_request(self) -> None:
+        if not self._stop_requested:
+            return
+        requested_at = getattr(self, "_manual_stop_requested_at", None)
+        if requested_at is None:
+            self._manual_stop_requested_at = time.monotonic()
+            with self._process_lock:
+                reconstruct = self._reconstruct_proc
                 self._reconstruct_proc = None
+            if reconstruct is not None and reconstruct.poll() is None:
+                terminate_process_tree(reconstruct)
+            accepted = request_solver_write_and_stop(self.win_case_dir, preserve_write_interval=True)
+            self.status_signal.emit(
+                "Interrupt: requesting a saved solver state before exit."
+                if accepted else
+                "Interrupt: write request failed; waiting before forced termination."
+            )
+            return
+        if time.monotonic() - requested_at >= 10.0:
+            self.status_signal.emit(
+                "Interrupt write timed out; terminating solver. Restart state is unverified."
+            )
+            with self._process_lock:
+                solver = self._proc
+            if solver is not None and solver.poll() is None:
+                terminate_process_tree(solver)
 
     @staticmethod
     def _win_unc_to_wsl_path_and_distro(win_path: str) -> Tuple[Optional[str], str]:
@@ -493,7 +529,11 @@ class SolverRunner(QThread):
             return
 
         self._last_reconstructed_time = time_val
-        cmd = "reconstructPar -newTimes > log.reconstructPar 2>&1"
+        cmd = self._reconstruct_command(
+            latest=False,
+            log_name="log.reconstructPar",
+            time_name=_label,
+        )
         try:
             args = self._build_wsl_cmd(self._linux_case_dir, cmd)
             with self._process_lock:
@@ -545,7 +585,43 @@ class SolverRunner(QThread):
             self._reconstruct_proc = None
         return False
 
-    def _final_reconstruct_latest(self, *, all_new_times: bool = False) -> int:
+    def _uses_adaptive_mesh(self) -> bool:
+        path = os.path.join(self.win_case_dir, "constant", "dynamicMeshDict")
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+        except OSError:
+            return False
+        return "adaptiveFvMesh" in text
+
+    def _reconstruct_command(
+        self, *, latest: bool, log_name: str, time_name: str = ""
+    ) -> str:
+        """Field reconstruction, preceded by a mesh merge when AMR changed it.
+
+        Refined processor times contain a complete polyMesh and no
+        ``pointProcAddressing``. ``reconstructPar`` cannot read those times.
+        ``reconstructParMesh`` rebuilds the mesh and writes the addressing.
+        A live call pins both tools to the same processor directory. Separate
+        ``-latestTime`` selections race: the solver can write a newer time
+        after the mesh merge, and the field reconstruct then dies on a time
+        that has no addressing. ``-newTimes`` would also open the earlier
+        refined directories, which still have no addressing.
+        """
+        adaptive = self._uses_adaptive_mesh()
+        pinned = time_name.strip()
+        if adaptive and pinned:
+            selector = f"-time {pinned}"
+        else:
+            selector = "-latestTime" if latest or adaptive else "-newTimes"
+        fields = f"reconstructPar {selector} > {log_name} 2>&1"
+        if not adaptive:
+            return fields
+        return f"reconstructParMesh {selector} > log.reconstructParMesh 2>&1 && {fields}"
+
+    def _final_reconstruct_latest(
+        self, *, all_new_times: bool = False, allow_after_stop: bool = False
+    ) -> int:
         """Deterministically reconstruct serial results needed by final outputs.
 
         Returns the subprocess exit code (0 on success). Does not launch a second
@@ -558,18 +634,18 @@ class SolverRunner(QThread):
                 "and was stopped after timeout. Check log.reconstructPar / debug_summary.txt."
             )
             return 1
-        command = (
-            "reconstructPar -newTimes > log.reconstructFinal 2>&1"
-            if all_new_times
-            else FINAL_RECONSTRUCT_CMD
+        command = self._reconstruct_command(
+            latest=not all_new_times, log_name="log.reconstructFinal"
         )
-        label = "-newTimes" if all_new_times else "-latestTime"
-        self.status_signal.emit(f"Final reconstruction (reconstructPar {label})...")
+        label = "reconstructParMesh + reconstructPar" if self._uses_adaptive_mesh() else (
+            "reconstructPar -newTimes" if all_new_times else "reconstructPar -latestTime"
+        )
+        self.status_signal.emit(f"Final reconstruction ({label})...")
         proc = None
         try:
             args = self._build_wsl_cmd(self._linux_case_dir, command)
             with self._process_lock:
-                if self._stop_requested or not self.keep_running:
+                if (self._stop_requested and not allow_after_stop) or not self.keep_running:
                     return 1
                 proc = subprocess.Popen(
                     args,
@@ -631,23 +707,28 @@ class SolverRunner(QThread):
             return
         if not complete:
             return
-        parsed = parse_last_probe_pressures(complete.decode("utf-8", "ignore"))
-        if parsed is None:
-            return
-        sample_time, pressures, _count = parsed
+        arrival = None
         idx = self._wave_probe_index
-        if idx < 0 or idx >= len(pressures):
+        for line in complete.decode("utf-8", "ignore").splitlines():
+            parsed = parse_last_probe_pressures(line)
+            if parsed is None:
+                continue
+            sample_time, pressures, _count = parsed
+            if idx < 0 or idx >= len(pressures):
+                continue
+            if record.remap_for_2d:
+                reached = primary_shock_at_probe(pressures[idx], record.p_atm)
+            else:
+                reached = overpressure_arrived(
+                    pressures[idx], p_atm=record.p_atm,
+                    threshold_pa=record.threshold_overpressure_pa,
+                )
+            if reached:
+                arrival = sample_time
+                break
+        if arrival is None:
             return
-        if record.remap_for_2d:
-            reached = primary_shock_at_probe(pressures[idx], record.p_atm)
-        else:
-            reached = overpressure_arrived(
-                pressures[idx],
-                p_atm=record.p_atm,
-                threshold_pa=record.threshold_overpressure_pa,
-            )
-        if not reached:
-            return
+        sample_time = arrival
         record.wave_radius_reached = True
         record.detected_arrival_time_s = float(sample_time)
         record = detect_arrival_in_case(case_dir, record)
@@ -669,7 +750,8 @@ class SolverRunner(QThread):
             self.status_signal.emit(
                 f"Wave reached requested radius ({radius_str} m). Stopping simulation."
             )
-        request_solver_write_and_stop(case_dir)
+        record.watchdog_write_requested = bool(request_solver_write_and_stop(case_dir))
+        save_wave_stop(case_dir, record, stop_kind)
         self._watchdog_stop_requested_time = time.time()
 
     def _maybe_stop_after_watchdog(self) -> None:
@@ -681,6 +763,10 @@ class SolverRunner(QThread):
         elapsed = time.time() - self._watchdog_stop_requested_time
         if elapsed < self._watchdog_grace_seconds:
             return
+        record, stop_kind = load_wave_stop(self.win_case_dir)
+        if record is not None:
+            record.watchdog_forced_stop = True
+            save_wave_stop(self.win_case_dir, record, stop_kind or "1d")
         terminate_process_tree(self._proc)
 
     def _read_new_probe_lines(self) -> Optional[Tuple[float, List[float], int, float]]:
@@ -699,7 +785,21 @@ class SolverRunner(QThread):
         if not complete:
             return None
 
-        parsed = parse_last_probe_pressures(complete.decode("utf-8", "ignore"))
+        text = complete.decode("utf-8", "ignore")
+        # OpenFOAM headers contain the actual (possibly nonuniform) probe order.
+        import re as _re
+        coords = getattr(self, "_live_probe_coordinates", {})
+        for match in _re.finditer(r"#\s*Probe\s+(\d+)\s+\(([^)]+)\)", text):
+            try:
+                point = tuple(float(v) for v in match.group(2).split())
+                if len(point) == 3 and all(math.isfinite(v) for v in point):
+                    coords[int(match.group(1))] = point
+            except ValueError:
+                pass
+        self._live_probe_coordinates = coords
+        self.live_probe_radii = tuple(math.sqrt(sum(v*v for v in coords[i]))
+                                     for i in range(len(coords))) if set(coords) == set(range(len(coords))) else ()
+        parsed = parse_last_probe_pressures(text)
         if parsed is None:
             return None
 
@@ -725,7 +825,7 @@ class SolverRunner(QThread):
 
         try:
             execution = build_execution_plan(
-                self.win_case_dir, self.cores, self.intent
+                self.win_case_dir, self.cores, self.intent, verify_restart=True
             )
         except ExecutionPreparationError as exc:
             self.status_signal.emit(str(exc))
@@ -783,8 +883,10 @@ class SolverRunner(QThread):
         _re_courant = re.compile(r"^Courant Number.*$", re.MULTILINE)
         while self.keep_running and self._proc.poll() is None:
             self._maybe_reconstruct_new_times()
-            self._check_watchdog_trigger(self.win_case_dir)
-            self._maybe_stop_after_watchdog()
+            self._maybe_stop_after_manual_request()
+            if not self._stop_requested:
+                self._check_watchdog_trigger(self.win_case_dir)
+                self._maybe_stop_after_watchdog()
             if self._probe_file is None:
                 self._probe_file = self._discover_probe_file()
                 if self._probe_file:
@@ -869,14 +971,20 @@ class SolverRunner(QThread):
                 foam_fatal=foam_fatal,
                 end_time_s=configured_end,
             )
-            snap_msg = write_snapshot_after_run(
-                self.win_case_dir,
-                completion,
-                user_stopped=user_stopped,
-            )
-            if snap_msg:
-                self.status_signal.emit(snap_msg)
+            self._capture_final_snapshot(completion, user_stopped=user_stopped)
         if user_stopped:
+            # Interrupt kills the live reconstructPar child. The viewer only
+            # reads reconstructed case-root times, so finish that copy after
+            # the solver has actually exited.
+            if self.cores > 1:
+                recon_rc = self._final_reconstruct_latest(allow_after_stop=True)
+                if recon_rc != 0:
+                    self.status_signal.emit(
+                        "Stopped by user. Last parallel fields were not reconstructed "
+                        f"(rc={recon_rc})."
+                    )
+                    self.finished_signal.emit(False)
+                    return
             self.status_signal.emit("Stopped by user.")
             self.finished_signal.emit(False)
             return

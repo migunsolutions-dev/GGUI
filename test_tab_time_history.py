@@ -475,6 +475,28 @@ class ProbeHistoryIncompleteTests(unittest.TestCase):
             self.assertEqual(columns[0], [101325.0])
 
 
+class ResumeProbeMergeTests(unittest.TestCase):
+    def _write(self, directory, text):
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, "p"), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_merged_history_keeps_the_pre_resume_samples(self):
+        from validation.probes import merged_probe_history
+
+        with tempfile.TemporaryDirectory() as td:
+            self._write(
+                os.path.join(td, "postProcessing", "probes2d", "0"),
+                "# Probe 0 (0.05 0.08 0)\n0 101325\n0.0002 200000\n",
+            )
+            self._write(
+                os.path.join(td, "postProcessing", "probes2d", "0.0002"),
+                "# Probe 0 (0.05 0.08 0)\n0.0002 200000\n0.0003 150000\n",
+            )
+            _locs, times, columns = merged_probe_history(td, "probes2d", "p")
+            self.assertEqual(times, [0.0, 0.0002, 0.0003])
+            self.assertEqual(columns[0], [101325.0, 200000.0, 150000.0])
+
 class TabTimeHistoryAppWireTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -250,5 +250,24 @@ class LogScalePolicyTests(unittest.TestCase):
         viewer.shutdown_viewer()
 
 
+class CameraHoldTests(unittest.TestCase):
+    def test_live_refresh_does_not_recompute_parallel_scale(self):
+        viewer = AxisymmetricViewerWidget()
+
+        class _Plotter:
+            def __init__(self):
+                self.calls = 0
+
+            def enable_parallel_projection(self):
+                self.calls += 1
+
+        viewer._plotter = _Plotter()
+        viewer._shutdown = False
+        viewer._apply_meridional_camera(force=False)
+        self.assertEqual(viewer._plotter.calls, 0)
+        viewer._plotter = None
+        viewer.shutdown_viewer()
+
+
 if __name__ == "__main__":
     unittest.main()

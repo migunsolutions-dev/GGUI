@@ -79,6 +79,37 @@ except ImportError:
     get_charge_cell_count = None  # optional for case_init_mode.json update
 
 
+def _sync_2d_decompose_subdomains(case_dir: str, cores: int) -> None:
+    """Match decomposeParDict to the core count about to be launched.
+
+    Initialize writes numberOfSubdomains. Changing Processor cores later left
+    that entry stale, so decomposePar and mpirun disagreed.
+    """
+    path = os.path.join(case_dir or "", "system", "decomposeParDict")
+    if not os.path.isfile(path):
+        return
+    requested = max(1, int(cores))
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return
+    changed = False
+    updated = []
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("numberOfSubdomains") and not changed:
+            indent = line[: len(line) - len(stripped)]
+            updated.append(f"{indent}numberOfSubdomains {requested};\n")
+            changed = True
+        else:
+            updated.append(line)
+    if not changed or updated == lines:
+        return
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.writelines(updated)
+
+
 class InfoPanel(QFrame):
     """Lower-left info panel showing read-only derived information"""
     def __init__(self, parent=None):
@@ -3018,6 +3049,8 @@ class BlastFoamApp(QMainWindow):
         
         log_path = os.path.join(case_dir, "log.blastFoam")
         self.tab_jotter.start_monitoring(log_path)
+        if mode == "2D":
+            _sync_2d_decompose_subdomains(case_dir, cores)
         
         if mode == "3D" and isinstance(self.tabs.currentWidget(), TabGeneral3D):
             self.view_timer.start(1000)
@@ -3067,7 +3100,9 @@ class BlastFoamApp(QMainWindow):
         self._active_run_intent = intent
         self._active_result_storage_policy = policy
         self._run_user_interrupted = False
-        self.tab_time_history.begin_run(mode, case_dir)
+        self.tab_time_history.begin_run(
+            mode, case_dir, keep_existing=intent == ExecutionIntent.RESUME
+        )
         self._refresh_validation()
         # Queued delivery keeps status/viewport updates on the Qt GUI thread.
         self.runner.data_signal.connect(
