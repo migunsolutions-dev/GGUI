@@ -22,6 +22,10 @@ import sys
 from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+from remap_native_io import (
+    _parse_internal_field, _read_3d_cell_centres as _read_cell_centres,
+    _read_0_orig_internal, _read_bc, verified_remap_source,
+)
 
 MAPPING_METHOD = "radial_from_target_charge_center"
 GROUND_CLIP = "domain_z_ge_0_no_mirror"
@@ -270,44 +274,12 @@ def _resolve_time_dir(case_path: str, requested_time: str) -> Optional[str]:
         requested = float(raw)
     except ValueError:
         return None
-    abs_tol = abs(requested * 1e-9) if requested != 0 else 1e-9
     for value, name in available:
-        if abs(value - requested) < abs_tol:
+        if value == requested:
             return name
-    return min(available, key=lambda item: abs(item[0] - requested))[1]
+    return None
 
 
-def _parse_internal_field(path: str, is_vector: bool = False):
-    with open(path, "r", encoding="utf-8", errors="replace") as handle:
-        text = handle.read()
-    if "uniform" in text:
-        match = re.search(r"internalField\s+uniform\s+([^;]+);", text)
-        if match:
-            token = match.group(1).strip()
-            if is_vector:
-                nums = tuple(float(x) for x in re.findall(r"[\d.eE+-]+", token))
-                return None, np.array(nums[:3] if len(nums) >= 3 else (0.0, 0.0, 0.0))
-            found = re.search(r"[\d.eE+-]+", token)
-            return None, float(found.group()) if found else 0.0
-    match = re.search(
-        r"internalField\s+nonuniform\s+List<\w+>\s*(\d+)\s*\((.*?)\)\s*;",
-        text,
-        re.DOTALL,
-    )
-    if not match:
-        return None, np.zeros(3) if is_vector else 0.0
-    count = int(match.group(1))
-    inner = match.group(2)
-    if is_vector:
-        vals = []
-        for triple in re.finditer(r"\(([^)]+)\)", inner):
-            parts = triple.group(1).split()
-            if len(parts) >= 3:
-                vals.append((float(parts[0]), float(parts[1]), float(parts[2])))
-        arr = np.array(vals[:count], dtype=float) if vals else None
-        return arr, np.zeros(3)
-    nums = [float(x) for x in re.findall(r"[\d.eE+-]+", inner)[:count]]
-    return np.array(nums, dtype=float), 0.0
 
 
 def _parse_cell_centres_file(path: str) -> Optional[np.ndarray]:
@@ -328,113 +300,15 @@ def _parse_cell_centres_file(path: str) -> Optional[np.ndarray]:
     return np.array(pts, dtype=float) if pts else None
 
 
-def _read_1d_data(source_case: str, time_dir: str) -> Optional[Dict[str, np.ndarray]]:
-    time_path = os.path.join(source_case, time_dir)
-
-    def read_field(name: str, vec: bool = False):
-        path = os.path.join(time_path, name)
-        if not os.path.isfile(path):
-            return None, None
-        return _parse_internal_field(path, is_vector=vec)
-
-    p_arr, p_def = read_field("p")
-    t_arr, t_def = read_field("T")
-    rho4_arr, r4_def = read_field("rho.c4")
-    rhoa_arr, ra_def = read_field("rho.air")
-    a4_arr, a4_def = read_field("alpha.c4")
-    u_arr, u_def = read_field("U", vec=True)
-    n = 0
-    for arr in (p_arr, t_arr, rho4_arr, rhoa_arr, a4_arr, u_arr):
-        if arr is not None:
-            n = max(n, len(arr))
-    n = max(1, n)
-    centres = None
-    for candidate in (
-        os.path.join(time_path, "C"),
-        os.path.join(source_case, "constant", "polyMesh", "C"),
-    ):
-        if os.path.isfile(candidate):
-            centres = _parse_cell_centres_file(candidate)
-            if centres is not None and len(centres) == n:
-                break
-            centres = None
-    if centres is not None:
-        r_1d = np.linalg.norm(centres, axis=1)
-    else:
-        r_1d = None
-        try:
-            from remap_snapshot_1d import cell_radii_from_poly_mesh
-
-            r_1d = cell_radii_from_poly_mesh(source_case, n)
-        except Exception:
-            r_1d = None
-        if r_1d is None or len(r_1d) != n:
-            return None
-    if p_arr is None:
-        p_arr = np.full(n, 101325.0 if p_def is None else p_def)
-    if t_arr is None:
-        t_arr = np.full(n, 300.0 if t_def is None else t_def)
-    if rho4_arr is None:
-        rho4_arr = np.full(n, 0.0 if r4_def is None else r4_def)
-    if rhoa_arr is None:
-        rhoa_arr = np.full(n, 1.225 if ra_def is None else ra_def)
-    if a4_arr is None:
-        a4_arr = np.full(n, 0.0 if a4_def is None else a4_def)
-    if u_arr is None:
-        u_mag = np.zeros(n)
-    else:
-        u_mag = np.linalg.norm(u_arr, axis=1)
-    return {
-        "r": np.asarray(r_1d, dtype=float),
-        "p": np.asarray(p_arr, dtype=float),
-        "T": np.asarray(t_arr, dtype=float),
-        "rho.c4": np.asarray(rho4_arr, dtype=float),
-        "rho.air": np.asarray(rhoa_arr, dtype=float),
-        "alpha.c4": np.asarray(a4_arr, dtype=float),
-        "U_mag": np.asarray(u_mag, dtype=float),
-    }
+def _read_1d_data(source_case, time_dir):
+    from remap_snapshot_1d import capture_arrays_from_time_dir
+    return capture_arrays_from_time_dir(source_case, time_dir)
 
 
-def _read_cell_centres() -> Optional[np.ndarray]:
-    for path in ("0/C", "0/Cc"):
-        if os.path.isfile(path):
-            pts = _parse_cell_centres_file(path)
-            if pts is not None and len(pts) > 0:
-                return pts
-    try:
-        import pyvista as pv
-
-        if os.path.isfile("case.foam"):
-            mesh = pv.read("case.foam")
-            if hasattr(mesh, "__getitem__") and len(mesh) > 0:
-                mesh = mesh[0]
-            return np.array(mesh.cell_centers().points)
-    except Exception:
-        pass
-    return None
 
 
-def _read_0_orig_internal(zero_dir: str, name: str, n_cells: int, is_vector: bool = False):
-    path = os.path.join(zero_dir, name)
-    if not os.path.isfile(path):
-        return None
-    arr, default = _parse_internal_field(path, is_vector=is_vector)
-    if arr is not None and len(arr) == n_cells:
-        return np.asarray(arr)
-    if is_vector:
-        return np.full((n_cells, 3), default)
-    return np.full(n_cells, default)
 
 
-def _read_bc(filepath: str) -> str:
-    if not os.path.isfile(filepath):
-        return "boundaryField { }"
-    with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
-        text = handle.read()
-    start = text.find("boundaryField")
-    if start < 0:
-        return "boundaryField { }"
-    return text[start:].rstrip() + "\n"
 
 
 def _fast_write(path: str, name: str, dim: str, arr, bc: str, is_vector: bool = False) -> None:
@@ -464,6 +338,106 @@ def _fast_write(path: str, name: str, dim: str, arr, bc: str, is_vector: bool = 
         handle.write(bc if bc.endswith("\n") else bc + "\n")
 
 
+def _profile_is_ideal_gas(resolved) -> bool:
+    """True only for a positively identified Ideal-Gas profile."""
+    from models import SOURCE_MODEL_IG, normalize_source_model
+
+    declared = str((resolved.metadata or {}).get("source_model") or "")
+    if declared:
+        return normalize_source_model(declared) == SOURCE_MODEL_IG
+    profile = resolved.profile or {}
+    return (
+        "rho" in profile
+        and "alpha.c4" not in profile
+        and "rho.air" not in profile
+        and "rho.c4" not in profile
+    )
+
+
+def _case_gas_constant() -> float:
+    """R = (gamma-1)*Cv from the case phaseProperties, matching eConst idealGas."""
+    path = os.path.join("constant", "phaseProperties")
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    gamma = float(re.search(r"\bgamma\s+([0-9.eE+-]+)\s*;", text).group(1))
+    cv = float(re.search(r"\bCv\s+([0-9.eE+-]+)\s*;", text).group(1))
+    if gamma <= 1.0 or cv <= 0.0:
+        raise ValueError("Ideal-Gas thermo constants are not usable")
+    return (gamma - 1.0) * cv
+
+
+def _write_ideal_gas_state(
+    *,
+    data_1d,
+    r_2d,
+    z_2d,
+    hob,
+    mapped_radius,
+    zero_dir,
+    out_dir,
+    n_cells,
+    r_lim,
+    r_src,
+) -> int:
+    """Plant single-phase p, rho, T and U. T is rebuilt from p and rho.
+
+    blastFoam's eConst ideal gas sets ``e = p/((gamma-1)*rho)`` and ``T = e/Cv``.
+    Rebuilding T from the planted p and rho keeps that relation exact and does
+    not add a second energy source.
+    """
+    p_orig = _read_0_orig_internal(zero_dir, "p", n_cells)
+    t_orig = _read_0_orig_internal(zero_dir, "T", n_cells)
+    rho_orig = _read_0_orig_internal(zero_dir, "rho", n_cells)
+    u_orig = _read_0_orig_internal(zero_dir, "U", n_cells, is_vector=True)
+    mapped = map_fields_to_2d_cells(
+        r_2d,
+        z_2d,
+        hob,
+        data_1d["r"],
+        data_1d,
+        mapped_radius=mapped_radius,
+        ambient={"p": p_orig, "T": t_orig, "rho": rho_orig, "U": u_orig},
+    )
+    rho = np.asarray(mapped["rho"], dtype=float)
+    pressure = np.asarray(mapped["p"], dtype=float)
+    if (
+        not np.all(np.isfinite(rho))
+        or not np.all(np.isfinite(pressure))
+        or np.any(rho <= 0.0)
+    ):
+        print("remap_2d: Ideal-Gas density or pressure is not a finite positive state", file=sys.stderr)
+        return 1
+    mapped["T"] = pressure / (rho * _case_gas_constant())
+    os.makedirs(out_dir, exist_ok=True)
+    for name, dim in (
+        ("p", "[1 -1 -2 0 0 0 0]"),
+        ("T", "[0 0 0 1 0 0 0]"),
+        ("rho", "[1 -3 0 0 0 0 0]"),
+    ):
+        _fast_write(
+            os.path.join(out_dir, name),
+            name,
+            dim,
+            mapped[name],
+            _read_bc(os.path.join(zero_dir, name)),
+            is_vector=False,
+        )
+    _fast_write(
+        os.path.join(out_dir, "U"),
+        "U",
+        "",
+        mapped["U"],
+        _read_bc(os.path.join(zero_dir, "U")),
+        is_vector=True,
+    )
+    inside = int(np.sum(r_src <= r_lim))
+    print(
+        "remap_2d: wrote %s/p,T,rho,U (inside r<=%.6g: %d/%d)"
+        % (out_dir, r_lim, inside, n_cells)
+    )
+    return 0
+
+
 def run_case_remap(
     *,
     source_case: str,
@@ -473,31 +447,12 @@ def run_case_remap(
     out_dir: str = "0",
 ) -> int:
     """Run the 1D→2D remap from the generated 2D case root. Returns a process code."""
-    data_1d = None
     try:
-        from remap_snapshot_1d import load_profile_for_remap
-
-        snap, snap_err = load_profile_for_remap(source_case)
-    except Exception:
-        snap, snap_err = None, None
-    if snap_err:
-        print("remap_2d: %s" % snap_err, file=sys.stderr)
+        resolved = verified_remap_source(source_case, source_time)
+    except ValueError as exc:
+        print("remap_2d: %s" % exc, file=sys.stderr)
         return 1
-    if snap is not None:
-        data_1d = snap
-        print("remap_2d: using dedicated 1D remap snapshot", file=sys.stderr)
-    else:
-        time_dir = _resolve_time_dir(source_case, source_time)
-        if not time_dir:
-            print("remap_2d: FATAL - 1D time directory not found", file=sys.stderr)
-            print("  SOURCE_CASE: %s" % source_case, file=sys.stderr)
-            print("  SOURCE_TIME: %s" % repr(source_time), file=sys.stderr)
-            return 1
-        print("remap_2d: source_time %s -> %s" % (source_time, time_dir), file=sys.stderr)
-        data_1d = _read_1d_data(source_case, time_dir)
-        if not data_1d:
-            print("remap_2d: failed to read 1D data", file=sys.stderr)
-            return 1
+    data_1d = resolved.profile
     centres = _read_cell_centres()
     if centres is None or len(centres) == 0:
         print("remap_2d: run postProcess -func writeCellCentres first", file=sys.stderr)
@@ -510,6 +465,19 @@ def run_case_remap(
     n_cells = len(r_src)
     zero_dir = "0.orig" if os.path.isdir("0.orig") else "0"
     r_lim = effective_mapped_radius(data_1d["r"], mapped_radius)
+    if _profile_is_ideal_gas(resolved):
+        return _write_ideal_gas_state(
+            data_1d=data_1d,
+            r_2d=r_2d,
+            z_2d=z_2d,
+            hob=hob,
+            mapped_radius=mapped_radius,
+            zero_dir=zero_dir,
+            out_dir=out_dir,
+            n_cells=n_cells,
+            r_lim=r_lim,
+            r_src=r_src,
+        )
     print(
         "remap_2d: HOB=%.6g origin=%s R_remap=%.6g cells=%d"
         % (float(hob), origin.tolist(), r_lim, n_cells),
@@ -522,12 +490,12 @@ def run_case_remap(
     a4_orig = _read_0_orig_internal(zero_dir, "alpha.c4", n_cells)
     u_orig = _read_0_orig_internal(zero_dir, "U", n_cells, is_vector=True)
     ambient = {
-        "p": 101325.0 if p_orig is None else p_orig,
-        "T": 300.0 if t_orig is None else t_orig,
-        "rho.c4": 0.0 if rho4_orig is None else rho4_orig,
-        "rho.air": 1.225 if rhoa_orig is None else rhoa_orig,
-        "alpha.c4": 0.0 if a4_orig is None else a4_orig,
-        "U": None if u_orig is None else u_orig,
+        "p": p_orig,
+        "T": t_orig,
+        "rho.c4": rho4_orig,
+        "rho.air": rhoa_orig,
+        "alpha.c4": a4_orig,
+        "U": u_orig,
     }
     mapped = map_fields_to_2d_cells(
         r_2d,

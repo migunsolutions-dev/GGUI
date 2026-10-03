@@ -29,12 +29,14 @@ UNITS = {
     "p": "Pa",
     "T": "K",
     "U_mag": "m/s",
+    "rho": "kg/m3",
     "rho.air": "kg/m3",
     "rho.c4": "kg/m3",
     "alpha.c4": "1",
 }
 REQUIRED_ARRAYS = ("r", "p", "T", "U_mag")
 OPTIONAL_ARRAYS = ("rho.air", "rho.c4", "alpha.c4")
+IG_DENSITY = "rho"
 SUPPORTED_SCHEMA_VERSIONS = (SCHEMA_VERSION,)
 
 _SKIP_TIME = frozenset({"constant", "system", "0.orig", "postProcessing"})
@@ -76,7 +78,7 @@ def snapshot_json_path(case_dir: str) -> str:
 
 
 def snapshot_exists(case_dir: str) -> bool:
-    return os.path.isfile(snapshot_npz_path(case_dir)) and os.path.isfile(
+    return os.path.isfile(snapshot_npz_path(case_dir)) or os.path.isfile(
         snapshot_json_path(case_dir)
     )
 
@@ -224,6 +226,55 @@ def _completion_info(case_dir: str) -> Dict[str, Any]:
     return info
 
 
+def positive_source_model(case_dir: str) -> Optional[str]:
+    """Identify the 1D source from explicit evidence only.
+
+    Returns the model id, ``None`` when nothing identifies it, or ``"conflict"``
+    when completion metadata and phaseProperties disagree. A missing phase
+    field is not evidence of Ideal Gas.
+    """
+    from models import SOURCE_MODEL_IG, SOURCE_MODEL_JWL, normalize_source_model
+
+    evidence = []
+    completion_path = os.path.join(case_dir or "", "ggui_1d_run_completion.json")
+    if os.path.isfile(completion_path):
+        try:
+            with open(completion_path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            return "conflict"
+        if isinstance(data, dict) and data.get("source_model"):
+            evidence.append(normalize_source_model(data["source_model"]))
+    phase_path = os.path.join(case_dir or "", "constant", "phaseProperties")
+    if os.path.isfile(phase_path):
+        try:
+            with open(phase_path, encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+        except OSError:
+            return "conflict"
+        text = re.sub(r"/\*.*?\*/|//[^\n]*", "", text, flags=re.S)
+        if re.search(r"\bequationOfState\s+JWL\s*;", text):
+            evidence.append(SOURCE_MODEL_JWL)
+        elif re.search(r"\bequationOfState\s+idealGas\s*;", text) and not re.search(
+            r"\bphases\s*\(", text
+        ):
+            evidence.append(SOURCE_MODEL_IG)
+    if not evidence:
+        return None
+    if len(set(evidence)) != 1:
+        return "conflict"
+    return evidence[0]
+
+
+def snapshot_array_names(source_model: Optional[str]) -> Tuple[str, ...]:
+    """Radial arrays stored for this source. JWL keeps the phase schema."""
+    from models import SOURCE_MODEL_IG, normalize_source_model
+
+    if source_model and normalize_source_model(source_model) == SOURCE_MODEL_IG:
+        return REQUIRED_ARRAYS + (IG_DENSITY,)
+    return REQUIRED_ARRAYS + OPTIONAL_ARRAYS
+
+
 def write_snapshot(
     case_dir: str,
     arrays: Dict[str, Sequence[float]],
@@ -231,30 +282,20 @@ def write_snapshot(
     physical_time: Optional[float] = None,
     extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Write npz + json. *arrays* must include r, p, T, U_mag."""
+    """Write actual radial thermodynamic, velocity and phase fields; never fill gaps."""
     from models import SOURCE_MODEL_JWL, SOURCE_MODEL_SCHEMA_VERSION
 
-    packed = {name: _as_1d(values, name) for name, values in arrays.items()}
-    n = packed["r"].size
-    for name in REQUIRED_ARRAYS:
-        if name not in packed:
-            raise ValueError(f"Snapshot is missing required field {name!r}.")
-        if packed[name].size != n:
-            raise ValueError(
-                f"Snapshot field {name!r} length {packed[name].size} does not match r ({n})."
-            )
-    for name in OPTIONAL_ARRAYS:
-        if name not in packed:
-            packed[name] = np.zeros(n, dtype=np.float64)
-        elif packed[name].size != n:
-            raise ValueError(
-                f"Snapshot field {name!r} length {packed[name].size} does not match r ({n})."
-            )
     completion = _completion_info(case_dir)
+    source_model = completion.get("source_model") or SOURCE_MODEL_JWL
+    names = snapshot_array_names(source_model)
+    packed = _validated_profile_arrays(arrays, source_model=source_model)
+    n = packed["r"].size
     phys = physical_time
     if phys is None:
         phys = completion.get("final_solver_time_s")
-    shapes = {name: [int(packed[name].size)] for name in list(REQUIRED_ARRAYS) + list(OPTIONAL_ARRAYS)}
+    if phys is not None and (not np.isfinite(float(phys)) or float(phys) < 0):
+        raise ValueError("Snapshot physical time must be finite and nonnegative.")
+    shapes = {name: [int(packed[name].size)] for name in names}
     metadata: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "source_dimension": SOURCE_DIMENSION,
@@ -271,7 +312,7 @@ def write_snapshot(
         "arrival_criterion": completion.get("arrival_criterion") or "",
         "coordinate_convention": COORDINATE_CONVENTION,
         "units": dict(UNITS),
-        "field_names": list(REQUIRED_ARRAYS) + list(OPTIONAL_ARRAYS),
+        "field_names": list(names),
         "field_shapes": shapes,
         "n_points": int(n),
         "arrays_checksum": arrays_checksum(packed),
@@ -383,15 +424,10 @@ def validate_snapshot(
             return False, "Remap snapshot physical time is invalid."
         if not np.isfinite(phys_f) or phys_f < 0.0:
             return False, "Remap snapshot physical time is invalid."
-    for name in REQUIRED_ARRAYS:
-        if name not in packed:
-            return False, f"Remap snapshot is missing required field {name!r}."
-    n = packed["r"].size
-    if n < 2:
-        return False, "Remap snapshot radial profile is too short."
-    for name, arr in packed.items():
-        if np.asarray(arr).size != n:
-            return False, f"Remap snapshot field {name!r} has inconsistent length."
+    try:
+        packed = _validated_profile_arrays(packed, source_model=meta.get("source_model"))
+    except (TypeError, ValueError) as exc:
+        return False, str(exc)
     expected_sum = arrays_checksum(packed)
     if str(meta.get("arrays_checksum") or "") != expected_sum:
         return False, "Remap snapshot checksum does not match the stored arrays."
@@ -445,16 +481,46 @@ def validate_snapshot(
     return True, ""
 
 
-def profile_from_snapshot(arrays: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-    return {
-        "r": np.asarray(arrays["r"], dtype=float),
-        "p": np.asarray(arrays["p"], dtype=float),
-        "T": np.asarray(arrays["T"], dtype=float),
-        "rho.c4": np.asarray(arrays.get("rho.c4", np.zeros_like(arrays["r"])), dtype=float),
-        "rho.air": np.asarray(arrays.get("rho.air", np.zeros_like(arrays["r"])), dtype=float),
-        "alpha.c4": np.asarray(arrays.get("alpha.c4", np.zeros_like(arrays["r"])), dtype=float),
-        "U_mag": np.asarray(arrays["U_mag"], dtype=float),
-    }
+def _validated_profile_arrays(
+    arrays: Dict[str, Sequence[float]],
+    *,
+    source_model: Optional[str] = None,
+) -> Dict[str, np.ndarray]:
+    # JWL carries both phase densities and the volume fraction. Those values are
+    # solver data even where a phase has zero volume fraction, and they are never
+    # invented. Ideal Gas carries unsuffixed rho and must not contain phase fields.
+    from models import SOURCE_MODEL_IG, normalize_source_model
+
+    ig = bool(source_model) and normalize_source_model(source_model) == SOURCE_MODEL_IG
+    required = snapshot_array_names(SOURCE_MODEL_IG if ig else None)
+    if ig:
+        present = [name for name in OPTIONAL_ARRAYS if name in arrays]
+        if present:
+            raise ValueError(
+                "Ideal-Gas snapshot must not contain JWL phase fields: "
+                + ", ".join(present)
+            )
+    for name in required:
+        if name not in arrays:
+            raise ValueError(f"Snapshot is missing required field {name!r}.")
+    packed = {name: _as_1d(arrays[name], name) for name in required}
+    n = packed["r"].size
+    if n < 2:
+        raise ValueError("Snapshot radial profile is too short.")
+    for name, values in packed.items():
+        if values.size != n:
+            raise ValueError(f"Snapshot field {name!r} length does not match r ({n}).")
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Snapshot field {name!r} contains nonfinite values.")
+    return packed
+
+
+def profile_from_snapshot(
+    arrays: Dict[str, np.ndarray],
+    *,
+    source_model: Optional[str] = None,
+) -> Dict[str, np.ndarray]:
+    return _validated_profile_arrays(arrays, source_model=source_model)
 
 
 def load_profile_for_remap(case_dir: str) -> Tuple[Optional[Dict[str, np.ndarray]], Optional[str]]:
@@ -467,7 +533,8 @@ def load_profile_for_remap(case_dir: str) -> Tuple[Optional[Dict[str, np.ndarray
     arrays = read_snapshot_arrays(case_dir)
     if arrays is None:
         return None, "Remap snapshot arrays could not be loaded."
-    return profile_from_snapshot(arrays), None
+    meta = read_snapshot_metadata(case_dir) or {}
+    return profile_from_snapshot(arrays, source_model=meta.get("source_model")), None
 
 
 def _list_time_dirs(case_dir: str) -> List[Tuple[float, str]]:
@@ -516,38 +583,44 @@ def matching_time_dir(case_dir: str, physical_time: Optional[float]) -> Optional
 
 
 def _parse_internal_field(path: str, is_vector: bool = False):
+    """Read actual ASCII values; malformed/missing fields never become zeros."""
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        with open(path, "r", encoding="utf-8", errors="strict") as handle:
             text = handle.read()
-    except OSError:
-        return None, None
-    if "uniform" in text:
-        match = re.search(r"internalField\s+uniform\s+([^;]+);", text)
-        if match:
-            token = match.group(1).strip()
+        text = re.sub(r"/\*.*?\*/|//[^\n]*", "", text, flags=re.DOTALL)
+        uniform = re.search(r"internalField\s+uniform\s+([^;]+);", text)
+        if uniform:
+            token = uniform.group(1).strip()
             if is_vector:
-                nums = tuple(float(x) for x in re.findall(r"[\d.eE+-]+", token))
-                return None, np.array(nums[:3] if len(nums) >= 3 else (0.0, 0.0, 0.0))
-            found = re.search(r"[\d.eE+-]+", token)
-            return None, float(found.group()) if found else 0.0
-    match = re.search(
-        r"internalField\s+nonuniform\s+List<\w+>\s*(\d+)\s*\((.*?)\)\s*;",
-        text,
-        re.DOTALL,
-    )
-    if not match:
+                if not (token.startswith("(") and token.endswith(")")):
+                    return None, None
+                values = [float(x) for x in token[1:-1].split()]
+                if len(values) != 3 or not np.all(np.isfinite(values)):
+                    return None, None
+                return None, np.asarray(values)
+            value = float(token)
+            return (None, value) if np.isfinite(value) else (None, None)
+        match = re.search(
+            r"internalField\s+nonuniform\s+List<\w+>\s*(\d+)\s*\((.*?)\)\s*;",
+            text, re.DOTALL,
+        )
+        if not match:
+            return None, None
+        count, inner = int(match.group(1)), match.group(2)
+        if is_vector:
+            rows = re.findall(r"\(([^)]+)\)", inner)
+            values = np.asarray([[float(v) for v in row.split()] for row in rows])
+            if values.shape != (count, 3):
+                return None, None
+        else:
+            values = np.asarray([float(v) for v in inner.split()])
+            if values.shape != (count,):
+                return None, None
+        if count <= 0 or not np.all(np.isfinite(values)):
+            return None, None
+        return values, None
+    except (OSError, UnicodeError, ValueError, TypeError):
         return None, None
-    count = int(match.group(1))
-    inner = match.group(2)
-    if is_vector:
-        vals = []
-        for triple in re.finditer(r"\(([^)]+)\)", inner):
-            parts = triple.group(1).split()
-            if len(parts) >= 3:
-                vals.append((float(parts[0]), float(parts[1]), float(parts[2])))
-        return (np.array(vals[:count], dtype=float) if vals else None), np.zeros(3)
-    nums = [float(x) for x in re.findall(r"[\d.eE+-]+", inner)[:count]]
-    return np.array(nums, dtype=float), 0.0
 
 
 def _read_field(time_path: str, name: str, is_vector: bool = False):
@@ -647,54 +720,52 @@ def cell_radii_from_poly_mesh(case_dir: str, n_cells: int) -> Optional[np.ndarra
 
 
 def capture_arrays_from_time_dir(case_dir: str, time_label: str) -> Optional[Dict[str, np.ndarray]]:
+    """Capture a complete profile for the positively identified source model.
+
+    Uniform existing fields are expanded; missing fields are never supplied.
+    Ideal Gas is accepted only when completion metadata or a single-phase
+    ``idealGas`` dictionary says so. A JWL case with missing phase fields
+    stays incomplete and is not treated as Ideal Gas.
+    """
+    identified = positive_source_model(case_dir)
+    if identified == "conflict":
+        return None
+    from models import SOURCE_MODEL_IG
+
     time_path = os.path.join(case_dir, time_label)
-    p_arr, p_def = _read_field(time_path, "p")
-    t_arr, t_def = _read_field(time_path, "T")
-    u_arr, _u_def = _read_field(time_path, "U", is_vector=True)
-    rhoa_arr, ra_def = _read_field(time_path, "rho.air")
-    if rhoa_arr is None and ra_def is None:
-        rhoa_arr, ra_def = _read_field(time_path, "rho")
-    rho4_arr, r4_def = _read_field(time_path, "rho.c4")
-    a4_arr, a4_def = _read_field(time_path, "alpha.c4")
-    n = 0
-    for arr in (p_arr, t_arr, u_arr, rhoa_arr, rho4_arr, a4_arr):
-        if arr is not None:
-            n = max(n, len(arr))
+    if identified == SOURCE_MODEL_IG:
+        names = ("p", "T", "U", "rho")
+    else:
+        names = ("p", "T", "U", "rho.air", "rho.c4", "alpha.c4")
+    fields = {name: _read_field(time_path, name, is_vector=(name == "U")) for name in names}
+    if any(arr is None and uniform is None for arr, uniform in fields.values()):
+        return None
+    centres_path = os.path.join(time_path, "C")
+    centres, _ = _read_field(time_path, "C", is_vector=True)
+    lengths = {len(arr) for arr, _ in fields.values() if arr is not None}
+    if centres is not None:
+        lengths.add(len(centres))
+    if len(lengths) != 1:
+        return None
+    n = lengths.pop()
     if n < 2:
         return None
-    if p_arr is None:
-        p_arr = np.full(n, 101325.0 if p_def is None else p_def)
-    if t_arr is None:
-        t_arr = np.full(n, 300.0 if t_def is None else t_def)
-    if u_arr is None:
-        u_mag = np.zeros(n)
+    if os.path.isfile(centres_path) and centres is None:
+        return None  # present but corrupt coordinates are not an absent C field
+    if centres is not None:
+        radii = np.linalg.norm(centres, axis=1)
     else:
-        u_mag = np.linalg.norm(np.asarray(u_arr, dtype=float), axis=1)
-    if rhoa_arr is None:
-        rhoa_arr = np.full(n, 1.225 if ra_def is None else ra_def)
-    if rho4_arr is None:
-        rho4_arr = np.full(n, 0.0 if r4_def is None else r4_def)
-    if a4_arr is None:
-        a4_arr = np.full(n, 0.0 if a4_def is None else a4_def)
-    centres_path = os.path.join(time_path, "C")
-    r_1d = None
-    if os.path.isfile(centres_path):
-        c_arr, _ = _parse_internal_field(centres_path, is_vector=True)
-        if c_arr is not None and len(c_arr) == n:
-            r_1d = np.linalg.norm(np.asarray(c_arr, dtype=float), axis=1)
-    if r_1d is None:
-        r_1d = cell_radii_from_poly_mesh(case_dir, n)
-    if r_1d is None:
-        r_1d = np.arange(n, dtype=float) + 0.5
-    return {
-        "r": np.asarray(r_1d, dtype=float),
-        "p": np.asarray(p_arr, dtype=float),
-        "T": np.asarray(t_arr, dtype=float),
-        "U_mag": np.asarray(u_mag, dtype=float),
-        "rho.air": np.asarray(rhoa_arr, dtype=float),
-        "rho.c4": np.asarray(rho4_arr, dtype=float),
-        "alpha.c4": np.asarray(a4_arr, dtype=float),
-    }
+        radii = cell_radii_from_poly_mesh(case_dir, n)
+    if radii is None or len(radii) != n or not np.all(np.isfinite(radii)):
+        return None
+    result = {"r": np.asarray(radii, dtype=float)}
+    for name, (arr, uniform) in fields.items():
+        if arr is None:
+            arr = np.tile(uniform, (n, 1)) if name == "U" else np.full(n, uniform)
+        result["U_mag" if name == "U" else name] = (
+            np.linalg.norm(arr, axis=1) if name == "U" else np.asarray(arr, dtype=float)
+        )
+    return result
 
 
 def latest_complete_time_dir(case_dir: str) -> Optional[str]:
@@ -741,21 +812,13 @@ def write_snapshot_after_run(
     stop_reason = str(getattr(completion, "stop_reason", "") or "")
     final_t = getattr(completion, "final_solver_time_s", None)
     arrived = bool(getattr(completion, "wave_radius_reached", False))
-    if user_stopped:
-        time_label = matching_time_dir(case_dir, final_t)
-        if not time_label:
-            return (
-                "Remap snapshot not written: the stopped 1D state has no matching "
-                "field dump to capture."
-            )
-        meta = write_snapshot_from_time_dir(case_dir, time_label, physical_time=final_t)
-        if meta is None:
-            return "Remap snapshot not written: the stopped 1D field dump is incomplete."
-        return (
-            "Remap snapshot written from last solver state "
-            f"(t={float(meta['source_physical_time']):.6g} s)."
-        )
-    if stop_reason == "wave_radius_reached" or arrived:
+    if user_stopped or stop_reason == "user_stopped":
+        return "Remap snapshot not written: a manual checkpoint is for restart, not handoff."
+    if getattr(completion, "remap_for_2d", False):
+        from completion_1d import wave_radius_stop_is_success
+        if not wave_radius_stop_is_success(completion):
+            return "Remap snapshot not written: live handoff completion is unverified."
+    if stop_reason == "wave_radius_reached":
         time_label = matching_time_dir(case_dir, final_t)
         if not time_label:
             return (
@@ -791,6 +854,34 @@ def resolve_remap_source(case_dir: str) -> RemapSourceResolution:
             blocked=False,
             message="The selected 1D source case does not exist.",
         )
+    # Read the portable record directly: generated cases copy this module alone.
+    completion_path = os.path.join(case_dir, "ggui_1d_run_completion.json")
+    completion = {}
+    if os.path.isfile(completion_path):
+        try:
+            with open(completion_path, encoding="utf-8") as handle:
+                completion = json.load(handle)
+            if not isinstance(completion, dict):
+                raise ValueError("Completion record must be an object")
+        except (OSError, ValueError):
+            return RemapSourceResolution(
+                ok=False, blocked=True, message="Unreadable 1D completion record."
+            )
+    if completion.get("stop_reason") == "user_stopped":
+        return RemapSourceResolution(
+            ok=False, blocked=True,
+            message="Manual interruption creates a restart checkpoint, not a remap handoff.",
+        )
+    if completion.get("remap_for_2d") and (
+        completion.get("stop_reason") != "wave_radius_reached"
+        or completion.get("watchdog_write_requested") is not True
+        or completion.get("watchdog_forced_stop") is True
+        or completion.get("return_code") != 0
+    ):
+        return RemapSourceResolution(
+            ok=False, blocked=True,
+            message="Remap handoff is unverified: a successful live write-and-stop is required; End Time or arrival history alone is insufficient.",
+        )
     if snapshot_exists(case_dir):
         ok, message = validate_snapshot(case_dir)
         if not ok:
@@ -824,7 +915,7 @@ def resolve_remap_source(case_dir: str) -> RemapSourceResolution:
                 + (f" (t={phys_f:.6g} s)." if phys_f is not None else ".")
             ),
             field_names=names,
-            profile=profile_from_snapshot(arrays),
+            profile=profile_from_snapshot(arrays, source_model=meta.get("source_model")),
             metadata=meta,
         )
     latest = latest_complete_time_dir(case_dir)
@@ -834,7 +925,8 @@ def resolve_remap_source(case_dir: str) -> RemapSourceResolution:
             blocked=False,
             message=(
                 "Remap is unavailable: no valid 1D remap snapshot and no complete "
-                "OpenFOAM time directory. The last solver state was not captured. "
+                "OpenFOAM time directory for this source model "
+                "and valid physical cell coordinates. The last solver state was not captured. "
                 "This is independent of writeInterval."
             ),
         )
@@ -867,7 +959,9 @@ def resolve_remap_source(case_dir: str) -> RemapSourceResolution:
             f"{latest} as a fallback."
         ),
         field_names=tuple(arrays),
-        profile=profile_from_snapshot(arrays) if arrays else None,
+        profile=profile_from_snapshot(
+            arrays, source_model=positive_source_model(case_dir)
+        ) if arrays else None,
     )
 
 

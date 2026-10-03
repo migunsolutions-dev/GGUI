@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -320,23 +321,40 @@ def validate_mapping_source(
             warnings.append(resolved.message)
         else:
             errors.append(resolved.message)
+        from models import SOURCE_MODEL_IG
+        from remap_snapshot_1d import positive_source_model
+
+        identified = positive_source_model(source_case)
+        ig_source = identified == SOURCE_MODEL_IG
+        if identified == "conflict":
+            errors.append(
+                "Conflicting remap source model evidence; Ideal-Gas and JWL cannot be mixed."
+            )
         phase_path = os.path.join(source_case, "constant", "phaseProperties")
         try:
             with open(phase_path, "r", encoding="utf-8", errors="ignore") as stream:
                 phase_text = stream.read()
-            if "JWL" not in phase_text or "phases" not in phase_text:
-                errors.append("Source material/EOS is not compatible with the target JWL case.")
-            rho_tokens = (
-                f"rho0 {inputs.rho_charge:g}",
-                f"rho0 {inputs.rho_charge:.1f}",
-            )
-            if not any(token in phase_text for token in rho_tokens):
-                warnings.append(
-                    "Source explosive density could not be matched exactly to the target; "
-                    "review phaseProperties before mapping."
+            if ig_source:
+                if "idealGas" not in phase_text or re.search(r"\bphases\s*\(", phase_text):
+                    errors.append(
+                        "Source material/EOS is not a single-phase Ideal-Gas case."
+                    )
+            else:
+                if "JWL" not in phase_text or "phases" not in phase_text:
+                    errors.append("Source material/EOS is not compatible with the target JWL case.")
+                rho_tokens = (
+                    f"rho0 {inputs.rho_charge:g}",
+                    f"rho0 {inputs.rho_charge:.1f}",
                 )
+                if not any(token in phase_text for token in rho_tokens):
+                    warnings.append(
+                        "Source explosive density could not be matched exactly to the target; "
+                        "review phaseProperties before mapping."
+                    )
         except OSError:
             errors.append("Source constant/phaseProperties is missing.")
+        if ig_source:
+            required_fields = ("p", "T", "U", "rho")
     if snapshot_ok or remap_blocked:
         pass
     elif not source_time:

@@ -322,6 +322,52 @@ class Generator2DTests(unittest.TestCase):
                 b["domain"]["total_computational_cells"],
             )
 
+    def test_ideal_gas_remap_is_single_phase_and_jwl_remap_stays_two_phase(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = os.path.join(td, "ig_source")
+            os.makedirs(os.path.join(source, "constant"))
+            with open(os.path.join(source, "constant", "phaseProperties"), "w", encoding="utf-8") as handle:
+                handle.write(
+                    "type basic;\n"
+                    "thermoType { equationOfState idealGas; }\n"
+                    "equationOfState { gamma 1.4; }\n"
+                )
+            with open(os.path.join(source, "ggui_1d_run_completion.json"), "w", encoding="utf-8") as handle:
+                json.dump({"source_model": "IG_ISOTHERMAL_BURST"}, handle)
+            _, case = self._generate(
+                td,
+                "ig_remap",
+                initialization_source=REMAP_SOURCE,
+                mesh_mode=FIXED_MESH,
+                mapping=MappingSource2D(case_path=source, mapped_radius=0.5),
+            )
+            phase = _read(case, "constant/phaseProperties")
+            schemes = _read(case, "system/fvSchemes")
+            self.assertIn("equationOfState idealGas", phase)
+            self.assertNotIn("phases", phase)
+            self.assertNotIn("activationModel", phase)
+            self.assertNotIn("E0", phase)
+            self.assertTrue(os.path.isfile(os.path.join(case, "0.orig", "rho")))
+            self.assertFalse(os.path.isfile(os.path.join(case, "0.orig", "alpha.c4")))
+            self.assertNotIn("alpha.c4", _read(case, "system/setFieldsDict"))
+            self.assertIn("timeIntegrator Euler", schemes)
+            self.assertIn("fluxScheme Tadmor", schemes)
+            self.assertNotIn("reconstruct(alpha.c4)", schemes)
+            self.assertIn('"reconstruct(p)" vanLeer', schemes)
+
+            _, jwl = self._generate(
+                td,
+                "jwl_remap",
+                initialization_source=REMAP_SOURCE,
+                mesh_mode=FIXED_MESH,
+                mapping=MappingSource2D(case_path="/tmp/not_a_case", mapped_radius=0.5),
+            )
+            jwl_phase = _read(jwl, "constant/phaseProperties")
+            self.assertIn("phases (c4 air);", jwl_phase)
+            self.assertIn("activationModel none", jwl_phase)
+            self.assertTrue(os.path.isfile(os.path.join(jwl, "0.orig", "alpha.c4")))
+            self.assertIn("reconstruct(alpha.c4)", _read(jwl, "system/fvSchemes"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -105,21 +105,17 @@ class Generator2D(BaseGenerator):
         # Radial remap about the user HOB: sample the 1D profile at
         # r_source = hypot(r, z - HOB). Do not use rotateFields, which maps
         # from the origin [0, 0, 0] and leaves an elevated charge on the ground.
+        # python3 is last so `set -e` stops Allrun when the planter fails.
+        # A failing command earlier in an && list does not abort the script.
         base = (
             f"{restore} && blockMesh && postProcess -func writeCellCentres "
-            "&& python3 remap_2d.py"
+            "&& checkMesh"
         )
-        return base + internal_patch + " && checkMesh"
+        return base + internal_patch + " && python3 remap_2d.py"
 
     def _write_remap_scripts(self, case_dir: str, inputs: CaseInputs2D) -> None:
-        src = pathlib.Path(__file__).with_name("remap_fields_2d.py")
-        dest = pathlib.Path(case_dir) / "remap_fields_2d.py"
-        if not src.is_file():
-            raise RuntimeError("remap_fields_2d.py is missing next to generator_2d.py")
-        shutil.copyfile(src, dest)
-        snap_src = pathlib.Path(__file__).with_name("remap_snapshot_1d.py")
-        if snap_src.is_file():
-            shutil.copyfile(snap_src, pathlib.Path(case_dir) / "remap_snapshot_1d.py")
+        from remap_runtime import copy_remap_runtime
+        copy_remap_runtime(case_dir)
         source = win_to_wsl_path(inputs.mapping.case_path)
         source_time = (
             inputs.mapping.specific_time
@@ -142,6 +138,20 @@ class Generator2D(BaseGenerator):
             "    ))\n"
         )
         self._write_text(os.path.join(case_dir, "remap_2d.py"), driver)
+
+    def _remap_is_ideal_gas(self, inputs: CaseInputs2D) -> bool:
+        """Ideal-Gas remap only when the linked 1D case is positively identified."""
+        if inputs.initialization_source == DIRECT_SOURCE:
+            return False
+        from models import SOURCE_MODEL_IG
+        from remap_snapshot_1d import positive_source_model
+
+        found = positive_source_model(str(inputs.mapping.case_path or ""))
+        if found == "conflict":
+            raise ValueError(
+                "Conflicting remap source model evidence; Ideal-Gas and JWL cannot be mixed."
+            )
+        return found == SOURCE_MODEL_IG
 
     def _write_block_mesh(self, case_dir: str, domain) -> None:
         """Wedge topology and orientation copied from blastFoam axisymmetricCharge."""
@@ -252,14 +262,24 @@ mergePatchPairs ();
 
     def _write_initial_fields(self, case_dir: str, inputs: CaseInputs2D) -> None:
         zero = os.path.join(case_dir, "0.orig")
-        rho_air = inputs.p_atm / (287.05 * inputs.t_atm)
-        scalar_specs = (
-            ("p", "[1 -1 -2 0 0 0 0]", inputs.p_atm),
-            ("T", "[0 0 0 1 0 0 0]", inputs.t_atm),
-            ("rho.c4", "[1 -3 0 0 0 0 0]", inputs.rho_charge),
-            ("rho.air", "[1 -3 0 0 0 0 0]", rho_air),
-            ("alpha.c4", "[0 0 0 0 0 0 0]", 0.0),
-        )
+        if self._remap_is_ideal_gas(inputs):
+            from ig_source_state import ambient_state as ig_ambient
+
+            state = ig_ambient(inputs.p_atm, inputs.t_atm)
+            scalar_specs = (
+                ("p", "[1 -1 -2 0 0 0 0]", state.p_atm),
+                ("T", "[0 0 0 1 0 0 0]", state.t_atm),
+                ("rho", "[1 -3 0 0 0 0 0]", state.rho),
+            )
+        else:
+            rho_air = inputs.p_atm / (287.05 * inputs.t_atm)
+            scalar_specs = (
+                ("p", "[1 -1 -2 0 0 0 0]", inputs.p_atm),
+                ("T", "[0 0 0 1 0 0 0]", inputs.t_atm),
+                ("rho.c4", "[1 -3 0 0 0 0 0]", inputs.rho_charge),
+                ("rho.air", "[1 -3 0 0 0 0 0]", rho_air),
+                ("alpha.c4", "[0 0 0 0 0 0 0]", 0.0),
+            )
         for name, dimensions, value in scalar_specs:
             content = (
                 self._foam_header(name, "volScalarField", "0")
@@ -275,6 +295,26 @@ mergePatchPairs ();
         self._write_text(os.path.join(zero, "U"), u)
 
     def _write_phase_properties(self, case_dir: str, inputs: CaseInputs2D) -> None:
+        if self._remap_is_ideal_gas(inputs):
+            from ig_source_state import ambient_state as ig_ambient
+
+            state = ig_ambient(inputs.p_atm, inputs.t_atm)
+            content = self._foam_header("phaseProperties", "dictionary", "constant") + f"""
+type            basic;
+thermoType {{ transport const; thermo eConst; equationOfState idealGas; }}
+equationOfState {{ gamma {state.gamma:.10g}; }}
+specie          {{ molWeight 28.97; }}
+transport       {{ mu 0; Pr 1; }}
+thermodynamics  {{ Cv {state.cv:.10g}; Hf 0; }}
+"""
+            const = os.path.join(case_dir, "constant")
+            self._write_text(os.path.join(const, "phaseProperties"), content)
+            self._write_text(
+                os.path.join(const, "turbulenceProperties"),
+                self._foam_header("turbulenceProperties", "dictionary", "constant")
+                + "simulationType laminar;\n",
+            )
+            return
         validate_required_values(
             inputs,
             undefined_keys=getattr(inputs, "undefined_keys", ()) or (),
@@ -388,6 +428,15 @@ refineProbes {'true' if inputs.refine_probes else 'false'};
         )
 
     def _write_set_fields(self, case_dir: str, inputs: CaseInputs2D, checked) -> None:
+        if self._remap_is_ideal_gas(inputs):
+            content = self._foam_header("setFieldsDict", "dictionary", "system") + """
+fields ();
+nBufferLayers 0;
+defaultFieldValues ();
+regions ();
+"""
+            self._write_text(os.path.join(case_dir, "system", "setFieldsDict"), content)
+            return
         if inputs.initialization_source != DIRECT_SOURCE:
             regions = ""
             level = 0
@@ -467,7 +516,28 @@ solvers
 }
 PIMPLE { nCorrectors 3; nNonOrthogonalCorrectors 0; }
 """
-        fv_schemes = self._foam_header("fvSchemes", "dictionary", "system") + r"""
+        ideal = self._remap_is_ideal_gas(inputs)
+        if ideal:
+            fv_body = r"""
+fluxScheme Tadmor;
+ddtSchemes { default Euler; timeIntegrator Euler; }
+gradSchemes { default cellMDLimited leastSquares 1.0; }
+divSchemes { default none; }
+laplacianSchemes { default Gauss linear corrected; }
+interpolationSchemes
+{
+    default linear;
+    "reconstruct(rho)" vanLeer;
+    "reconstruct(U)" vanLeer;
+    "reconstruct(e)" vanLeer;
+    "reconstruct(p)" vanLeer;
+    "reconstruct(T)" vanLeer;
+    "reconstruct(speedOfSound)" vanLeer;
+}
+snGradSchemes { default corrected; }
+"""
+        else:
+            fv_body = r"""
 fluxScheme Tadmor;
 ddtSchemes { default Euler; timeIntegrator Euler; }
 gradSchemes { default cellMDLimited leastSquares 1.0; }
@@ -486,6 +556,7 @@ interpolationSchemes
 }
 snGradSchemes { default corrected; }
 """
+        fv_schemes = self._foam_header("fvSchemes", "dictionary", "system") + fv_body
         self._write_text(os.path.join(system, "fvSolution"), fv_solution)
         self._write_text(os.path.join(system, "fvSchemes"), fv_schemes)
 
@@ -505,6 +576,8 @@ snGradSchemes { default corrected; }
         # cells at existing ``probes`` / ``blastProbes`` function-object locations.
         # There is no supported controlDict function type ``refineProbes``.
         probe_fields = list(inputs.output_fields) if inputs.output_fields else ["p"]
+        if ideal:
+            probe_fields = [name for name in probe_fields if name != "alpha.c4"]
         if bool(getattr(inputs, "enable_impulse", False)) and "impulse" not in probe_fields:
             probe_fields.append("impulse")
         if bool(getattr(inputs, "enable_dynamic_pressure", False)) and "dynamicPressure" not in probe_fields:
@@ -576,13 +649,14 @@ snGradSchemes { default corrected; }
         )
         remap_block = ""
         if bool(getattr(inputs, "output_remap_data", False)):
-            remap_block = """    remapDump
-    {
+            dump_fields = "p U rho T" if ideal else "p U rho T alpha.c4"
+            remap_block = f"""    remapDump
+    {{
         type            writeObjects;
         libs            ("libutilityFunctionObjects.so");
-        objects         (p U rho T alpha.c4);
+        objects         ({dump_fields});
         writeControl    onEnd;
-    }
+    }}
 """
         probes_block = ""
         if probes:
@@ -708,6 +782,7 @@ functions
             else "blastFoam"
         )
         decompose = "decomposePar -force && " if inputs.cores > 1 else ""
+        listed_fields = "p rho U T" if self._remap_is_ideal_gas(inputs) else "p rho U T alpha.c4"
         allrun = f"""#!/usr/bin/env bash
 cd "$(dirname "$0")" || exit 1
 source "{self.openfoam_bashrc}" || true
@@ -724,7 +799,7 @@ latest=$(ls -1d [0-9]* 0.[0-9]* 2>/dev/null | sort -g | tail -1)
   echo '/* GGUI 2D remap snapshot ({REMAP_2D_FILENAME}) */'
   echo "time            ${{latest:-latest}};"
   echo 'sourceCase      ".";'
-  echo 'fields          (p rho U T alpha.c4);'
+  echo 'fields          ({listed_fields});'
 }} > {REMAP_2D_FILENAME}
 """
         allclean = f"""#!/usr/bin/env bash

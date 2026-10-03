@@ -92,6 +92,9 @@ def _write_time_dir(case_dir: str, label: str, n: int = 8, p_peak: float = 5.0e6
     _write_scalar(os.path.join(tdir, "rho.air"), "rho.air", rho_air)
     _write_scalar(os.path.join(tdir, "rho.c4"), "rho.c4", rho_c4)
     _write_scalar(os.path.join(tdir, "alpha.c4"), "alpha.c4", alpha)
+    if not os.path.isdir(os.path.join(case_dir, "constant", "polyMesh")):
+        _write_vector(os.path.join(tdir, "C"), "C", r)
+
 
 
 def _write_control(case_dir: str, write_interval: float = WRITE_INTERVAL) -> None:
@@ -132,8 +135,21 @@ def _arrived_completion(case_dir: str, final_t: float = FINAL_T) -> CompletionRe
     return record
 
 
+def _ig_snapshot_arrays(n: int = 6) -> dict:
+    return {
+        "r": np.linspace(0.0, 1.0, n),
+        "p": np.full(n, 2.0e5),
+        "rho": np.full(n, 1.2),
+        "T": np.full(n, 300.0),
+        "U_mag": np.zeros(n),
+    }
+
+
 def _snapshot_arrays(n: int = 6) -> dict:
     return {
+        "rho.air": np.zeros_like(np.linspace(0.0, 1.0, n)),
+        "rho.c4": np.zeros_like(np.linspace(0.0, 1.0, n)),
+        "alpha.c4": np.zeros_like(np.linspace(0.0, 1.0, n)),
         "r": np.linspace(0.0, 1.0, n),
         "p": np.full(n, 2.0e5),
         "T": np.full(n, 300.0),
@@ -286,6 +302,9 @@ class RemapSnapshot1DTests(unittest.TestCase):
             write_snapshot(
                 td,
                 {
+                    "rho.air": np.zeros_like(np.linspace(0.0, 1.0, 6)),
+                    "rho.c4": np.zeros_like(np.linspace(0.0, 1.0, 6)),
+                    "alpha.c4": np.zeros_like(np.linspace(0.0, 1.0, 6)),
                     "r": np.linspace(0.0, 1.0, 6),
                     "p": np.full(6, 2.0e5),
                     "T": np.full(6, 300.0),
@@ -319,6 +338,9 @@ class RemapSnapshot1DTests(unittest.TestCase):
             write_snapshot(
                 td,
                 {
+                    "rho.air": np.zeros_like(np.linspace(0.0, 1.0, 6)),
+                    "rho.c4": np.zeros_like(np.linspace(0.0, 1.0, 6)),
+                    "alpha.c4": np.zeros_like(np.linspace(0.0, 1.0, 6)),
                     "r": np.linspace(0.0, 1.0, 6),
                     "p": np.full(6, 2.0e5),
                     "T": np.full(6, 300.0),
@@ -349,6 +371,9 @@ class RemapSnapshot1DTests(unittest.TestCase):
             write_snapshot(
                 td,
                 {
+                    "rho.air": np.zeros_like(np.linspace(0.0, 1.0, 6)),
+                    "rho.c4": np.zeros_like(np.linspace(0.0, 1.0, 6)),
+                    "alpha.c4": np.zeros_like(np.linspace(0.0, 1.0, 6)),
                     "r": np.linspace(0.0, 1.0, 6),
                     "p": np.full(6, 2.0e5),
                     "T": np.full(6, 300.0),
@@ -369,6 +394,9 @@ class RemapSnapshot1DTests(unittest.TestCase):
             write_snapshot(
                 td,
                 {
+                    "rho.air": np.zeros_like(np.linspace(0.0, 1.0, 6)),
+                    "rho.c4": np.zeros_like(np.linspace(0.0, 1.0, 6)),
+                    "alpha.c4": np.zeros_like(np.linspace(0.0, 1.0, 6)),
                     "r": np.linspace(0.0, 1.0, 6),
                     "p": np.full(6, 2.0e5),
                     "T": np.full(6, 300.0),
@@ -389,6 +417,9 @@ class RemapSnapshot1DTests(unittest.TestCase):
             write_snapshot(
                 td,
                 {
+                    "rho.air": np.zeros_like(np.linspace(0.0, 1.0, 6)),
+                    "rho.c4": np.zeros_like(np.linspace(0.0, 1.0, 6)),
+                    "alpha.c4": np.zeros_like(np.linspace(0.0, 1.0, 6)),
                     "r": np.linspace(0.0, 1.0, 6),
                     "p": np.full(6, 2.0e5),
                     "T": np.full(6, 300.0),
@@ -477,6 +508,9 @@ class RemapSnapshot1DTests(unittest.TestCase):
             write_snapshot(
                 td,
                 {
+                    "rho.air": np.zeros_like(r),
+                    "rho.c4": np.zeros_like(r),
+                    "alpha.c4": np.zeros_like(r),
                     "r": r,
                     "p": p,
                     "T": np.full(n, 300.0),
@@ -522,14 +556,14 @@ class RemapSnapshot1DTests(unittest.TestCase):
             )
             with open(os.path.join(case3d, "remap_radial.py"), encoding="utf-8") as handle:
                 script = handle.read()
-            self.assertIn("load_profile_for_remap", script)
-            self.assertIn("using dedicated 1D remap snapshot", script)
+            self.assertIn("verified_remap_source", script)
+            self.assertIn("using verified", script)
             self.assertNotIn('SOURCE_TIME = "snapshot"', script)
             self.assertTrue(os.path.isfile(os.path.join(case3d, "remap_snapshot_1d.py")))
             self.assertTrue(os.path.isfile(os.path.join(case3d, "remap_fields_2d.py")))
             self.assertIn("carry_mixture_mass_in_air", script)
             self.assertIn("effective_mapped_radius", script)
-            self.assertIn("remap_radius_m", script)
+            self.assertIn("read_handoff_radius(SOURCE_1D_CASE)", script)
             self.assertNotIn("np.linspace", script)
             self.assertNotIn("a4_3d = np.zeros(n_cells)", script)
             self.assertIn(resolved.time_label, script)
@@ -611,6 +645,9 @@ class RemapSnapshot1DTests(unittest.TestCase):
             write_snapshot(
                 td,
                 {
+                    "rho.air": np.zeros_like(np.linspace(0.0, 1.0, 5)),
+                    "rho.c4": np.zeros_like(np.linspace(0.0, 1.0, 5)),
+                    "alpha.c4": np.zeros_like(np.linspace(0.0, 1.0, 5)),
                     "r": np.linspace(0.0, 1.0, 5),
                     "p": np.full(5, 1.0e5),
                     "T": np.full(5, 300.0),
@@ -622,7 +659,7 @@ class RemapSnapshot1DTests(unittest.TestCase):
             reset_completion_for_new_run(td)
             self.assertFalse(snapshot_exists(td))
 
-    def test_user_stop_writes_snapshot_only_when_dump_matches(self):
+    def test_user_stop_never_exports_a_remap_handoff(self):
         with tempfile.TemporaryDirectory() as td:
             _write_control(td)
             record = CompletionRecord(
@@ -636,8 +673,8 @@ class RemapSnapshot1DTests(unittest.TestCase):
             self.assertFalse(snapshot_exists(td))
             _write_time_dir(td, f"{FINAL_T:g}")
             status = write_snapshot_after_run(td, record, user_stopped=True)
-            self.assertIn("Remap snapshot written", status)
-            self.assertTrue(snapshot_exists(td))
+            self.assertIn("not written", status)
+            self.assertFalse(snapshot_exists(td))
 
     def test_declared_remap_radius_ignores_domain_and_field_extent(self):
         with tempfile.TemporaryDirectory() as td:
@@ -653,6 +690,9 @@ class RemapSnapshot1DTests(unittest.TestCase):
             write_snapshot(
                 td,
                 {
+                    "rho.air": np.zeros_like(np.linspace(0.01, 1.65, 8)),
+                    "rho.c4": np.zeros_like(np.linspace(0.01, 1.65, 8)),
+                    "alpha.c4": np.zeros_like(np.linspace(0.01, 1.65, 8)),
                     "r": np.linspace(0.01, 1.65, 8),
                     "p": np.full(8, 2.0e5),
                     "T": np.full(8, 300.0),
@@ -728,9 +768,16 @@ class RemapSnapshot1DTests(unittest.TestCase):
                         )
                     info = _completion_info(td)
                     self.assertEqual(info["source_model"], expected)
-                    metadata = write_snapshot(
-                        td, _snapshot_arrays(), physical_time=FINAL_T
+                    arrays = (
+                        _ig_snapshot_arrays()
+                        if expected == SOURCE_MODEL_IG
+                        else _snapshot_arrays()
                     )
+                    metadata = write_snapshot(td, arrays, physical_time=FINAL_T)
+                    if expected == SOURCE_MODEL_IG:
+                        self.assertIn("rho", metadata["field_names"])
+                        self.assertNotIn("alpha.c4", metadata["field_names"])
+                        self.assertNotIn("rho.air", read_snapshot_arrays(td))
                     self.assertEqual(metadata["source_model"], expected)
                     self.assertEqual(
                         metadata["source_model_schema_version"],
@@ -742,6 +789,39 @@ class RemapSnapshot1DTests(unittest.TestCase):
                         stored["source_model_schema_version"],
                         SOURCE_MODEL_SCHEMA_VERSION,
                     )
+
+    def test_ideal_gas_capture_uses_rho_and_rejects_a_broken_jwl_dump(self):
+        from remap_snapshot_1d import capture_arrays_from_time_dir
+
+        with tempfile.TemporaryDirectory() as td:
+            _write_control(td)
+            _write_time_dir(td, "0.2")
+            for name in ("rho.air", "rho.c4", "alpha.c4"):
+                os.remove(os.path.join(td, "0.2", name))
+            captured = capture_arrays_from_time_dir(td, "0.2")
+            self.assertIsNone(captured)
+            with open(os.path.join(td, "constant", "phaseProperties"), "w", encoding="utf-8") as handle:
+                handle.write(
+                    "type basic;\n"
+                    "thermoType { equationOfState idealGas; }\n"
+                    "equationOfState { gamma 1.4; }\n"
+                )
+            write_completion_record(
+                td,
+                CompletionRecord(
+                    mode=RUN_MODE_TERMINATE,
+                    stop_reason=STOP_REASON_WAVE_RADIUS_REACHED,
+                    wave_radius_reached=True,
+                    final_solver_time_s=0.2,
+                    source_model=SOURCE_MODEL_IG,
+                ),
+            )
+            _write_scalar(os.path.join(td, "0.2", "rho"), "rho", np.full(8, 1.2))
+            captured = capture_arrays_from_time_dir(td, "0.2")
+            self.assertIsNotNone(captured)
+            self.assertIn("rho", captured)
+            self.assertNotIn("alpha.c4", captured)
+            self.assertNotIn("rho.air", captured)
 
 
 if __name__ == "__main__":
