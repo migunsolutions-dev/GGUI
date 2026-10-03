@@ -521,6 +521,22 @@ def detect_arrival_in_case(
     return updated
 
 
+def restore_initialized_after_unprogressed_stop(case_dir: str) -> None:
+    """Drop a user stop that never wrote a restart time.
+
+    The case stays the initialized case. The next Run starts from startTime.
+    """
+    record = read_completion_record(case_dir)
+    if record is None:
+        return
+    record.stop_reason = ""
+    record.return_code = None
+    record.final_solver_time_s = None
+    record.wave_radius_reached = False
+    record.detected_arrival_time_s = None
+    write_completion_record(case_dir, record)
+
+
 def finalize_completion_record(
     case_dir: str,
     *,

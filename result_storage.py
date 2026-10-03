@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 import os
 import re
 import shutil
@@ -102,6 +103,8 @@ def _numeric_time_entries(root: str) -> list[tuple[float, str, str]]:
 
 
 _RE_TIME_EQ = re.compile(r"(?m)^Time\s*=\s*([0-9.eE+-]+)")
+_RE_DELTA_T = re.compile(r"(?m)^deltaT\s*=\s*([0-9.eE+-]+)")
+_RE_LOG_END = re.compile(r"(?m)^End\s*$")
 _RE_ROOT_END_TIME = re.compile(r"(?m)^\s*endTime\s+([0-9.eE+-]+)\s*;")
 
 
@@ -130,24 +133,42 @@ def control_dict_root_end_time(case_dir: str) -> Optional[float]:
         return None
 
 
+def logged_solver_progress(
+    case_dir: str, log_text: Optional[str] = None
+) -> tuple:
+    """Step count, last ``Time =``, and last ``deltaT`` from one log read.
+
+    The live 1D status line follows probe samples, which can stop short of the
+    final solver step. This is the log the completion record already used.
+    """
+    text = _read_solver_log(case_dir, log_text)
+    times = _RE_TIME_EQ.findall(text)
+    deltas = _RE_DELTA_T.findall(text)
+    last_t = None
+    if times:
+        try:
+            value = float(times[-1])
+        except ValueError:
+            value = None
+        if _finite_number(value):
+            last_t = float(value)
+    last_dt = None
+    if deltas:
+        try:
+            value = float(deltas[-1])
+        except ValueError:
+            value = None
+        if _finite_positive(value):
+            last_dt = float(value)
+    return len(times), last_t, last_dt
+
+
 def last_blastfoam_logged_time(
     case_dir: str, log_text: Optional[str] = None
 ) -> Optional[float]:
     """Last ``Time =`` value from log.blastFoam."""
-    if log_text is None:
-        log_path = os.path.join(case_dir, "log.blastFoam")
-        try:
-            with open(log_path, encoding="utf-8", errors="ignore") as stream:
-                log_text = stream.read()
-        except OSError:
-            return None
-    times = _RE_TIME_EQ.findall(log_text)
-    if not times:
-        return None
-    try:
-        return float(times[-1])
-    except ValueError:
-        return None
+    _step, last_t, _dt = logged_solver_progress(case_dir, log_text)
+    return last_t
 
 
 def is_generated_1d_case(case_dir: str) -> bool:
@@ -166,18 +187,111 @@ def is_generated_1d_case(case_dir: str) -> bool:
         return False
 
 
+def last_blastfoam_logged_delta_t(
+    case_dir: str, log_text: Optional[str] = None
+) -> Optional[float]:
+    """Last ``deltaT =`` value from log.blastFoam, if the log printed one."""
+    if log_text is None:
+        log_path = os.path.join(case_dir, "log.blastFoam")
+        try:
+            with open(log_path, encoding="utf-8", errors="ignore") as stream:
+                log_text = stream.read()
+        except OSError:
+            return None
+    values = _RE_DELTA_T.findall(log_text or "")
+    if not values:
+        return None
+    try:
+        value = float(values[-1])
+    except ValueError:
+        return None
+    return value if math.isfinite(value) and value > 0.0 else None
+
+
+def has_resumable_solver_time(case_dir: str) -> bool:
+    """True when a saved time directory after t=0 exists."""
+    return any(entry[0] > 0.0 for entry in _numeric_time_entries(case_dir or ""))
+
+
+def solver_clock_reached_end(
+    end_time: Optional[float],
+    last_time: Optional[float],
+    last_delta_t: Optional[float] = None,
+) -> bool:
+    """One rule for a normal blastFoam stop at the configured maximum time.
+
+    The solver stops when the next accepted step would pass ``endTime``, so the
+    last recorded time is often one ``deltaT`` short. That is completion.
+    A stop many steps earlier is not.
+    """
+    if not _finite_positive(end_time) or not _finite_number(last_time):
+        return False
+    end = float(end_time)
+    last = float(last_time)
+    gap = end - last
+    if gap <= max(1.0e-12, abs(end) * 1.0e-12):
+        return True
+    if _finite_positive(last_delta_t) and gap <= float(last_delta_t) * (1.0 + 1.0e-6):
+        return True
+    return False
+
+
+def _finite_number(value: Optional[float]) -> bool:
+    return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def _finite_positive(value: Optional[float]) -> bool:
+    return _finite_number(value) and float(value) > 0.0
+
+
+def _read_solver_log(case_dir: str, log_text: Optional[str]) -> str:
+    if log_text is not None:
+        return log_text
+    log_path = os.path.join(case_dir, "log.blastFoam")
+    try:
+        with open(log_path, encoding="utf-8", errors="ignore") as stream:
+            return stream.read()
+    except OSError:
+        return ""
+
+
+def case_reached_configured_end(
+    case_dir: str, log_text: Optional[str] = None
+) -> bool:
+    """Whether the solver clock reached the root ``endTime``.
+
+    Uses the later of the log time and the newest time directory, and the last
+    logged ``deltaT``. Probe samples are not a second clock.
+    """
+    end_time = control_dict_root_end_time(case_dir)
+    text = _read_solver_log(case_dir, log_text)
+    last_t = last_blastfoam_logged_time(case_dir, text)
+    entries = [entry for entry in _numeric_time_entries(case_dir) if entry[0] > 0.0]
+    if entries and (last_t is None or entries[-1][0] > last_t):
+        last_t = entries[-1][0]
+    last_dt = last_blastfoam_logged_delta_t(case_dir, text)
+    if solver_clock_reached_end(end_time, last_t, last_dt):
+        return True
+    # A log that closes with End but never printed deltaT still counts when the
+    # remaining gap is inside the historical relative bound. This is the same
+    # helper, not a second Validation rule.
+    if (
+        last_dt is None
+        and text
+        and _RE_LOG_END.search(text)
+        and "FOAM FATAL" not in text
+        and _finite_positive(end_time)
+        and _finite_number(last_t)
+    ):
+        gap = float(end_time) - float(last_t)
+        return gap <= max(1.0e-9, abs(float(end_time)) * 1.0e-4)
+    return False
+
+
 def logged_time_reached_end(
     case_dir: str, log_text: Optional[str] = None
 ) -> bool:
-    end_time = control_dict_root_end_time(case_dir)
-    last_t = last_blastfoam_logged_time(case_dir, log_text)
-    if last_t is None:
-        entries = [entry for entry in _numeric_time_entries(case_dir) if entry[0] > 0]
-        last_t = entries[-1][0] if entries else None
-    if end_time is None or last_t is None:
-        return False
-    tolerance = max(1.0e-9, abs(end_time) * 1.0e-4)
-    return last_t >= end_time - tolerance
+    return case_reached_configured_end(case_dir, log_text)
 
 
 def solver_run_succeeded(
@@ -214,14 +328,8 @@ def solver_run_succeeded(
 
 
 def run_reached_configured_end(case_dir: str) -> bool:
-    """Confirm that a successful terminal run materialized its configured end."""
-    end_time = control_dict_root_end_time(case_dir)
-    entries = [entry for entry in _numeric_time_entries(case_dir) if entry[0] > 0]
-    if end_time is None or not entries:
-        return False
-    latest = entries[-1][0]
-    tolerance = max(1.0e-12, abs(end_time) * 1.0e-8)
-    return latest >= end_time - tolerance
+    """Same end-time contract as completion recording and Validation."""
+    return case_reached_configured_end(case_dir)
 
 
 def _safe_remove_tree(case_dir: str, path: str) -> None:

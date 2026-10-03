@@ -201,5 +201,41 @@ class ResultStorageTests(unittest.TestCase):
                 self.assertEqual(runner._run_result_export(), 0)
 
 
+    def test_normal_last_step_counts_as_end_time(self):
+        from result_storage import case_reached_configured_end, logged_time_reached_end
+
+        with tempfile.TemporaryDirectory() as case:
+            _mkdir(case, "system")
+            with open(os.path.join(case, "system", "controlDict"), "w", encoding="utf-8") as stream:
+                stream.write("endTime         0.0001;\n")
+            with open(os.path.join(case, "log.blastFoam"), "w", encoding="utf-8") as stream:
+                stream.write("deltaT = 8.07118e-07\nTime = 9.96146e-05\nEnd\n")
+            self.assertTrue(case_reached_configured_end(case))
+            self.assertTrue(logged_time_reached_end(case))
+            self.assertTrue(run_reached_configured_end(case))
+
+    def test_logged_solver_progress_reads_the_final_step(self):
+        from result_storage import logged_solver_progress
+
+        with tempfile.TemporaryDirectory() as case:
+            with open(os.path.join(case, "log.blastFoam"), "w", encoding="utf-8") as stream:
+                stream.write("Time = 0.001\ndeltaT = 1e-06\nTime = 0.002\ndeltaT = 2e-07\n")
+            step, last_t, last_dt = logged_solver_progress(case)
+            self.assertEqual(step, 2)
+            self.assertAlmostEqual(last_t, 0.002)
+            self.assertAlmostEqual(last_dt, 2e-07)
+
+    def test_early_stop_is_not_end_time(self):
+        from result_storage import case_reached_configured_end
+
+        with tempfile.TemporaryDirectory() as case:
+            _mkdir(case, "system")
+            with open(os.path.join(case, "system", "controlDict"), "w", encoding="utf-8") as stream:
+                stream.write("endTime         0.002;\n")
+            with open(os.path.join(case, "log.blastFoam"), "w", encoding="utf-8") as stream:
+                stream.write("deltaT = 1.0e-06\nTime = 0.001\n")
+            self.assertFalse(case_reached_configured_end(case))
+
+
 if __name__ == "__main__":
     unittest.main()

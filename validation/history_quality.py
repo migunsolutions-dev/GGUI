@@ -10,8 +10,6 @@ from validation.probes import is_physical_probe_value
 
 ARRIVAL_OVERPRESSURE_PA = 1000.0
 MIN_PROBE_SAMPLES = 8
-END_TIME_REL_TOL = 1.0e-4
-END_TIME_ABS_TOL = 1.0e-9
 PEAK_NEAR_END_FRACTION = 0.90
 RESIDUAL_POSITIVE_FRACTION = 0.05
 
@@ -63,20 +61,24 @@ def run_reached_end_time(
     last_time_s: Optional[float],
     end_time_s: Optional[float],
     reached_end: Optional[bool] = None,
+    last_delta_t: Optional[float] = None,
 ) -> Optional[bool]:
+    """Honor an explicit case outcome. Do not invent a second tolerance.
+
+    ``reached_end`` comes from the shared solver-clock rule. A probe sample
+    that ends one write interval early must not overturn that decision.
+    """
     if reached_end is True:
-        return True
-    if not is_finite_number(end_time_s):
-        return None if reached_end is None else bool(reached_end)
-    end = float(end_time_s)
-    tol = max(END_TIME_ABS_TOL, abs(end) * END_TIME_REL_TOL)
-    if is_finite_number(last_time_s) and float(last_time_s) >= end - tol:
         return True
     if reached_end is False:
         return False
-    if reached_end is None:
-        return False if is_finite_number(last_time_s) else None
-    return bool(reached_end)
+    if not is_finite_number(end_time_s):
+        return None
+    from result_storage import solver_clock_reached_end
+
+    if solver_clock_reached_end(end_time_s, last_time_s, last_delta_t):
+        return True
+    return False if is_finite_number(last_time_s) else None
 
 
 def assess_history(

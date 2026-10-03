@@ -5,7 +5,7 @@ from typing import Dict, Optional, Tuple
 
 import ig_source_state as igs
 import jwl_activation_energy as jwl_act
-from base_generator import BaseGenerator
+from base_generator import ALPHA_C4_CHECK_SCRIPT_1D, BaseGenerator
 from models import (
     BOUNDARY_1D_REFLECT,
     BOUNDARY_1D_TERMINATE,
@@ -119,6 +119,7 @@ class Generator1D(BaseGenerator):
             self.openfoam_bashrc,
             use_ig_source_check=ig_state is not None,
             ig_source_check_p_atm=float(inputs.p_atm),
+            alpha_check_script=None if ig_state is not None else ALPHA_C4_CHECK_SCRIPT_1D,
         )
 
         if ig_state is not None:

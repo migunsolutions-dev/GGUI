@@ -87,6 +87,12 @@ END { exit (found ? 0 : 1); }
 }
 '''
 
+# 1D has no Inside/Outside pre-refinement controls. The shared script keeps the 3D wording.
+ALPHA_C4_CHECK_SCRIPT_1D = ALPHA_C4_CHECK_SCRIPT.replace(
+    "FATAL: No cells captured inside the charge volume. Increase charge pre-refinement (Inside/Outside), increase Outside extent, or refine base mesh near the charge.",
+    "FATAL: No cells captured inside the charge. Reduce Cell Size so at least one cell centre lies inside the charge radius.",
+)
+
 
 def ig_source_check_script(p_atm: float) -> str:
     """Bind the burst-detection threshold to the case ambient pressure.
@@ -171,6 +177,7 @@ class BaseGenerator:
         fast_run_mode: bool = True,
         use_ig_source_check: bool = False,
         ig_source_check_p_atm: float = 101325.0,
+        alpha_check_script: Optional[str] = None,
     ) -> None:
         """
         Write Allrun and Allclean scripts.
@@ -287,7 +294,10 @@ bash ./check_ig_source.sh || exit 1
 """
             else:
                 # Sanity check: alpha.c4 must have at least one positive internalField value (uniform or nonuniform)
-                self._write_text(os.path.join(case_dir, "check_alpha_c4.sh"), ALPHA_C4_CHECK_SCRIPT)
+                self._write_text(
+                    os.path.join(case_dir, "check_alpha_c4.sh"),
+                    alpha_check_script or ALPHA_C4_CHECK_SCRIPT,
+                )
                 alpha_check_block = """
 # Pre-solver sanity: alpha.c4 must have at least one positive value (no explosive mass -> blastFoam "No mass was found in the domain")
 bash ./check_alpha_c4.sh || exit 1

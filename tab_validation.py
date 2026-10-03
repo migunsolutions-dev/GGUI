@@ -1041,12 +1041,20 @@ class TabValidation(QWidget):
     def _case_end_state(self, case: Optional[str], last_time: Optional[float]) -> Tuple[Optional[float], Optional[bool]]:
         if not case:
             return None, None
-        ctrl = os.path.join(case, "system", "controlDict")
-        try:
-            stamp = os.path.getmtime(ctrl) if os.path.isfile(ctrl) else None
-        except OSError:
-            stamp = None
-        cached = self._case_end_cache.get((case, stamp))
+        stamps = []
+        for name in (
+            os.path.join("system", "controlDict"),
+            "log.blastFoam",
+            "ggui_1d_run_completion.json",
+            "ggui_2d_wave_stop.json",
+        ):
+            path = os.path.join(case, name)
+            try:
+                stamps.append(os.path.getmtime(path) if os.path.isfile(path) else None)
+            except OSError:
+                stamps.append(None)
+        key = (case, tuple(stamps))
+        cached = self._case_end_cache.get(key)
         if cached is not None:
             end_time, reached = cached
         else:
@@ -1060,13 +1068,10 @@ class TabValidation(QWidget):
             except Exception:
                 end_time = None
                 reached = None
-            self._case_end_cache[(case, stamp)] = (end_time, reached)
-        if last_time is not None and end_time is not None:
-            from validation.history_quality import run_reached_end_time
-
-            reached = run_reached_end_time(last_time_s=last_time, end_time_s=end_time, reached_end=reached)
+            self._case_end_cache[key] = (end_time, reached)
         # Terminate-at-radius is a successful 1D finish. Probe histories from that
         # stop are eligible for Kingery-Bulmash even though endTime was only an upper bound.
+        # The probe file's last sample is not a second end-time clock.
         if reached is not True and self._radius_termination_complete(case):
             reached = True
         return end_time, reached
@@ -1243,11 +1248,24 @@ class TabValidation(QWidget):
         self._numerical_cache = {}
 
     def _latest_probe_path(self, case: str, fo: str, field: str) -> str:
-        key = (case, fo, field)
+        """Resolve the newest probe file. A miss is not cached.
+
+        Run refreshes Validation before postProcessing exists. Caching that
+        empty path kept the tab on "histories were not generated" after the
+        solver had written the files.
+        """
+        root = os.path.join(case or "", "postProcessing", fo or "")
+        try:
+            root_stamp = os.path.getmtime(root) if case and fo and os.path.isdir(root) else None
+        except OSError:
+            root_stamp = None
+        if root_stamp is None:
+            return ""
+        key = (case, fo, field, root_stamp)
         hit = self._probe_path_cache.get(key)
         if hit is not None:
             return hit
-        path = latest_probe_field_file(case, fo, field) if case and fo else ""
+        path = latest_probe_field_file(case, fo, field)
         self._probe_path_cache[key] = path
         return path
 
@@ -1690,7 +1708,8 @@ class TabValidation(QWidget):
         charge = self._snapshot.material_name or "—"
         mass = float(self.spin_kb_mass.value())
         if self._auto_sampling():
-            plans = self._collect_auto_plans()
+            shown = self._display_dims()
+            plans = [plan for plan in self._collect_auto_plans() if plan.dim in shown]
             rmin = min((p.r_min for p in plans), default=None)
             rmax = max((p.r_max for p in plans), default=None)
             n_auto = sum(len(p.points) for p in plans)

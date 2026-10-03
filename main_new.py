@@ -62,6 +62,7 @@ from external_case_workflow_2d import (
     write_control_dict_entries,
 )
 from initialization_plan import build_initialization_plan
+from case_session import CaseSession, input_snapshot
 from startup_capture_guard import UNSAFE_CAPTURE_MESSAGE, require_safe_capture
 from case_init_mode import record_set_cmd_actual
 from project_io import (
@@ -466,6 +467,7 @@ class BlastFoamApp(QMainWindow):
         
         # State
         self.runner = None
+        self._case_sessions = {}
         self._prep_worker = None
         self._prep_phase = "idle"  # idle|starting|active|cancelling|finished
         self._prep_kind = None  # native_2d|import_copy|imported_init
@@ -474,6 +476,8 @@ class BlastFoamApp(QMainWindow):
         self._pending_exact_end_after_prep = False
         self._run_user_interrupted = False
         self._ui_review = None  # attached only by ui_preview / tests
+        self.active_case_dir_1d = None
+        self.active_case_initialized_1d = False
         self.active_case_dir_3d = None
         self.active_case_initialized_3d = False
         self.active_case_dir_2d = None
@@ -485,6 +489,7 @@ class BlastFoamApp(QMainWindow):
         # Build UI
         self._init_toolbar()
         self._init_central_widget()
+        self._connect_case_edit_checks()
         
         # Initialize info panel
         self.info_panel.update_info(
@@ -497,6 +502,72 @@ class BlastFoamApp(QMainWindow):
         # Explicitly clear any widget-driven floor so the window stays shrinkable
         # in both width and height.
         self.setMinimumSize(0, 0)
+
+    def _record_case_initialized(self, dimension, case_dir, inputs):
+        session = CaseSession()
+        session.initialized(case_dir, inputs)
+        self._case_sessions[dimension] = session
+
+    def _observe_case_edits(self):
+        for dimension, session in tuple(self._case_sessions.items()):
+            if not session.case_dir:
+                continue
+            tab = {"1D": self.tab_1d, "2D": self.tab_2d, "3D": self.tab_3d}[dimension]
+            try:
+                session.observe(
+                    tab.get_case_inputs(),
+                    verified_runtime_patch=(dimension == "1D"),
+                )
+            except (ValueError, TypeError):
+                session.stale = True
+                session.changed_fields = ("invalid_input",)
+            if session.stale:
+                setattr(self, "active_case_initialized_" + dimension.lower(), False)
+                if dimension == "2D":
+                    tab.set_simulation_state(SimulationState2D.STALE)
+                self.status_bar.set_status(dimension + " stale — Initialize required", "#e67e22")
+            if dimension == "1D":
+                self._sync_1d_run_button()
+
+    def _queue_case_edit_check(self, *_args):
+        if getattr(self, "_case_check_queued", False):
+            return
+        self._case_check_queued = True
+        def check():
+            self._case_check_queued = False
+            self._observe_case_edits()
+        QTimer.singleShot(0, check)
+
+    def _connect_case_edit_checks(self):
+        # Connect current editors; Run also compares the full input snapshot so
+        # dynamically-created advanced dialogs cannot bypass this contract.
+        for tab in (self.tab_1d, self.tab_2d, self.tab_3d):
+            for widget in tab.findChildren(QWidget):
+                for name in ("valueChanged", "currentIndexChanged", "toggled", "editingFinished", "cellChanged"):
+                    signal = getattr(widget, name, None)
+                    if signal is not None and hasattr(signal, "connect"):
+                        signal.connect(self._queue_case_edit_check)
+                        break
+        self.probes_model.changed.connect(self._queue_case_edit_check)
+
+    def _case_run_guard(self, dimension, inputs):
+        if self._prep_is_active() or (self.runner is not None and self.runner.isRunning()):
+            QMessageBox.warning(self, "Operation in progress", "Wait for the active operation or interrupt it before Run.")
+            return False
+        case_dir = getattr(self, "active_case_dir_" + dimension.lower(), None)
+        initialized = getattr(self, "active_case_initialized_" + dimension.lower(), False)
+        session = self._case_sessions.get(dimension)
+        runtime_patch = dimension == "1D"
+        if not initialized or session is None or not session.runnable(
+            case_dir, inputs, verified_runtime_patch=runtime_patch
+        ):
+            if session is not None and session.stale:
+                self._observe_case_edits()
+            message = session.requirement() if session is not None else "Initialize is required before Run."
+            QMessageBox.warning(self, "Initialize required", message)
+            self.status_bar.set_status(dimension + " — Initialize required", "#e67e22")
+            return False
+        return True
 
     def _apply_default_opening_geometry(self) -> None:
         """First-show default size ≈1685×1060, fitted inside availableGeometry.
@@ -694,6 +765,7 @@ class BlastFoamApp(QMainWindow):
         
         # Connect tab signals (preserve existing connections)
         self.tab_1d.sig_request_run.connect(lambda: (self.tabs.setCurrentWidget(self.tab_1d), self.run_active_tab()))
+        self.tab_1d.sig_request_init.connect(self.on_initialize_model_1d)
         self.tab_1d.sig_request_stop.connect(self.on_stop_request)
 
         self.tab_2d.sig_request_init.connect(self.on_initialize_model_2d)
@@ -851,10 +923,7 @@ class BlastFoamApp(QMainWindow):
                 self._output_file_options.dim3d.cycle_write = legacy_cycle_3d
             self._apply_output_file_options(self._output_file_options)
             self.current_project_path = os.path.abspath(path)
-            self.active_case_dir_3d = None
-            self.active_case_initialized_3d = False
-            self.active_case_dir_2d = None
-            self.active_case_initialized_2d = False
+            self._release_open_project_runtime()
             selected = project.get("gui_state", {}).get(
                 "selected_primary_tab", "General 3D"
             )
@@ -870,6 +939,63 @@ class BlastFoamApp(QMainWindow):
             self.status_bar.set_status("Project loaded", "#2ecc71")
         except (ProjectFormatError, OSError, TypeError, ValueError) as exc:
             QMessageBox.critical(self, "Open Project Error", str(exc))
+
+    def _release_open_project_runtime(self) -> None:
+        """Drop live solver bindings after a project open.
+
+        A project restores inputs and gauges. It does not store a solver-result
+        directory, so the previous session's case must not stay attached.
+        """
+        self.active_case_dir_1d = None
+        self.active_case_initialized_1d = False
+        self.active_case_dir_2d = None
+        self.active_case_initialized_2d = False
+        self.active_case_dir_3d = None
+        self.active_case_initialized_3d = False
+        sessions = getattr(self, "_case_sessions", None)
+        if isinstance(sessions, dict):
+            sessions.clear()
+        tab_2d = getattr(self, "tab_2d", None)
+        if tab_2d is not None:
+            tab_2d._last_1d_case_dir = ""
+            if getattr(tab_2d, "_remap_from_last_1d", False):
+                tab_2d._set_remap_case_path("", from_last_1d=False)
+        tab_th = getattr(self, "tab_time_history", None)
+        if tab_th is not None:
+            cases = getattr(tab_th, "_run_cases", None)
+            if isinstance(cases, dict):
+                for key in list(cases):
+                    cases[key] = ""
+            sim_time = getattr(tab_th, "_sim_time", None)
+            if isinstance(sim_time, dict):
+                for key in list(sim_time):
+                    sim_time[key] = 0.0
+            added = getattr(tab_th, "_added", None)
+            if isinstance(added, list):
+                added.clear()
+            baselines = getattr(tab_th, "_run_baselines", None)
+            if isinstance(baselines, dict):
+                baselines.clear()
+            refresh_plot = getattr(tab_th, "refresh_plot", None)
+            if callable(refresh_plot):
+                refresh_plot()
+        tab_1d = getattr(self, "tab_1d", None)
+        if tab_1d is not None:
+            tab_1d.begin_run_graph()
+            plot = getattr(tab_1d, "plot_initial_condition", None)
+            if callable(plot):
+                plot()
+        bar = getattr(self, "status_bar", None)
+        if bar is not None:
+            bar.update_1d(step=0, tt=0.0, dt=0.0)
+            bar.update_2d(step=0, tt=0.0, dt=0.0)
+            bar.update_3d(step=0, tt=0.0, dt=0.0)
+            bar._et_seconds = 0.0
+            bar.set_progress(0)
+            bar._sync_visible_metrics_line()
+        sync = getattr(self, "_sync_1d_run_button", None)
+        if callable(sync):
+            sync()
 
     def _on_open_case(self):
         """Open an existing BlastFoam case; classify topology before mutating GUI state."""
@@ -957,6 +1083,7 @@ class BlastFoamApp(QMainWindow):
         self.active_case_dir_3d = case_dir
         self.active_case_initialized_3d = os.path.isdir(os.path.join(case_dir, "0"))
         loaded_inputs = self.tab_3d.get_case_inputs()
+        self._record_case_initialized("3D", case_dir, loaded_inputs)
         self.tab_3d.viewer.load_case(
             case_dir,
             charge_center=loaded_inputs.charge_center,
@@ -1295,8 +1422,17 @@ class BlastFoamApp(QMainWindow):
 
     def _set_preparation_ui(self, *, active: bool) -> None:
         """Disable conflicting actions and enable Cancel Preparation while active."""
-        tab = getattr(self, "tab_2d", None)
+        is_1d = self.__dict__.get("_prep_kind") == "native_1d"
+        tab = self.tab_1d if is_1d else getattr(self, "tab_2d", None)
         if tab is None:
+            return
+        if is_1d:
+            tab.btn_initialize.setEnabled(not active)
+            if active:
+                tab.btn_run.setEnabled(False)
+            else:
+                self._sync_1d_run_button()
+            tab.btn_stop.setText("Cancel Preparation" if active else "⏸ Interrupt")
             return
         btn_init = getattr(tab, "btn_initialize", None)
         btn_end = getattr(tab, "btn_exact_end", None)
@@ -1456,6 +1592,7 @@ class BlastFoamApp(QMainWindow):
             self.tab_2d._keep_openfoam_time_folders = True
             self.active_case_dir_2d = case_dir
             self.active_case_initialized_2d = True
+            self._record_case_initialized("2D", case_dir, inputs)
             self._refresh_validation()
             selected_field = self.tab_2d.cmb_field.currentText().strip() or "p"
             self.tab_2d.viewer.set_axisymmetric_domain(inputs.radius, inputs.height)
@@ -1499,6 +1636,13 @@ class BlastFoamApp(QMainWindow):
 
     def run_imported_2d_exact_end(self) -> None:
         """Direct blastFoam in the generated GGUI case (never the BF source)."""
+        try:
+            inputs = self.tab_2d.get_case_inputs()
+        except (ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Initialize required", str(exc))
+            return
+        if not self._case_run_guard("2D", inputs):
+            return
         ext = getattr(self.tab_2d, "_imported_case", None)
         if ext is None or ext.mode != ImportMode2D.IMPORTED_2D_READY:
             QMessageBox.warning(
@@ -1792,6 +1936,8 @@ class BlastFoamApp(QMainWindow):
         )
         self.tab_2d.apply_output_file_options(opts.dim2d)
         self.tab_3d.apply_output_file_options(opts.dim3d)
+        if hasattr(self, "_case_sessions"):
+            self._queue_case_edit_check()
         if hasattr(self, "tab_time_history"):
             self.tab_time_history.set_impulse_available()
 
@@ -1836,7 +1982,7 @@ class BlastFoamApp(QMainWindow):
         <h3>Workflow</h3>
         <ol>
         <li>Configure domain and charge parameters</li>
-        <li>Click "Initialize Model" (3D only)</li>
+        <li>Click "Initialize Model" in the active dimension</li>
         <li>Click "Run Simulation"</li>
         <li>Monitor progress in status bar and live log</li>
         </ol>
@@ -1898,35 +2044,168 @@ class BlastFoamApp(QMainWindow):
         else:
             QMessageBox.information(self, "Info", "Please select a computational tab to run simulation.")
     
+    def on_initialize_model_1d(self, inputs):
+        """Prepare the unchanged 1D numerical case without starting the solver."""
+        if self._prep_is_active() or (self.runner and self.runner.isRunning()):
+            QMessageBox.warning(self, "Busy", "Wait for the active preparation or solver, or Interrupt it first.")
+            return
+        from copy import deepcopy
+        from preparation_service_1d import prepare_native_1d_case
+        from preparation_worker_qt import PreparationWorker, PreparationStep
+        requested = deepcopy(inputs)
+        root = self._resolved_case_root()
+        bashrc = self.openfoam_bashrc
+        self.active_case_initialized_1d = False
+        self._case_sessions.pop("1D", None)
+        def work(cancel_token, progress):
+            return prepare_native_1d_case(requested, root, bashrc, cancel_token, progress)
+        worker = PreparationWorker([PreparationStep("Initialize 1D", work)], parent=self)
+        self._begin_preparation(worker, kind="native_1d", on_ok=self._on_1d_prep_ok,
+                                on_err=self._on_1d_prep_failed, on_cancel=self._on_1d_prep_failed)
+
+    def _on_1d_prep_ok(self, result):
+        self._finish_preparation_controls(success=True)
+        payload = result.payload or {}
+        case, inputs = payload.get("case_dir"), payload.get("inputs")
+        if not case or inputs is None:
+            self.active_case_initialized_1d = False
+            QMessageBox.critical(self, "1D Initialize", "Preparation returned incomplete data.")
+            return
+        self.active_case_dir_1d = case
+        self.active_case_initialized_1d = True
+        self._record_case_initialized("1D", case, inputs)
+        self.tab_2d.set_last_1d_case(case)
+        self.status_bar.update_1d(step=0, tt=0.0, dt=0.0)
+        self.status_bar._et_seconds = 0.0
+        self.status_bar._sync_visible_metrics_line()
+        self.status_bar.set_status("1D Initialized", "#2ecc71")
+        self._sync_1d_run_button()
+        self._observe_case_edits()
+
+    def _on_1d_prep_failed(self, result):
+        self._finish_preparation_controls(success=False)
+        self.active_case_initialized_1d = False
+        self._sync_1d_run_button()
+        label = "1D preparation cancelled" if result.cancelled else "1D preparation failed"
+        self.status_bar.set_status(label, "#e67e22")
+        if not result.cancelled:
+            QMessageBox.critical(self, label, result.error or label)
+
+    def _reset_1d_unprogressed_display(self) -> None:
+        """Match the status line: no saved solver step exists yet."""
+        bar = self.status_bar
+        bar.update_1d(step=0, tt=0.0, dt=0.0)
+        bar._et_seconds = 0.0
+        bar.set_progress(0)
+        bar._sync_visible_metrics_line()
+
+    def _apply_1d_completed_metrics(self, case_dir: str) -> None:
+        """Show the solver log's final step and time when a 1D run completes.
+
+        Probe samples can lag a short resume. The completion record already
+        holds the final solver time; the same log supplies the step count.
+        """
+        if not case_dir:
+            return
+        from completion_1d import read_completion_record
+        from result_storage import logged_solver_progress
+
+        record = read_completion_record(case_dir)
+        recorded = getattr(record, "final_solver_time_s", None) if record else None
+        step_n, log_t, log_dt = logged_solver_progress(case_dir)
+        final_t = recorded if isinstance(recorded, (int, float)) else log_t
+        if final_t is None:
+            return
+        self.status_bar.update_1d(
+            step=step_n,
+            tt=float(final_t),
+            dt=0.0 if log_dt is None else float(log_dt),
+        )
+
+    def _sync_1d_run_button(self) -> None:
+        """Run stays available only for a current initialized 1D case."""
+        tab = getattr(self, "tab_1d", None)
+        if tab is None or not hasattr(tab, "btn_run"):
+            return
+        running = self.runner is not None and self.runner.isRunning()
+        preparing = self._prep_is_active()
+        tab.btn_run.setEnabled(
+            bool(getattr(self, "active_case_initialized_1d", False))
+            and not running
+            and not preparing
+        )
+
+    def _patch_1d_end_time(self, case_dir: str, new_end_time: float) -> None:
+        """Write the root endTime only. Mesh and initial fields stay as initialized."""
+        cd_path = os.path.join(case_dir, "system", "controlDict")
+        if not os.path.isfile(cd_path):
+            return
+        with open(cd_path, "r", encoding="utf-8", errors="ignore") as stream:
+            text = stream.read()
+        try:
+            updated, _changed = update_top_level_entries(
+                text, {"endTime": float(new_end_time)}
+            )
+        except KeyError:
+            return
+        if updated != text:
+            with open(cd_path, "w", encoding="utf-8", newline="") as stream:
+                stream.write(updated)
+
+    def _1d_run_already_complete(self, case_dir: str, requested_end: float) -> bool:
+        """True when this case already satisfied its stop and end time was not raised."""
+        from completion_1d import (
+            is_terminate_mode,
+            read_completion_record,
+            reflect_end_time_is_success,
+            wave_radius_stop_is_success,
+        )
+
+        record = read_completion_record(case_dir)
+        if record is None or record.end_time_s is None:
+            return False
+        if is_terminate_mode(record):
+            done = wave_radius_stop_is_success(record)
+        else:
+            done = reflect_end_time_is_success(record)
+        if not done:
+            return False
+        previous = float(record.end_time_s)
+        slack = max(1.0e-12, abs(previous) * 1.0e-12)
+        return float(requested_end) <= previous + slack
+
     def run_1d_process(self):
-        """Execute 1D simulation"""
+        """Run/resume the same explicitly initialized 1D case."""
         try:
             inputs = self.tab_1d.get_case_inputs()
-            if not isinstance(inputs, CaseInputs1D):
-                raise ValueError("Invalid 1D Inputs")
-
-            for tab in (self.tab_2d, self.tab_3d):
-                viewer = getattr(tab, "viewer", None)
-                release = getattr(viewer, "release_vtk", None)
-                if callable(release):
-                    release()
+            if not self._case_run_guard("1D", inputs):
+                return
+            case = self.active_case_dir_1d
+            requested_end = float(inputs.end_time_s)
+            if self._1d_run_already_complete(case, requested_end):
+                QMessageBox.information(
+                    self,
+                    "Run complete",
+                    "This 1D run is already complete.",
+                )
+                self.status_bar.set_status("Done", "#2ecc71")
+                return
+            self._patch_1d_end_time(case, requested_end)
+            try:
+                build_execution_plan(case, 1, ExecutionIntent.RESUME)
+                intent = ExecutionIntent.RESUME
+            except ExecutionPreparationError as exc:
+                if str(exc).startswith("No resumable saved time exists"):
+                    intent = ExecutionIntent.INITIALIZED_SOLVER_RUN
                 else:
-                    setter = getattr(viewer, "set_viewport_active", None)
-                    if callable(setter):
-                        setter(False)
+                    raise
+            self.tab_2d.set_last_1d_case(case)
+            self._start_solver(case, cores=1, mode="1D", intent=intent)
+            self._sync_1d_run_button()
+        except Exception as exc:
+            self.status_bar.set_status("1D Run Error", "#e74c3c")
+            QMessageBox.critical(self, "1D Run Error", str(exc))
 
-            self.status_bar.set_status("Generating 1D Case...", "#f39c12")
-            
-            prefix = "Case_1D"
-            case_name = self.service.make_case_name(prefix)
-            case_dir = self.service.generate_case(case_name, inputs)
-            self.tab_2d.set_last_1d_case(case_dir)
-            self._start_solver(case_dir, cores=1, mode="1D")
-            
-        except Exception as e:
-            self.status_bar.set_status("Error", "#e74c3c")
-            QMessageBox.critical(self, "1D Error", str(e))
-    
     def _split_remap_path(self, path):
         """Split remap path into case directory and time directory"""
         norm = os.path.normpath((path or "").strip())
@@ -1967,6 +2246,7 @@ class BlastFoamApp(QMainWindow):
                 )
                 self.status_bar.set_status("2D validation failed", "#e74c3c")
                 return
+            self._pending_case_inputs_2d = input_snapshot(inputs)
             effective_inputs = inputs
             mapping_report = None
             if inputs.initialization_source == "From 1D":
@@ -2074,6 +2354,8 @@ class BlastFoamApp(QMainWindow):
             self.tab_2d.cmb_field.blockSignals(False)
             self.tab_2d.viewer.set_field(selected_field)
             self.tab_2d.mark_initialized(case_dir, actual_cells, charge_cells)
+            self._record_case_initialized("2D", case_dir, self._pending_case_inputs_2d)
+            self._observe_case_edits()
             if mapping_report is not None:
                 import json
 
@@ -2165,7 +2447,7 @@ class BlastFoamApp(QMainWindow):
         return AxisymmetricViewerWidget.count_owner_cells(mesh_dir)
 
     def run_2d_process_exact_end(self):
-        """Initialize if needed, then continue the 2D case to configured endTime."""
+        """Run an explicitly initialized, current 2D case to configured endTime."""
         if self.runner is not None and self.runner.isRunning():
             QMessageBox.warning(
                 self, "exact END", "A solver process is already running."
@@ -2176,16 +2458,8 @@ class BlastFoamApp(QMainWindow):
             return
         try:
             inputs = self.tab_2d.get_case_inputs()
-            if (
-                not self.active_case_dir_2d
-                or not self.active_case_initialized_2d
-                or self.tab_2d.simulation_state == SimulationState2D.STALE
-            ):
-                self._pending_exact_end_after_prep = True
-                self.on_initialize_model_2d(inputs)
-                # Async prep: exact END continues from the success handler.
-                if not self.active_case_initialized_2d:
-                    return
+            if not self._case_run_guard("2D", inputs):
+                return
             write_param = (
                 inputs.write_interval_time
                 if inputs.write_control_type == "adjustableRunTime"
@@ -2206,6 +2480,13 @@ class BlastFoamApp(QMainWindow):
                 intent = ExecutionIntent.RESUME
             except ExecutionPreparationError as exc:
                 if str(exc).startswith("No resumable saved time exists"):
+                    from completion_1d import read_completion_record
+                    completion = read_completion_record(self.active_case_dir_2d)
+                    if completion is not None and completion.stop_reason == "user_stopped":
+                        raise ExecutionPreparationError(
+                            "The interrupted case has no saved restart time. "
+                            "Inspect the case or explicitly Initialize a new case."
+                        ) from exc
                     intent = ExecutionIntent.INITIALIZED_SOLVER_RUN
                 else:
                     raise
@@ -2564,6 +2845,8 @@ class BlastFoamApp(QMainWindow):
                 )
                 self.status_bar.set_status("3D Initialized", "#2ecc71")
                 self.active_case_initialized_3d = True
+                self._record_case_initialized("3D", case_dir, inputs)
+                self._observe_case_edits()
                 self._refresh_validation()
                 
             except Exception as e:
@@ -2593,10 +2876,8 @@ class BlastFoamApp(QMainWindow):
         try:
             inputs = self.tab_3d.get_case_inputs()
             
-            if not self.active_case_dir_3d or not self.active_case_initialized_3d:
-                self.on_initialize_model_3d(inputs)
-                if not self.active_case_dir_3d or not self.active_case_initialized_3d:
-                    return
+            if not self._case_run_guard("3D", inputs):
+                return
             
             # Get write parameters based on control type
             if inputs.write_control_type == "adjustableRunTime":
@@ -2619,6 +2900,13 @@ class BlastFoamApp(QMainWindow):
                 intent = ExecutionIntent.RESUME
             except ExecutionPreparationError as exc:
                 if str(exc).startswith("No resumable saved time exists"):
+                    from completion_1d import read_completion_record
+                    completion = read_completion_record(self.active_case_dir_3d)
+                    if completion is not None and completion.stop_reason == "user_stopped":
+                        raise ExecutionPreparationError(
+                            "The interrupted case has no saved restart time. "
+                            "Inspect the case or explicitly Initialize a new case."
+                        ) from exc
                     intent = ExecutionIntent.INITIALIZED_SOLVER_RUN
                 else:
                     raise
@@ -2676,6 +2964,7 @@ class BlastFoamApp(QMainWindow):
                 case_dir,
                 max(1, int(self.tab_3d.spin_cores.value())),
                 ExecutionIntent.ONE_STEP_RESUME,
+                verify_restart=True,
             )
             start_time = float(execution.latest_time or 0.0)
             one_step_end = start_time + delta_t
@@ -2693,10 +2982,8 @@ class BlastFoamApp(QMainWindow):
         """Run 3D solver for exactly one time step then stop."""
         try:
             inputs = self.tab_3d.get_case_inputs()
-            if not self.active_case_dir_3d or not self.active_case_initialized_3d:
-                self.on_initialize_model_3d(inputs)
-                if not self.active_case_dir_3d or not self.active_case_initialized_3d:
-                    return
+            if not self._case_run_guard("3D", inputs):
+                return
             if not self._set_control_dict_one_step(self.active_case_dir_3d):
                 QMessageBox.critical(self, "exact 1", "Could not set one-step end time (check system/controlDict startTime and deltaT).")
                 return
@@ -2828,7 +3115,7 @@ class BlastFoamApp(QMainWindow):
             self.status_bar.update_1d(step=step_n, tt=sim_time_s, dt=dt_val)
             if self.tabs.currentWidget() == self.tab_1d:
                 try:
-                    self.tab_1d.update_graph(pressures, sim_time_s)
+                    self.tab_1d.update_graph(pressures, sim_time_s, getattr(self.runner, "live_probe_radii", ()))
                 except Exception:
                     pass
         elif mode == "2D":
@@ -3073,6 +3360,9 @@ class BlastFoamApp(QMainWindow):
         user_interrupted = bool(getattr(self, "_run_user_interrupted", False))
         self.view_timer.stop()
         self.tab_jotter.stop_monitoring()
+        snapshot_error = getattr(state.get("runner"), "snapshot_error", "")
+        if not isinstance(snapshot_error, str):
+            snapshot_error = ""
         self.runner = None
         self._active_run_mode = None
         self._active_run_case_dir = None
@@ -3101,7 +3391,12 @@ class BlastFoamApp(QMainWindow):
                 and run_reached_configured_end(finished_case_dir)
             )
             self.status_bar.set_progress(100)
-            self.status_bar.set_status("Done", "#2ecc71")
+            if finished_mode == "1D":
+                self._apply_1d_completed_metrics(finished_case_dir)
+            self.status_bar.set_status(
+                "Done — remap snapshot unavailable" if snapshot_error else "Done",
+                "#e67e22" if snapshot_error else "#2ecc71",
+            )
             if finished_mode == "3D":
                 if cleanup_eligible:
                     self.tab_3d.viewer.release_vtk()
@@ -3132,7 +3427,21 @@ class BlastFoamApp(QMainWindow):
                         "Done — native-result cleanup incomplete", "#e67e22"
                     )
         else:
-            if user_interrupted:
+            from result_storage import has_resumable_solver_time
+
+            unprogressed_stop = (
+                finished_mode == "1D"
+                and user_interrupted
+                and finished_case_dir
+                and not has_resumable_solver_time(finished_case_dir)
+            )
+            if unprogressed_stop:
+                from completion_1d import restore_initialized_after_unprogressed_stop
+
+                restore_initialized_after_unprogressed_stop(finished_case_dir)
+                self._reset_1d_unprogressed_display()
+                self.status_bar.set_status("Initialized, not yet progressed", "#2ecc71")
+            elif user_interrupted:
                 if finished_mode == "1D":
                     self.status_bar.set_status("Stopped by user", "#e67e22")
                 else:
@@ -3149,6 +3458,8 @@ class BlastFoamApp(QMainWindow):
                     if getattr(self.tab_2d, "is_imported_mode", False):
                         self.tab_2d.set_import_mode(ImportMode2D.IMPORTED_2D_FAILED)
                     self.tab_2d.set_simulation_state(SimulationState2D.FAILED)
+        if finished_mode == "1D":
+            self._sync_1d_run_button()
         self._refresh_validation()
 
     def _on_3d_initial_dt_changed(self, dt_val):
