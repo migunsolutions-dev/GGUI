@@ -1,0 +1,11 @@
+IG_dx2mm	\\wsl.localhost\Ubuntu-20.04\home\naor\OpenFOAM\naor-9\run\Work\OscIG_dx2mm_20261003_152625
+IG_dx1mm	\\wsl.localhost\Ubuntu-20.04\home\naor\OpenFOAM\naor-9\run\Work\OscIG_dx1mm_20261003_152640
+IG_dx0p5mm	\\wsl.localhost\Ubuntu-20.04\home\naor\OpenFOAM\naor-9\run\Work\OscIG_dx0p5mm_20261003_152645
+IG_upwind	\\wsl.localhost\Ubuntu-20.04\home\naor\OpenFOAM\naor-9\run\Work\OscIG_upwind_20261003_152713
+IG_minmod	\\wsl.localhost\Ubuntu-20.04\home\naor\OpenFOAM\naor-9\run\Work\OscIG_minmod_20261003_152716
+IG_superbee	\\wsl.localhost\Ubuntu-20.04\home\naor\OpenFOAM\naor-9\run\Work\OscIG_superbee_20261003_152722
+IG_rk2	\\wsl.localhost\Ubuntu-20.04\home\naor\OpenFOAM\naor-9\run\Work\OscIG_rk2_20261003_152729
+IG_cfl01	\\wsl.localhost\Ubuntu-20.04\home\naor\OpenFOAM\naor-9\run\Work\OscIG_cfl01_20261003_152739
+JWL_upwind	\\wsl.localhost\Ubuntu-20.04\home\naor\OpenFOAM\naor-9\run\Work\OscJWL_upwind
+JWL_minmod	\\wsl.localhost\Ubuntu-20.04\home\naor\OpenFOAM\naor-9\run\Work\OscJWL_minmod
+JWL_tadmor_existing	\\wsl.localhost\Ubuntu-20.04\home\naor\OpenFOAM\naor-9\run\Work\JwlFlux_Tadmor

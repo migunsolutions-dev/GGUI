@@ -1,0 +1,142 @@
+[
+  {
+    "front_r_m": 0.8130165246139106,
+    "window_r": [
+      0.7271626185824388,
+      0.8060284159838612
+    ],
+    "window_cells": 80,
+    "local_median_p_pa": 2148170.0,
+    "neighbor_dp_rms_pa": 134913.76686093822,
+    "neighbor_dp_rms_over_p": 0.0628040457044546,
+    "residual_rms_pa": 251333.4425937141,
+    "residual_peak_to_trough_pa": 1096366.4705882352,
+    "residual_rms_over_p": 0.11699886070176667,
+    "extrema": 0,
+    "median_cells_between_extrema": null,
+    "p_rho_residual_corr": 0.9760395828260606,
+    "p_ur_residual_corr": 0.9631880270694475,
+    "case": "JWL_Tadmor",
+    "time_s": 0.000249982
+  },
+  {
+    "front_r_m": 0.8130165246139106,
+    "window_r": [
+      0.7271626185824388,
+      0.8060284159838612
+    ],
+    "window_cells": 80,
+    "local_median_p_pa": 2230220.0,
+    "neighbor_dp_rms_pa": 120613.39855143202,
+    "neighbor_dp_rms_over_p": 0.054081390424008405,
+    "residual_rms_pa": 204703.78328575383,
+    "residual_peak_to_trough_pa": 846401.176470588,
+    "residual_rms_over_p": 0.09178636335686785,
+    "extrema": 0,
+    "median_cells_between_extrema": null,
+    "p_rho_residual_corr": 0.949775060297835,
+    "p_ur_residual_corr": 0.909581546051624,
+    "case": "JWL_Kurganov",
+    "time_s": 0.000250068
+  },
+  {
+    "front_r_m": 0.8150131270876947,
+    "window_r": [
+      0.7291592210288171,
+      0.8080250184652357
+    ],
+    "window_cells": 80,
+    "local_median_p_pa": 2204235.0,
+    "neighbor_dp_rms_pa": 130210.33511062112,
+    "neighbor_dp_rms_over_p": 0.059072800817798976,
+    "residual_rms_pa": 248241.2374481137,
+    "residual_peak_to_trough_pa": 1085723.5294117643,
+    "residual_rms_over_p": 0.11262013235798983,
+    "extrema": 1,
+    "median_cells_between_extrema": null,
+    "p_rho_residual_corr": 0.9502366082484985,
+    "p_ur_residual_corr": 0.9531309146740397,
+    "case": "JWL_HLL",
+    "time_s": 0.000249961
+  },
+  {
+    "front_r_m": 0.8140148258360553,
+    "window_r": [
+      0.7281609198015273,
+      0.8070267172359591
+    ],
+    "window_cells": 80,
+    "local_median_p_pa": 2047355.0,
+    "neighbor_dp_rms_pa": 161209.09232846356,
+    "neighbor_dp_rms_over_p": 0.07874017565515681,
+    "residual_rms_pa": 292002.0071573015,
+    "residual_peak_to_trough_pa": 1241890.0,
+    "residual_rms_over_p": 0.14262402326772908,
+    "extrema": 1,
+    "median_cells_between_extrema": null,
+    "p_rho_residual_corr": 0.9065337754198555,
+    "p_ur_residual_corr": 0.9726211137321534,
+    "case": "JWL_HLLC",
+    "time_s": 0.00025001
+  },
+  {
+    "front_r_m": 0.8130165246139106,
+    "window_r": [
+      0.7271626185824388,
+      0.8060284159838612
+    ],
+    "window_cells": 80,
+    "local_median_p_pa": 2329920.0,
+    "neighbor_dp_rms_pa": 111487.54845046003,
+    "neighbor_dp_rms_over_p": 0.0478503761719115,
+    "residual_rms_pa": 210582.27850154287,
+    "residual_peak_to_trough_pa": 899217.6470588236,
+    "residual_rms_over_p": 0.09038176353760767,
+    "extrema": 0,
+    "median_cells_between_extrema": null,
+    "p_rho_residual_corr": 0.9724249397919543,
+    "p_ur_residual_corr": 0.9718919218906544,
+    "case": "JWL_AUSM+",
+    "time_s": 0.00025004
+  },
+  {
+    "front_r_m": 0.8160114283200277,
+    "window_r": [
+      0.7301575222512675,
+      0.8090233196827958
+    ],
+    "window_cells": 80,
+    "local_median_p_pa": 2276545.0,
+    "neighbor_dp_rms_pa": 131739.97943782472,
+    "neighbor_dp_rms_over_p": 0.05786838364180138,
+    "residual_rms_pa": 248158.00830485966,
+    "residual_peak_to_trough_pa": 948373.5294117648,
+    "residual_rms_over_p": 0.10900641467876086,
+    "extrema": 0,
+    "median_cells_between_extrema": null,
+    "p_rho_residual_corr": 0.9700894488783537,
+    "p_ur_residual_corr": 0.980160190926953,
+    "case": "JWL_AUSM+up",
+    "time_s": 0.000249989
+  },
+  {
+    "front_r_m": 1.0176682776771475,
+    "window_r": [
+      0.9318143714162374,
+      1.0106801688296818
+    ],
+    "window_cells": 80,
+    "local_median_p_pa": 719126.5,
+    "neighbor_dp_rms_pa": 69891.6410850179,
+    "neighbor_dp_rms_over_p": 0.09718963365279669,
+    "residual_rms_pa": 117309.36643762258,
+    "residual_peak_to_trough_pa": 474781.2941176472,
+    "residual_rms_over_p": 0.16312758108291459,
+    "extrema": 0,
+    "median_cells_between_extrema": null,
+    "p_rho_residual_corr": 0.936681787530137,
+    "p_ur_residual_corr": 0.9732890687732937,
+    "case": "IG_1kg",
+    "time_s": 0.000534135
+  }
+]
