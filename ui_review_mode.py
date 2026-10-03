@@ -15,6 +15,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt
 from PyQt5.QtGui import QColor, QKeySequence, QMouseEvent
+from ui_review_catalog import (
+    DESTINATIONS,
+    ROLE_LINKS,
+    ReviewMark,
+    destination_by_key,
+    mark_for_widget,
+    resolve_1d_marks,
+)
+
 from PyQt5.QtWidgets import (
     QApplication,
     QFormLayout,
@@ -24,6 +33,7 @@ from PyQt5.QtWidgets import (
     QLayout,
     QMainWindow,
     QBoxLayout,
+    QMenu,
     QScrollArea,
     QShortcut,
     QSplitter,
@@ -94,6 +104,22 @@ def git_identity(cwd: Optional[str] = None) -> Dict[str, str]:
     if head:
         identity["head"] = head
     return identity
+
+
+def _review_badge_visible(widget: Optional[QWidget]) -> bool:
+    """True when the widget is shown and not scrolled out of its scroll area."""
+    if not isinstance(widget, QWidget) or not widget.isVisible():
+        return False
+    if widget.width() <= 0 or widget.height() <= 0:
+        return False
+    parent = widget.parentWidget()
+    while parent is not None:
+        if isinstance(parent, QScrollArea):
+            viewport = parent.viewport()
+            rect = QRect(widget.mapTo(viewport, QPoint(0, 0)), widget.size())
+            return rect.intersects(viewport.rect())
+        parent = parent.parentWidget()
+    return True
 
 
 def _is_overlay(widget: Optional[QWidget]) -> bool:
@@ -632,6 +658,12 @@ class UIReviewController(QObject):
         self.ambiguities: List[str] = []
         self._overlays: List[QWidget] = []
         self._filter_installed = False
+        self._review_marks: List[Tuple[ReviewMark, Optional[QWidget]]] = []
+        self._compare_widget: Optional[QWidget] = None
+        self._return_stack: List[Dict[str, Any]] = []
+        self._menu: Optional[QMenu] = None
+        self._scroll_hooked = False
+        self._suppress_context_menu = False
         self.registry = RegionRegistry(os.path.join(self.output_dir, REGION_MAP_NAME))
         self._toggle = QShortcut(QKeySequence("Ctrl+Shift+I"), window)
         self._toggle.setContext(Qt.ApplicationShortcut)
@@ -654,6 +686,7 @@ class UIReviewController(QObject):
                 self.window.installEventFilter(self)
                 self._filter_installed = True
             self._hook_tab_changes()
+            self._hook_scroll_tracking()
         if self._saved_min_size is None:
             self._saved_min_size = QSize(self.window.minimumSize())
             self.window.setMinimumSize(self.window.size())
@@ -665,6 +698,8 @@ class UIReviewController(QObject):
         if not self.enabled:
             return
         self.enabled = False
+        self._close_menu()
+        self._compare_widget = None
         app = QApplication.instance()
         if app is not None and self._filter_installed:
             app.removeEventFilter(self)
@@ -687,6 +722,7 @@ class UIReviewController(QObject):
         scope = self._scope_widget()
         self.region_nodes = discover_region_nodes(self.window, scope)
         self.region_ids, notes = self.registry.assign(self.region_nodes, tab_key)
+        self._review_marks = resolve_1d_marks(self.window)
         self.ambiguities = list(notes)
         self.registry.save()
 
@@ -721,6 +757,211 @@ class UIReviewController(QObject):
             widget.currentChanged.connect(self._on_tab_changed)
             self._tab_hooks.append(widget)
 
+    def _hook_scroll_tracking(self) -> None:
+        if self._scroll_hooked:
+            return
+        self._scroll_hooked = True
+        for scroll in self.window.findChildren(QScrollArea):
+            bar = scroll.verticalScrollBar()
+            if bar is not None:
+                bar.valueChanged.connect(self._on_overlay_geometry)
+
+    def _on_overlay_geometry(self, _value: int = 0) -> None:
+        if self.enabled:
+            self._rebuild_overlays()
+
+    def _close_menu(self) -> None:
+        menu = self._menu
+        self._menu = None
+        if menu is not None:
+            menu.close()
+
+    def compare_choices(self, widget: Optional[QWidget]) -> Dict[str, Any]:
+        """Review-only navigation choices for the widget under the cursor."""
+        hit = mark_for_widget(self._review_marks, widget)
+        mark = hit[0] if hit is not None else None
+        tab_key = main_tab_key(self.window)
+        sub = active_sub_tab(widget, self.window) if isinstance(widget, QWidget) else ""
+        comparable = []
+        if mark is not None:
+            for link in ROLE_LINKS.get(mark.role, ()):
+                dest = destination_by_key(link.destination_key)
+                owner = getattr(self.window, dest.owner_attr, None) if dest is not None else None
+                target = getattr(owner, link.widget_attr, None) if owner is not None else None
+                if dest is None or not isinstance(target, QWidget):
+                    continue
+                comparable.append(
+                    {
+                        "label": f"{dest.label} — {link.label}",
+                        "destination": dest.key,
+                        "widget_attr": link.widget_attr,
+                    }
+                )
+        destinations = []
+        for dest in DESTINATIONS:
+            if isinstance(getattr(self.window, dest.owner_attr, None), QWidget):
+                destinations.append({"label": dest.label, "destination": dest.key, "widget_attr": ""})
+        return {
+            "review_id": mark.review_id if mark is not None else "",
+            "label": mark.label if mark is not None else "",
+            "role": mark.role if mark is not None else "",
+            "class": _class_name(widget) if isinstance(widget, QWidget) else "",
+            "main_tab": tab_key,
+            "sub_tab": sub,
+            "comparable": comparable,
+            "destinations": destinations,
+            "can_return": bool(self._return_stack),
+        }
+
+    def show_compare_menu(self, global_pos: QPoint) -> None:
+        widget = QApplication.widgetAt(global_pos)
+        if not isinstance(widget, QWidget) or not _is_under(self.window, widget):
+            return
+        choices = self.compare_choices(widget)
+        self._close_menu()
+        menu = QMenu(self.window)
+        menu.setProperty("ui_review_overlay", True)
+        title = choices["review_id"] or "Unlisted"
+        if choices["label"]:
+            title = f"{title} · {choices['label']}"
+        where = choices["main_tab"] or "window"
+        if choices["sub_tab"]:
+            where = f"{where} / {choices['sub_tab']}"
+        for line in (title, choices["class"] or "widget", where):
+            action = menu.addAction(line)
+            action.setEnabled(False)
+        if choices["comparable"]:
+            menu.addSeparator()
+            header = menu.addAction("Comparable controls")
+            header.setEnabled(False)
+            for item in choices["comparable"]:
+                action = menu.addAction(item["label"])
+                action.triggered.connect(
+                    lambda _checked=False, dest=item["destination"], attr=item["widget_attr"], rid=choices["review_id"]: (
+                        self.navigate(dest, attr, rid)
+                    )
+                )
+        if choices["destinations"]:
+            menu.addSeparator()
+            header = menu.addAction("Go to")
+            header.setEnabled(False)
+            for item in choices["destinations"]:
+                action = menu.addAction(item["label"])
+                action.triggered.connect(
+                    lambda _checked=False, dest=item["destination"], rid=choices["review_id"]: (
+                        self.navigate(dest, "", rid)
+                    )
+                )
+        if choices["can_return"]:
+            menu.addSeparator()
+            back = menu.addAction(self._return_label())
+            back.triggered.connect(self.return_to_previous)
+        self._menu = menu
+        menu.popup(global_pos)
+
+    def _return_label(self) -> str:
+        if not self._return_stack:
+            return "Return"
+        snap = self._return_stack[-1]
+        review_id = snap.get("review_id") or ""
+        title = snap.get("tab_title") or "previous location"
+        if review_id:
+            return f"Return to {title} ({review_id})"
+        return f"Return to {title}"
+
+    def _capture_location(self, review_id: str = "") -> Dict[str, Any]:
+        tabs = getattr(self.window, "tabs", None)
+        subs = []
+        for tabwidget in self.window.findChildren(QTabWidget):
+            if tabwidget is tabs:
+                continue
+            subs.append((tabwidget, int(tabwidget.currentIndex())))
+        scrolls = []
+        for scroll in self.window.findChildren(QScrollArea):
+            scrolls.append(
+                (
+                    scroll,
+                    int(scroll.verticalScrollBar().value()),
+                    int(scroll.horizontalScrollBar().value()),
+                )
+            )
+        title = ""
+        if isinstance(tabs, QTabWidget):
+            title = tabs.tabText(tabs.currentIndex())
+        return {
+            "main_index": int(tabs.currentIndex()) if isinstance(tabs, QTabWidget) else 0,
+            "tab_title": title,
+            "review_id": review_id,
+            "subs": subs,
+            "scrolls": scrolls,
+        }
+
+    def _restore_location(self, snap: Dict[str, Any]) -> None:
+        tabs = getattr(self.window, "tabs", None)
+        if isinstance(tabs, QTabWidget):
+            index = int(snap.get("main_index") or 0)
+            if 0 <= index < tabs.count():
+                tabs.setCurrentIndex(index)
+        for tabwidget, index in snap.get("subs") or ():
+            if isinstance(tabwidget, QTabWidget) and 0 <= int(index) < tabwidget.count():
+                tabwidget.setCurrentIndex(int(index))
+        QApplication.processEvents()
+        for scroll, vertical, horizontal in snap.get("scrolls") or ():
+            if not isinstance(scroll, QScrollArea):
+                continue
+            scroll.verticalScrollBar().setValue(int(vertical))
+            scroll.horizontalScrollBar().setValue(int(horizontal))
+
+    def navigate(self, destination_key: str, widget_attr: str = "", review_id: str = "") -> bool:
+        """Switch tabs for comparison. Does not write control values."""
+        dest = destination_by_key(destination_key)
+        if dest is None:
+            return False
+        owner = getattr(self.window, dest.owner_attr, None)
+        if not isinstance(owner, QWidget):
+            return False
+        self._return_stack.append(self._capture_location(review_id))
+        tabs = getattr(self.window, "tabs", None)
+        if isinstance(tabs, QTabWidget):
+            tabs.setCurrentWidget(owner)
+        sub = getattr(owner, dest.sub_attr, None) if dest.sub_attr else None
+        if isinstance(sub, QTabWidget) and dest.sub_title:
+            for index in range(sub.count()):
+                if sub.tabText(index) == dest.sub_title:
+                    sub.setCurrentIndex(index)
+                    break
+        target = getattr(owner, widget_attr, None) if widget_attr else None
+        self._compare_widget = target if isinstance(target, QWidget) else None
+        if self.enabled:
+            self.refresh_regions()
+            self._rebuild_overlays()
+            self._reveal(self._compare_widget)
+            self.write_outputs()
+        return True
+
+    def return_to_previous(self) -> bool:
+        if not self._return_stack:
+            return False
+        snap = self._return_stack.pop()
+        self._compare_widget = None
+        self._restore_location(snap)
+        if self.enabled:
+            self.refresh_regions()
+            self._rebuild_overlays()
+            self.write_outputs()
+        return True
+
+    def _reveal(self, widget: Optional[QWidget]) -> None:
+        if not isinstance(widget, QWidget):
+            return
+        for scroll in self.window.findChildren(QScrollArea):
+            host = scroll.widget()
+            if host is None:
+                continue
+            if widget is host or host.isAncestorOf(widget):
+                scroll.ensureWidgetVisible(widget)
+                return
+
     def _on_tab_changed(self, _index: int = 0) -> None:
         if not self.enabled:
             return
@@ -738,18 +979,26 @@ class UIReviewController(QObject):
                 return True
         if et == QEvent.Resize and obj is self.window:
             self._rebuild_overlays()
+        if et == QEvent.ContextMenu and self._suppress_context_menu:
+            self._suppress_context_menu = False
+            return True
         if et == QEvent.MouseButtonPress and isinstance(event, QMouseEvent):
+            if event.button() == Qt.RightButton:
+                if event.modifiers() & Qt.ControlModifier:
+                    self._suppress_context_menu = True
+                    self.show_compare_menu(event.globalPos())
+                    return True
+                return False
             if event.button() != Qt.LeftButton:
                 return False
             target = QApplication.widgetAt(event.globalPos())
             if target is None and isinstance(obj, QWidget):
                 target = obj
-            if _is_overlay(target):
-                return True
-            if not _is_under(self.window, target):
+            if _is_overlay(target) or not _is_under(self.window, target):
                 return False
+            # Record the review selection without eating the click.
             self.select_at(event.globalPos(), event.modifiers())
-            return True
+            return False
         return False
 
     def select_at(self, global_pos: QPoint, modifiers: Qt.KeyboardModifiers) -> Optional[Dict[str, Any]]:
@@ -870,6 +1119,9 @@ class UIReviewController(QObject):
         return record
 
     def _region_for(self, widget: QWidget) -> Optional[str]:
+        hit = mark_for_widget(self._review_marks, widget)
+        if hit is not None and main_tab_key(self.window) == "1d":
+            return hit[0].review_id
         for node in _walk_parents(widget):
             rid = self.region_ids.get(id(node))
             if rid:
@@ -887,13 +1139,22 @@ class UIReviewController(QObject):
         self._clear_overlays()
         if not self.enabled:
             return
-        for node in self.region_nodes:
-            if not node.widget.isVisible():
-                continue
-            rid = self.region_ids.get(id(node.widget))
-            if not rid:
-                continue
-            self._place_overlay(node.widget, rid, QColor("#2980b9"), "#ffffff", highlight=False)
+        if main_tab_key(self.window) == "1d" and self._review_marks:
+            for mark, widget in self._review_marks:
+                if not _review_badge_visible(widget):
+                    continue
+                self._place_overlay(widget, mark.review_id, QColor("#1a5276"), "#ffffff", highlight=False)
+        else:
+            for node in self.region_nodes:
+                if not node.widget.isVisible():
+                    continue
+                rid = self.region_ids.get(id(node.widget))
+                if not rid:
+                    continue
+                self._place_overlay(node.widget, rid, QColor("#2980b9"), "#ffffff", highlight=False)
+        target = self._compare_widget
+        if isinstance(target, QWidget) and target.isVisible() and _is_under(self.window, target):
+            self._place_overlay(target, "", QColor("#e67e22"), "#ffffff", highlight=True, badge=False)
         for item in self.sources:
             self._place_record(item, item["alias"], QColor("#e74c3c"), "#ffffff")
         if self.anchor is not None:
@@ -962,6 +1223,7 @@ class UIReviewController(QObject):
         fg: str,
         *,
         highlight: bool,
+        badge: bool = True,
     ) -> None:
         origin = widget.mapTo(self.window, QPoint(0, 0))
         size = widget.size()
@@ -969,6 +1231,8 @@ class UIReviewController(QObject):
             frame = ReviewHighlight(self.window, color)
             frame.setGeometry(QRect(origin, size))
             self._overlays.append(frame)
+        if not badge or not text:
+            return
         badge = ReviewBadge(
             self.window,
             text,
@@ -979,6 +1243,24 @@ class UIReviewController(QObject):
         self._overlays.append(badge)
 
     def visible_region_map(self) -> List[Dict[str, Any]]:
+        if main_tab_key(self.window) == "1d" and self._review_marks:
+            rows = []
+            for mark, widget in self._review_marks:
+                rows.append(
+                    {
+                        "id": mark.review_id,
+                        "kind": mark.kind,
+                        "role": mark.role,
+                        "title": mark.label,
+                        "visible": bool(widget is not None and widget.isVisible()),
+                        "class": _class_name(widget) if isinstance(widget, QWidget) else "",
+                        "objectName": _object_name(widget) if isinstance(widget, QWidget) else "",
+                        "locator": (
+                            structural_locator(widget, "1d") if isinstance(widget, QWidget) else ""
+                        ),
+                    }
+                )
+            return rows
         rows = []
         for node in self.region_nodes:
             rid = self.region_ids.get(id(node.widget))

@@ -2,7 +2,7 @@ import math
 import os
 import numpy as np
 from PyQt5.QtWidgets import (
-    QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QFrame,
+    QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QLabel, QPushButton, QFrame,
     QGroupBox, QFormLayout, QComboBox, QDoubleSpinBox, QSpinBox, QLineEdit,
     QRadioButton, QButtonGroup, QSplitter, QScrollArea, QSizePolicy, QTabWidget
 )
@@ -31,17 +31,12 @@ from ui_metrics import (
     EXECUTION_AREA_MIN_HEIGHT,
     EXECUTION_AREA_PREFERRED_HEIGHT,
     ACTION_BUTTON_FONT_PT,
-    GROUP_TITLE_FONT_PT,
+    INFO_ROW_STYLE,
+    INFO_TITLE_STYLE,
     SECONDARY_INFO_STYLE,
     WARNING_STYLE,
 )
 
-LABEL_RUN_TERMINATE = (
-    "Terminate at radius: stop when the wave reaches the radius; End Time is the upper bound"
-)
-LABEL_RUN_REFLECT = (
-    "Reflect at radius: reflect at the radius and run until End Time or manual stop"
-)
 TIP_RUN_TERMINATE = (
     "Stop when the wave reaches the radius; End Time is the upper bound."
 )
@@ -52,6 +47,28 @@ TIP_END_TIME = (
     "Written to controlDict as endTime. In Terminate mode this is an upper bound; "
     "in Reflect mode the run completes at this time."
 )
+
+# Shared 1D numeric boxes are 100px. Domain radius and cell size are 1.5x.
+_DOMAIN_SPIN_WIDTH = 150
+# A double keeps 15 decimal digits. That is the precision this spin can store.
+_RADIUS_DECIMALS = 15
+
+
+class _RadiusSpinBox(QDoubleSpinBox):
+    """Radius entry: keep typed digits instead of padding to a fixed 2 places."""
+
+    def textFromValue(self, value: float) -> str:
+        text = f"{float(value):.{_RADIUS_DECIMALS}f}".rstrip("0").rstrip(".")
+        return text if text else "0"
+
+    def valueFromText(self, text: str) -> float:
+        cleaned = str(text).strip().replace(" ", "")
+        if not cleaned:
+            return 0.0
+        try:
+            return float(cleaned)
+        except ValueError:
+            return float(super().valueFromText(text))
 
 
 def spherical_charge_radius_m(mass_kg: float, rho_kg_m3: float) -> float:
@@ -74,6 +91,13 @@ def ideal_gas_charge_pressure_pa(
     return max(float(gamma) - 1.0, 0.0) * max(float(rho_kg_m3), 0.0) * max(float(energy_j_per_kg), 0.0)
 
 
+def initial_radial_step(domain_radius_m: float, charge_radius_m: float, inside: float, outside: float):
+    """Step profile: one value inside the charge radius, another outside it."""
+    r_max = max(float(domain_radius_m), 1e-9)
+    r_c = min(max(float(charge_radius_m), 0.0), r_max)
+    return [0.0, r_c, r_c, r_max], [float(inside), float(inside), float(outside), float(outside)]
+
+
 def initial_overpressure_step(
     domain_radius_m: float,
     charge_radius_m: float,
@@ -81,10 +105,8 @@ def initial_overpressure_step(
     p_atm: float,
 ):
     """Step profile: charge pressure inside R_charge, ambient overpressure outside."""
-    r_max = max(float(domain_radius_m), 1e-9)
-    r_c = min(max(float(charge_radius_m), 0.0), r_max)
     over = max(float(charge_pressure_pa) - float(p_atm), 0.0)
-    return [0.0, r_c, r_c, r_max], [over, over, 0.0, 0.0]
+    return initial_radial_step(domain_radius_m, charge_radius_m, over, 0.0)
 
 
 def _qimage_from_rgba(rgba: np.ndarray, width: int, height: int) -> QImage:
@@ -188,6 +210,7 @@ class MplCanvas(QLabel):
 
 class Tab1D(QWidget):
     # --- הוספה: סיגנלים לתקשורת עם Main ---
+    sig_request_init = pyqtSignal(object)
     sig_request_run = pyqtSignal()
     sig_request_stop = pyqtSignal()
 
@@ -202,6 +225,7 @@ class Tab1D(QWidget):
         self._has_run_profile = False
         self._pending_pressures = None
         self._pending_time_s = 0.0
+        self._pmax_over = None
         self._graph_timer = QTimer(self)
         self._graph_timer.setSingleShot(True)
         self._graph_timer.setInterval(50)
@@ -245,7 +269,7 @@ class Tab1D(QWidget):
             axis_epsilon=0.10,
             right_boundary=(
                 BOUNDARY_1D_REFLECT
-                if self.radio_reflect.isChecked()
+                if self._right_boundary_is_reflect()
                 else BOUNDARY_1D_TERMINATE
             ),
             probe_fields=tuple(getattr(self, "_probe_fields", ("p", "impulse"))),
@@ -255,7 +279,7 @@ class Tab1D(QWidget):
             material_name=self.combo_comp.currentText(),
             stop_mode=(
                 RUN_MODE_REFLECT
-                if self.radio_reflect.isChecked()
+                if self._right_boundary_is_reflect()
                 else RUN_MODE_TERMINATE
             ),
             stop_radius_m=float(self.spin_radius.value()),
@@ -306,14 +330,17 @@ class Tab1D(QWidget):
         self.recalc_stats()
 
     def selected_source_model(self) -> str:
-        if getattr(self, "radio_ig", None) is not None and self.radio_ig.isChecked():
-            return SOURCE_MODEL_IG
-        return SOURCE_MODEL_JWL
+        combo = getattr(self, "combo_source", None)
+        if combo is None:
+            return SOURCE_MODEL_JWL
+        return normalize_source_model(combo.currentData())
 
     def _apply_source_model_radios(self, value) -> None:
         model = normalize_source_model(value)
-        self.radio_jwl.setChecked(model == SOURCE_MODEL_JWL)
-        self.radio_ig.setChecked(model == SOURCE_MODEL_IG)
+        index = self.combo_source.findData(model)
+        if index < 0:
+            index = 0
+        self.combo_source.setCurrentIndex(index)
         self.on_source_model_changed()
 
     def on_source_model_changed(self, *_args) -> None:
@@ -361,20 +388,20 @@ class Tab1D(QWidget):
             self.edit_energy.setText(f"{props['E0']:.2e}")
         self.on_source_model_changed()
 
-    def create_input_row(self, unit_text, default_val, decimals=2, step=1.0):
+    def create_input_row(self, unit_text, default_val, decimals=2, step=1.0, width=100, spin_cls=QDoubleSpinBox):
         layout = QHBoxLayout()
-        spin = QDoubleSpinBox()
+        spin = spin_cls()
         spin.setRange(0, 1_000_000)
-        spin.setValue(default_val)
         spin.setDecimals(decimals)
+        spin.setValue(default_val)
         spin.setSingleStep(step)
         spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
         spin.wheelEvent = lambda event: event.ignore()
-        spin.setFixedWidth(100)
+        spin.setFixedWidth(width)
         spin.valueChanged.connect(self.recalc_stats)
-        unit_label = QLabel(f"({unit_text})")
         layout.addWidget(spin)
-        layout.addWidget(unit_label)
+        if unit_text:
+            layout.addWidget(QLabel(f"({unit_text})"))
         layout.addStretch()
         return spin, layout
 
@@ -399,9 +426,13 @@ class Tab1D(QWidget):
         
         group_domain = QGroupBox("Domain")
         domain_layout = QFormLayout()
-        self.spin_radius, lay_radius = self.create_input_row("m", 1.0)
+        self.spin_radius, lay_radius = self.create_input_row(
+            "m", 1.0, _RADIUS_DECIMALS, width=_DOMAIN_SPIN_WIDTH, spin_cls=_RadiusSpinBox,
+        )
         domain_layout.addRow("Radius", lay_radius)
-        self.spin_cellsize, lay_cell = self.create_input_row("m", 0.005, 3)
+        self.spin_cellsize, lay_cell = self.create_input_row(
+            "m", 0.005, 6, width=_DOMAIN_SPIN_WIDTH,
+        )
         domain_layout.addRow("Cellsize", lay_cell)
         group_domain.setLayout(domain_layout)
         input_layout.addWidget(group_domain)
@@ -412,22 +443,24 @@ class Tab1D(QWidget):
         comp_layout = QHBoxLayout()
         self.combo_comp = QComboBox()
         self.combo_comp.addItems(["TNT", "C4", "PETN", "ANFO", "Custom"])
-        self.combo_comp.setCurrentText("C4")
-        self.combo_comp.currentIndexChanged.connect(self.on_material_changed) 
+        self.combo_comp.setCurrentText("TNT")
+        # 1.25 times the Mass field (S3), which is the 100px spin box.
+        self.combo_comp.setFixedWidth(125)
+        self.combo_comp.currentIndexChanged.connect(self.on_material_changed)
         comp_layout.addWidget(self.combo_comp)
         
         self.btn_edit_comp = QPushButton("Edit..")
         self.btn_edit_comp.setFixedWidth(100)
         self.btn_edit_comp.setEnabled(False)
         comp_layout.addWidget(self.btn_edit_comp)
-        charge_layout.addRow("Mat", comp_layout)
+        charge_layout.addRow("Composition", comp_layout)
 
         self.spin_mass, lay_mass = self.create_input_row("kg", 1.0)
         charge_layout.addRow("Mass", lay_mass)
-        self.spin_density, lay_dens = self.create_input_row("kg/m3", 1601.0)
+        self.spin_density, lay_dens = self.create_input_row("kg/m3", 1630.0)
         charge_layout.addRow("Density", lay_dens)
 
-        self.edit_energy = QLineEdit("4.52e+06")
+        self.edit_energy = QLineEdit("4.29e+06")
         self.edit_energy.setFixedWidth(100)
         self.edit_energy.editingFinished.connect(self.recalc_stats)
         self.edit_energy.textChanged.connect(self.recalc_stats)
@@ -436,19 +469,6 @@ class Tab1D(QWidget):
         energy_lay.addWidget(QLabel("(J/kg)"))
         energy_lay.addStretch()
         charge_layout.addRow("Energy", energy_lay)
-
-        source_layout = QHBoxLayout()
-        self.radio_jwl = QRadioButton(SOURCE_MODEL_LABELS[SOURCE_MODEL_JWL])
-        self.radio_ig = QRadioButton(SOURCE_MODEL_LABELS[SOURCE_MODEL_IG])
-        self.radio_jwl.setChecked(True)
-        self._source_model_group = QButtonGroup(self)
-        self._source_model_group.addButton(self.radio_jwl)
-        self._source_model_group.addButton(self.radio_ig)
-        self.radio_jwl.toggled.connect(self.on_source_model_changed)
-        source_layout.addWidget(self.radio_jwl)
-        source_layout.addWidget(self.radio_ig)
-        source_layout.addStretch()
-        charge_layout.addRow("Source model", source_layout)
 
         remap_layout = QHBoxLayout()
         self.radio_yes = QRadioButton("Yes")
@@ -486,28 +506,31 @@ class Tab1D(QWidget):
         self.cmb_left.setMinimumWidth(160)
         self.cmb_left.setMaximumWidth(220)
         bounds_layout.addRow("Left", self.cmb_left)
-        self.radio_terminate = QRadioButton(LABEL_RUN_TERMINATE)
-        self.radio_reflect = QRadioButton(LABEL_RUN_REFLECT)
-        self.radio_terminate.setToolTip(TIP_RUN_TERMINATE)
-        self.radio_reflect.setToolTip(TIP_RUN_REFLECT)
-        self.radio_terminate.setChecked(True)
-        self._run_mode_group = QButtonGroup(self)
-        self._run_mode_group.addButton(self.radio_terminate)
-        self._run_mode_group.addButton(self.radio_reflect)
-        bounds_layout.addRow(self.radio_terminate)
-        bounds_layout.addRow(self.radio_reflect)
+        self.cmb_right = QComboBox()
+        self.cmb_right.addItem("Terminate", RUN_MODE_TERMINATE)
+        self.cmb_right.addItem("Reflect", RUN_MODE_REFLECT)
+        self.cmb_right.setItemData(0, TIP_RUN_TERMINATE, Qt.ToolTipRole)
+        self.cmb_right.setItemData(1, TIP_RUN_REFLECT, Qt.ToolTipRole)
+        self.cmb_right.setMinimumWidth(self.cmb_left.minimumWidth())
+        self.cmb_right.setMaximumWidth(self.cmb_left.maximumWidth())
+        self.cmb_right.currentIndexChanged.connect(self._sync_end_time_always_editable)
+        bounds_layout.addRow("Right", self.cmb_right)
         group_bounds.setLayout(bounds_layout)
         input_layout.addWidget(group_bounds)
 
-        group_solver = QGroupBox("Solver")
+        group_solver = QGroupBox("Solver Options")
         solver_layout = QFormLayout()
-        self.spin_cfl, lay_cfl = self.create_input_row("", 0.50, 2, 0.1)
-        solver_layout.addRow("Max CFL", lay_cfl)
-        self.spin_endtime, lay_etime = self.create_input_row("s", 0.025, 4, 0.001)
+        self.spin_cfl, lay_cfl = self.create_input_row("", 0.50, 2, 0.1, width=_DOMAIN_SPIN_WIDTH)
+        solver_layout.addRow("CFL", lay_cfl)
+        self.combo_source = QComboBox()
+        self.combo_source.setFixedWidth(_DOMAIN_SPIN_WIDTH)
+        for model_id in (SOURCE_MODEL_JWL, SOURCE_MODEL_IG):
+            self.combo_source.addItem(SOURCE_MODEL_LABELS[model_id], model_id)
+        self.combo_source.currentIndexChanged.connect(self.on_source_model_changed)
+        solver_layout.addRow("Method", self.combo_source)
+        self.spin_endtime, lay_etime = self.create_input_row("s", 0.025, 4, 0.001, width=_DOMAIN_SPIN_WIDTH)
         self.spin_endtime.setToolTip(TIP_END_TIME)
         solver_layout.addRow("End Time", lay_etime)
-        self.radio_terminate.toggled.connect(self._sync_end_time_always_editable)
-        self.radio_reflect.toggled.connect(self._sync_end_time_always_editable)
         self._sync_end_time_always_editable()
         
         group_solver.setLayout(solver_layout)
@@ -547,12 +570,16 @@ class Tab1D(QWidget):
         self.lbl_charge_radius = QLabel("0.00")
         self.lbl_charge_cells = QLabel("0")
         self.lbl_adj_density = QLabel("0.00")
-        for lbl in [self.lbl_domain_cells, self.lbl_charge_radius, self.lbl_charge_cells, self.lbl_adj_density]:
-            lbl.setStyleSheet("font-weight: bold; color: #333;")
-        stats_layout.addRow("Dom. Cells:", self.lbl_domain_cells)
-        stats_layout.addRow("Charge R:", self.lbl_charge_radius)
-        stats_layout.addRow("Chrg. Cells:", self.lbl_charge_cells)
-        stats_layout.addRow("Field Rho:", self.lbl_adj_density)
+        for caption, value in (
+            ("Dom. Cells:", self.lbl_domain_cells),
+            ("Charge R:", self.lbl_charge_radius),
+            ("Chrg. Cells:", self.lbl_charge_cells),
+            ("Field Rho:", self.lbl_adj_density),
+        ):
+            label = QLabel(caption)
+            label.setStyleSheet(INFO_TITLE_STYLE)
+            value.setStyleSheet(INFO_ROW_STYLE)
+            stats_layout.addRow(label, value)
         group_stats.setLayout(stats_layout)
         left_layout.addWidget(group_stats)
 
@@ -645,20 +672,44 @@ class Tab1D(QWidget):
 
     def _redraw_canvas(self) -> None:
         """Apply pending live data, then paint a software bitmap (no Qt OpenGL)."""
-        if self._live_graph and self._pending_pressures:
+        if (
+            self._live_graph
+            and self._pending_pressures
+            and self.selected_chart() in ("pressure", "pmax")
+        ):
             self._apply_live_profile(self._pending_pressures, self._pending_time_s)
         try:
             self.canvas.draw_idle()
         except Exception:
             pass
 
-    def _style_overpressure_axes(self) -> None:
+    def selected_chart(self) -> str:
+        group = getattr(self, "_chart_group", None)
+        if group is None:
+            return "pressure"
+        button = group.checkedButton()
+        if button is None:
+            return "pressure"
+        return str(button.property("chart") or "pressure")
+
+    def _style_chart_axes(self, chart: str) -> None:
+        titles = {
+            "pressure": ("Overpressure vs Range", "Overpressure (Pa)"),
+            "pmax": ("PMax vs Range", "Peak overpressure (Pa)"),
+            "density": ("Density vs Range", "Density (kg/m3)"),
+            "energy": ("Energy vs Range", "Energy (J/kg)"),
+            "velocity": ("Velocity vs Range", "Velocity (m/s)"),
+        }
+        title, ylabel = titles.get(chart, titles["pressure"])
         axes = self.canvas.axes
-        axes.set_title("Overpressure vs Range")
+        axes.set_title(title)
         axes.set_xlabel("Radius (m)")
-        axes.set_ylabel("Overpressure (Pa)")
+        axes.set_ylabel(ylabel)
         axes.grid(True)
         axes.legend(loc="upper right")
+
+    def _style_overpressure_axes(self) -> None:
+        self._style_chart_axes("pressure")
 
     def charge_pressure_pa(self) -> float:
         """Charge pressure for the pre-run sketch from the entered density and energy."""
@@ -683,16 +734,57 @@ class Tab1D(QWidget):
         )
 
     def plot_initial_condition(self) -> None:
-        """Show the entered charge as a step in overpressure vs radius, before a run."""
+        """Show the entered charge before a run. A frozen or live profile is left in place."""
         if self._live_graph or getattr(self, "_has_run_profile", False):
             return
+        self._plot_setup_chart()
+
+    def _plot_setup_chart(self) -> None:
         if not hasattr(self, "canvas"):
             return
-        radii, overpressures = self.initial_overpressure_profile()
+        chart = self.selected_chart()
+        if chart in ("pressure", "pmax") and not is_ideal_gas_source(self.selected_source_model()):
+            name = "PMax" if chart == "pmax" else "pressure"
+            self.canvas.axes.clear()
+            self.canvas.axes.set_title(f"JWL {name} profile available after solver initialization")
+            self.canvas.axes.set_xlabel("Radius (m)")
+            self.canvas.axes.set_ylabel("Overpressure (Pa)" if chart == "pressure" else "Peak overpressure (Pa)")
+            self._redraw_canvas()
+            return
+        radii, values, label = self._setup_chart_series(chart)
         self.canvas.axes.clear()
-        self.canvas.axes.plot(radii, overpressures, color="#c0392b", linewidth=1.8, label="Pressure")
-        self._style_overpressure_axes()
+        self.canvas.axes.plot(radii, values, color="#c0392b", linewidth=1.8, label=label)
+        self._style_chart_axes(chart)
         self._redraw_canvas()
+
+    def _setup_chart_series(self, chart: str):
+        rho = float(self.spin_density.value())
+        charge_r = spherical_charge_radius_m(self.spin_mass.value(), rho)
+        radius = self.spin_radius.value()
+        if chart == "density":
+            ambient = igs.ambient_state(self.spin_press.value(), self.spin_temp.value())
+            return (*initial_radial_step(radius, charge_r, rho, ambient.rho), "Density")
+        if chart == "energy":
+            ambient = igs.ambient_state(self.spin_press.value(), self.spin_temp.value())
+            try:
+                entered = float(self.edit_energy.text())
+            except (TypeError, ValueError):
+                entered = float(self.get_selected_material_properties().get("E0") or 0.0)
+            inside = ambient.e + entered if is_ideal_gas_source(self.selected_source_model()) else entered
+            return (*initial_radial_step(radius, charge_r, inside, ambient.e), "Energy")
+        if chart == "velocity":
+            return (*initial_radial_step(radius, charge_r, 0.0, 0.0), "Velocity")
+        radii, overpressures = self.initial_overpressure_profile()
+        label = "PMax" if chart == "pmax" else "Pressure"
+        return radii, overpressures, label
+
+    def on_chart_changed(self, *_args) -> None:
+        if (self._live_graph or getattr(self, "_has_run_profile", False)) and self._pending_pressures:
+            if self.selected_chart() in ("pressure", "pmax"):
+                self._apply_live_profile(self._pending_pressures, self._pending_time_s)
+                self._redraw_canvas()
+                return
+        self._plot_setup_chart()
 
     def begin_run_graph(self) -> None:
         """Clear stale post-run freeze so the next live profile can replace it."""
@@ -700,28 +792,38 @@ class Tab1D(QWidget):
         self._live_graph = False
         self._pending_pressures = None
         self._pending_time_s = 0.0
+        self._pmax_over = None
+
+    def _right_boundary_is_reflect(self) -> bool:
+        combo = getattr(self, "cmb_right", None)
+        if combo is None:
+            return False
+        return combo.currentData() == RUN_MODE_REFLECT
 
     def _apply_run_mode_radios(self, values: dict) -> None:
         mode = normalize_run_mode(
             values.get("stop_mode") or values.get("mode"),
             values.get("right_boundary"),
         )
-        self.radio_terminate.blockSignals(True)
-        self.radio_reflect.blockSignals(True)
+        index = self.cmb_right.findData(
+            RUN_MODE_REFLECT if mode == RUN_MODE_REFLECT else RUN_MODE_TERMINATE
+        )
+        if index < 0:
+            index = 0
+        self.cmb_right.blockSignals(True)
         try:
-            if mode == RUN_MODE_REFLECT:
-                self.radio_reflect.setChecked(True)
-            else:
-                self.radio_terminate.setChecked(True)
+            self.cmb_right.setCurrentIndex(index)
         finally:
-            self.radio_terminate.blockSignals(False)
-            self.radio_reflect.blockSignals(False)
+            self.cmb_right.blockSignals(False)
         self._sync_end_time_always_editable()
 
     def _sync_end_time_always_editable(self, _checked: bool = False) -> None:
         """End Time stays visible and editable in both 1D modes."""
         self.spin_endtime.setVisible(True)
         self.spin_endtime.setEnabled(True)
+        if hasattr(self, "cmb_right"):
+            reflect = self._right_boundary_is_reflect()
+            self.cmb_right.setToolTip(TIP_RUN_REFLECT if reflect else TIP_RUN_TERMINATE)
 
     def end_live_graph(self) -> None:
         """Freeze the last live profile after a run; do not reset to the t=0 sketch."""
@@ -756,44 +858,73 @@ class Tab1D(QWidget):
     def _build_exec_tab(self, parent):
         layout = QHBoxLayout(parent)
         layout.setContentsMargins(8, 8, 8, 8)
-        
-        # כפתורי פעולה בלבד
-        g_actions = QGroupBox("Simulation Control")
-        title_font = QFont(g_actions.font())
-        title_font.setPointSize(GROUP_TITLE_FONT_PT)
-        title_font.setBold(True)
-        g_actions.setFont(title_font)
-        v_actions = QHBoxLayout(g_actions)
-        
+        layout.setAlignment(Qt.AlignTop)
+
+        column = QVBoxLayout()
+        column.setSpacing(8)
+
+        g_actions = QGroupBox("")
+        v_actions = QVBoxLayout(g_actions)
+        v_actions.setSpacing(8)
+
         action_font = QFont()
         action_font.setPointSize(ACTION_BUTTON_FONT_PT)
         action_font.setWeight(QFont.Bold)
 
+        self.btn_initialize = QPushButton("Initialize Model")
+        self.btn_initialize.setFont(action_font)
+        self.btn_initialize.setMinimumHeight(40)
+        self.btn_initialize.setToolTip("Generate mesh and initial fields before Run; required again after case input edits.")
+        self.btn_initialize.clicked.connect(lambda: self.sig_request_init.emit(self.get_case_inputs()))
+        v_actions.addWidget(self.btn_initialize)
+
         self.btn_run = QPushButton("▶ Run Simulation")
-        # Width sized for 10 pt bold label + padding (native Windows metrics).
-        self.btn_run.setFixedWidth(250)
-        self.btn_run.setFixedHeight(50)
-        self.btn_run.setFont(action_font)
-        self.btn_run.setStyleSheet(
-            "background-color: #2ecc71; color: white; font-weight: bold; border-radius: 6px;"
-        )
+        self.btn_run.setStyleSheet("background-color: #2ecc71; color: white; padding: 5px;")
         self.btn_run.clicked.connect(self.sig_request_run.emit)
 
         self.btn_stop = QPushButton("⏸ Interrupt")
-        self.btn_stop.setFixedWidth(190)
-        self.btn_stop.setFixedHeight(50)
-        self.btn_stop.setFont(action_font)
-        self.btn_stop.setStyleSheet(
-            "background-color: #e67e22; color: white; font-weight: bold; border-radius: 6px;"
-        )
+        self.btn_stop.setStyleSheet("background-color: #e67e22; color: white; padding: 5px;")
         self.btn_stop.clicked.connect(self.sig_request_stop.emit)
+        for button in (self.btn_run, self.btn_stop):
+            button.setMinimumWidth(198)
+            button.setFont(QFont())
 
         v_actions.addWidget(self.btn_run)
-        v_actions.addSpacing(20)
         v_actions.addWidget(self.btn_stop)
-        layout.addWidget(g_actions)
-        
+        column.addWidget(g_actions)
+        column.addStretch()
+        layout.addLayout(column)
+        layout.addWidget(self._build_chart_options(), 0, Qt.AlignTop)
         layout.addStretch()
+
+    def _build_chart_options(self) -> QWidget:
+        host = QWidget()
+        grid = QGridLayout(host)
+        grid.setContentsMargins(16, 0, 0, 0)
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(4)
+        title = QLabel("Chart:")
+        title_font = QFont(title.font())
+        title_font.setBold(True)
+        title.setFont(title_font)
+        grid.addWidget(title, 0, 0, Qt.AlignTop)
+        self._chart_group = QButtonGroup(self)
+        options = (
+            (0, 1, "pressure", "Pressure", "radio_chart_pressure"),
+            (0, 2, "pmax", "PMax", "radio_chart_pmax"),
+            (1, 1, "density", "Density", "radio_chart_density"),
+            (2, 1, "energy", "Energy", "radio_chart_energy"),
+            (3, 1, "velocity", "Velocity", "radio_chart_velocity"),
+        )
+        for row, column, key, text, attr in options:
+            radio = QRadioButton(text)
+            radio.setProperty("chart", key)
+            setattr(self, attr, radio)
+            self._chart_group.addButton(radio)
+            grid.addWidget(radio, row, column)
+        self.radio_chart_pressure.setChecked(True)
+        self._chart_group.buttonToggled.connect(self.on_chart_changed)
+        return host
 
     def recalc_stats(self):
         try:
@@ -821,6 +952,7 @@ class Tab1D(QWidget):
             self._live_graph = False
             self._has_run_profile = False
             self._pending_pressures = None
+            self._pmax_over = None
             self.plot_initial_condition()
             self.refresh_remap_status()
 
@@ -853,46 +985,45 @@ class Tab1D(QWidget):
         else:
             label.setStyleSheet(SECONDARY_INFO_STYLE)
 
-    def update_graph(self, pressures, sim_time_s: float):
+    def update_graph(self, pressures, sim_time_s: float, radii=()):
         if not pressures:
             return
+        self._live_probe_radii = tuple(radii)
         self._pending_pressures = [float(p) for p in pressures]
         self._pending_time_s = float(sim_time_s)
+        self._accumulate_pmax(self._pending_pressures)
         self._live_graph = True
         if not self._graph_timer.isActive():
             self._graph_timer.start()
 
-    def _apply_live_profile(self, pressures, sim_time_s: float) -> None:
-        if self.last_r_min is None:
-            try:
-                radius = float(self.spin_radius.value())
-                dx = float(self.spin_cellsize.value())
-                rho = float(self.spin_density.value())
-
-                vol = float(self.spin_mass.value()) / max(rho, 1.0)
-                r_ch = ((3.0 * vol) / (4.0 * math.pi)) ** (1 / 3.0)
-
-                r_min_geom = max(1e-6, 0.05 * dx)
-                r_min = max(1e-6, min(r_min_geom, 0.2 * r_ch))
-                self.last_r_min = r_min
-                self.last_r_max = radius
-            except (TypeError, ValueError, ZeroDivisionError, AttributeError):
-                self.last_r_min = 0.0
-                self.last_r_max = 1.0
-
-        r_min = self.last_r_min
-        r_max = self.last_r_max
+    def _accumulate_pmax(self, pressures) -> None:
         p_atm = self.spin_press.value()
-        overpressures = [p - p_atm for p in pressures]
-        n = len(overpressures)
-        if n > 1:
-            distances = [r_min + (i / (n - 1)) * (r_max - r_min) for i in range(n)]
+        over = [float(p) - p_atm for p in pressures]
+        previous = getattr(self, "_pmax_over", None)
+        if not previous or len(previous) != len(over):
+            self._pmax_over = over
+            return
+        self._pmax_over = [max(old, new) for old, new in zip(previous, over)]
+
+    def _apply_live_profile(self, pressures, sim_time_s: float) -> None:
+        chart = self.selected_chart()
+        if chart not in ("pressure", "pmax"):
+            self._plot_setup_chart()
+            return
+        distances = getattr(self, "_live_probe_radii", ())
+        if len(distances) != len(pressures) or not distances:
+            self.canvas.axes.clear()
+            self.canvas.axes.set_title("Live profile unavailable: probe coordinates missing")
+            return
+        if chart == "pmax" and getattr(self, "_pmax_over", None) and len(self._pmax_over) == len(pressures):
+            values = list(self._pmax_over)
         else:
-            distances = [r_min]
+            p_atm = self.spin_press.value()
+            values = [p - p_atm for p in pressures]
 
         self.canvas.axes.clear()
         self.canvas.axes.plot(
-            distances, overpressures, color="#c0392b", linewidth=1.8,
+            distances, values, color="#c0392b", linewidth=1.8,
             label=f"t = {sim_time_s*1000.0:.3f} ms",
         )
-        self._style_overpressure_axes()
+        self._style_chart_axes(chart)

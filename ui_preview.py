@@ -1,7 +1,12 @@
 """Launch a native GGUI preview without CFD, initialization, or case generation.
 
 Example:
-    python ui_preview.py --tab 2d --state ready --review
+    python ui_preview.py --tab 1d --state ready --review
+
+Review Mode adds stable IDs. On the 1D tab they are 1D-A, 1D-A01, and so on.
+Ctrl+Right Click a labelled control to open another tab and highlight a
+comparable control. The menu can return to the previous tab. Left clicks
+still operate the control. Production launch does not enable Review Mode.
 """
 from __future__ import annotations
 
@@ -139,7 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--review",
         action="store_true",
-        help="Enable UI Review Mode overlays (Ctrl+Shift+I toggles).",
+        help="Enable UI Review Mode overlays (Ctrl+Shift+I toggles, Ctrl+Right Click compares).",
     )
     return parser
 

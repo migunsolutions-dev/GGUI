@@ -26,7 +26,6 @@ from ui_metrics import (
     STATUS_READY_POINT_SIZE,
     STATUS_REP_MODE_GROUP,
     STATUS_REP_ET,
-    ACTION_BUTTON_FONT_PT,
 )
 from viewer_widget import ObstacleItem
 
@@ -138,9 +137,9 @@ class TestUILayoutConsistency(unittest.TestCase):
             vp = tab._exec_scroll.viewport() if hasattr(tab, "_exec_scroll") else tab.ctrl_tabs
             for btn in (tab.btn_run, tab.btn_stop):
                 self.assertFalse(btn.isHidden())
-                self.assertEqual(btn.font().pointSize(), ACTION_BUTTON_FONT_PT)
-                self.assertEqual(btn.font().pointSize(), 10)
-                self.assertEqual(btn.height(), 50)
+                self.assertEqual(btn.minimumWidth(), 198)
+                self.assertIn("padding: 5px", btn.styleSheet())
+                self.assertNotIn("border-radius", btn.styleSheet())
                 br = btn.rect()
                 mapped = QRect(btn.mapTo(vp, br.topLeft()), br.size())
                 self.assertTrue(
@@ -167,8 +166,8 @@ class TestUILayoutConsistency(unittest.TestCase):
             self.app.processEvents()
             after = list(tab._right_v_splitter.sizes())
             self.assertEqual(after, saved)
-            self.assertEqual(tab.btn_run.font().pointSize(), 10)
-            self.assertEqual(tab.btn_stop.font().pointSize(), 10)
+            self.assertEqual(tab.btn_run.height(), win.tab_2d.btn_initialize.height())
+            self.assertEqual(tab.btn_stop.height(), win.tab_2d.btn_initialize.height())
             # restore preferred for other tests
             tab._right_v_splitter.setSizes(before)
         finally:

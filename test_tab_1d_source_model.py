@@ -1,4 +1,4 @@
-"""1D source-model radios: JWL default, IG persists, JWL editor disabled on IG."""
+"""1D source-model list: JWL default, IG persists, JWL editor disabled on IG."""
 
 from __future__ import annotations
 
@@ -30,28 +30,26 @@ class Tab1DSourceModelTests(unittest.TestCase):
     def test_jwl_is_the_initial_default(self):
         tab = Tab1D()
         self.assertEqual(tab.selected_source_model(), SOURCE_MODEL_JWL)
-        self.assertTrue(tab.radio_jwl.isChecked())
+        self.assertEqual(tab.combo_source.currentData(), SOURCE_MODEL_JWL)
         inputs = tab.get_case_inputs()
         self.assertEqual(inputs.source_model, SOURCE_MODEL_JWL)
 
     def test_ig_round_trips_through_get_and_set(self):
         tab = Tab1D()
-        tab.radio_ig.setChecked(True)
+        tab.combo_source.setCurrentIndex(tab.combo_source.findData(SOURCE_MODEL_IG))
         data = tab.get_case_inputs().__dict__
         self.assertEqual(data["source_model"], SOURCE_MODEL_IG)
         other = Tab1D()
         other.set_case_inputs(data)
         self.assertEqual(other.selected_source_model(), SOURCE_MODEL_IG)
-        self.assertTrue(other.radio_ig.isChecked())
+        self.assertEqual(other.combo_source.currentData(), SOURCE_MODEL_IG)
 
     def test_ig_disables_jwl_coefficient_editor(self):
         tab = Tab1D()
         tab.combo_comp.setCurrentText("Custom")
-        tab.radio_jwl.setChecked(True)
-        tab.on_source_model_changed()
+        tab.combo_source.setCurrentIndex(tab.combo_source.findData(SOURCE_MODEL_JWL))
         self.assertTrue(tab.btn_edit_comp.isEnabled())
-        tab.radio_ig.setChecked(True)
-        tab.on_source_model_changed()
+        tab.combo_source.setCurrentIndex(tab.combo_source.findData(SOURCE_MODEL_IG))
         self.assertFalse(tab.btn_edit_comp.isEnabled())
 
 

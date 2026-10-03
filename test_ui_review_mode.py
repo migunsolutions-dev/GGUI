@@ -12,7 +12,8 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QEvent, Qt
+from PyQt5.QtGui import QMouseEvent
 from PyQt5.QtWidgets import (
     QApplication,
     QGroupBox,
@@ -356,6 +357,126 @@ class VtkResizeGuardTests(unittest.TestCase):
         self.app.sendEvent(viewer.child, QResizeEvent(QSize(1, 1), QSize(140, 80)))
         self.assertEqual(viewer.child.resize_events, active_count)
         viewer.close()
+
+
+class OneDReviewCatalogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _app()
+
+    def test_1d_ids_are_stable_and_resolved(self):
+        from tab_1d import Tab1D
+        from ui_review_catalog import resolve_1d_marks
+
+        class Host(QMainWindow):
+            def __init__(self):
+                super().__init__()
+                self.tab_1d = Tab1D()
+                self.setCentralWidget(self.tab_1d)
+
+        first = Host()
+        second = Host()
+        first.show()
+        second.show()
+        self.app.processEvents()
+        try:
+            marks_a = resolve_1d_marks(first)
+            marks_b = resolve_1d_marks(second)
+            ids_a = [mark.review_id for mark, _widget in marks_a]
+            ids_b = [mark.review_id for mark, _widget in marks_b]
+            self.assertEqual(ids_a, ids_b)
+            self.assertEqual(ids_a[0], "1D-A")
+            self.assertIn("1D-A07", ids_a)
+            self.assertIn("1D-D03", ids_a)
+            self.assertEqual(len(ids_a), len(set(ids_a)))
+            missing = [mark.review_id for mark, widget in marks_a if widget is None]
+            self.assertEqual(missing, [])
+            by_id = {mark.review_id: widget for mark, widget in marks_a}
+            self.assertIs(by_id["1D-A07"], first.tab_1d.spin_mass)
+            self.assertIs(by_id["1D-D03"], first.tab_1d.btn_run)
+            self.assertFalse(by_id["1D-A14"].isVisible())
+        finally:
+            first.close()
+            second.close()
+
+
+class OneDReviewNavigationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _app()
+
+    def test_review_navigation_preserves_1d_values_and_returns(self):
+        from main_new import BlastFoamApp
+        from ui_preview import select_tab
+
+        tmp = tempfile.TemporaryDirectory()
+        win = BlastFoamApp()
+        win.show()
+        self.app.processEvents()
+        try:
+            select_tab(win, "1d")
+            disable_cfd_actions(win)
+            controller = attach_ui_review(win, enabled=True, output_dir=tmp.name)
+            self.app.processEvents()
+            mass = win.tab_1d.spin_mass
+            radius = win.tab_1d.spin_radius
+            mass.setValue(2.5)
+            radius.setValue(1.25)
+            before_mass = mass.value()
+            before_radius = radius.value()
+            choices = controller.compare_choices(mass)
+            self.assertEqual(choices["review_id"], "1D-A07")
+            self.assertEqual(choices["class"], "QDoubleSpinBox")
+            self.assertTrue(any(item["destination"] == "2d-setup" for item in choices["comparable"]))
+            self.assertTrue(any(item["destination"] == "3d-model" for item in choices["comparable"]))
+            ids = [row["id"] for row in controller.visible_region_map()]
+            self.assertIn("1D-A", ids)
+            self.assertIn("1D-B", ids)
+            self.assertIn("1D-C", ids)
+            self.assertIn("1D-D", ids)
+            self.assertIn("1D-A05", ids)
+            self.assertGreater(len(controller.overlay_widgets()), 0)
+            for overlay in controller.overlay_widgets():
+                self.assertTrue(overlay.testAttribute(Qt.WA_TransparentForMouseEvents))
+            run_geo = win.tab_1d.btn_run.geometry()
+            self.assertTrue(
+                controller.navigate("2d-setup", "spin_mass", "1D-A07")
+            )
+            self.app.processEvents()
+            self.assertIs(win.tabs.currentWidget(), win.tab_2d)
+            self.assertIs(controller._compare_widget, win.tab_2d.spin_mass)
+            self.assertTrue(controller.enabled)
+            self.assertEqual(mass.value(), before_mass)
+            self.assertEqual(radius.value(), before_radius)
+            self.assertEqual(win.tab_1d.btn_run.geometry(), run_geo)
+            self.assertTrue(controller.return_to_previous())
+            self.app.processEvents()
+            self.assertIs(win.tabs.currentWidget(), win.tab_1d)
+            self.assertEqual(mass.value(), before_mass)
+            self.assertEqual(radius.value(), before_radius)
+            self.assertIsNone(controller._compare_widget)
+            left = QMouseEvent(
+                QEvent.MouseButtonPress,
+                win.tab_1d.btn_fit.rect().center(),
+                Qt.LeftButton,
+                Qt.LeftButton,
+                Qt.NoModifier,
+            )
+            self.assertFalse(controller.eventFilter(win.tab_1d.btn_fit, left))
+            right = QMouseEvent(
+                QEvent.MouseButtonPress,
+                win.tab_1d.btn_fit.rect().center(),
+                Qt.RightButton,
+                Qt.RightButton,
+                Qt.ControlModifier,
+            )
+            self.assertTrue(controller.eventFilter(win.tab_1d.btn_fit, right))
+            controller.disable()
+            self.assertFalse(controller.eventFilter(win.tab_1d.btn_fit, right))
+            self.assertFalse(controller.enabled)
+        finally:
+            win.close()
+            tmp.cleanup()
 
 
 if __name__ == "__main__":
