@@ -1,0 +1,70 @@
+path	size_gb	removed
+_amr_tuning_run01/variants	65.096	removed
+_val_b4/b4a	22.133	removed
+_val_b4/b4b_archive_invalid	0.235	removed
+_val_b4/b4b_fine	0.063	removed
+_val_b4/b4b_coarse	0.032	removed
+_val_band_seed/B4	2.389	removed
+_val_band_seed/Cbk	0.331	removed
+_val_band_seed/B5	0.053	removed
+_val_band_seed/A	0.013	removed
+_val_band_seed/C5	0.001	removed
+_val_band_seed/C4	0.001	removed
+_val_band_seed/D	0.001	removed
+_val_m2/B4	2.389	removed
+_val_m2/C4new	0.188	removed
+_val_m2/sph05_s5	0.003	removed
+_val_b2/b2ext_release	1.540	removed
+_val_b2/b2_release	0.374	removed
+_audit_building3d_ggui/mimic_building3d	1.823	removed
+_audit_building3d_roundtrip	0.055	removed
+_val_release_spatial/sdp_medium	1.538	removed
+_val_ex1/ex1_seed2_bandON	0.149	removed
+_val_ex1/ex1_seed0_bandON	0.149	removed
+_val_ex1/ex1_seed2_bandOFF	0.149	removed
+_val_ex1/ex1b_band_seed	0.094	removed
+_val_ex1/ex1b_new	0.085	removed
+_val_ex1/ex1b_legacy	0.075	removed
+_val_ex1/ex1_seed0_bandOFF	0.002	removed
+_val_b1/b1_scaledDelta_p	0.150	removed
+_val_b1/b1_densityGradient	0.149	removed
+_val_b1/b1_scaledDelta_rho	0.142	removed
+_ig_plan_scratch/phase_d/mass	1.845	removed
+_ig_plan_scratch/phase_d/matrix	1.573	removed
+_ig_plan_scratch/phase_d/resolution	0.196	removed
+_ig_plan_scratch/Sedov_2D	0.009	removed
+_ig_plan_scratch/jwl_v2_1d_acceptance	0.006	removed
+_ig_plan_scratch/phase_c_ig	0.001	removed
+validation/viper_1d/cases	0.274	removed
+_gui_verify_1d	0.001	removed
+_gui_verify_freeair_kb	0.003	removed
+_gui_verify_remap_2d	0.002	removed
+TOTAL	103.312	removed
+
+# leftover generated cases kept out of the size estimate
+_val_ex2/box_25_02
+_val_ex2/box_25_05
+_val_ex2/box_5_02
+_val_ex2/box_5_05
+_val_ex2/cyl_25_02
+_val_ex2/cyl_25_05
+_val_ex2/cyl_5_02
+_val_ex2/cyl_5_05
+_val_ex2/sph_25_02
+_val_ex2/sph_25_05
+_val_ex2/sph_5_02
+_val_ex2/sph_5_05
+_val_ex2_followup/cyl_5_02_s4
+_val_ex2_followup/sph_25_05_s5
+_val_m1/box_02
+_val_m1/box_05
+_val_m1/cyl_02
+_val_m1/cyl_05
+_val_m1/sph_02
+_val_m1/sph_02_bandON
+_val_m1/sph_05
+_wsl_solver_val/A_default_dg
+_wsl_solver_val/B_pressure_sd
+_wsl_solver_val/C_cylinder_oe
+_wsl_solver_val/D_cuboid_oe
+_wsl_solver_val/E_adv_loadbalance

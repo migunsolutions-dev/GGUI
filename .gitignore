@@ -44,6 +44,16 @@ _audit_*/
 _wsl_*/
 _wsl_*.log
 
+# GUI smoke screenshots and regenerable comparison outputs.
+_gui_verify_*/
+validation/viper_1d/cases/
+
+# Scratch solver trees. Reports, scripts, and phase_d/viper/*.vip stay.
+_ig_plan_scratch/phase_d/mass/
+_ig_plan_scratch/phase_d/matrix/
+_ig_plan_scratch/phase_d/resolution/
+_ig_plan_scratch/Sedov_2D/
+
 # OpenFOAM runtime debris at repo root only (do not ignore tutorial 0/ dirs)
 /processor*/
 /postProcessing/
