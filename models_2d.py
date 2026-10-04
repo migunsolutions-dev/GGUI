@@ -61,6 +61,8 @@ class CaseInputs2D:
 
     # Initialization.
     initialization_source: str = "Direct Charge"  # Direct Charge | From 1D
+    # Persisted model id. Blank/missing stays JWL so older projects still open.
+    source_model: str = "JWL_DETONATION"
     charge_shape: str = "Sphere"  # Sphere | Cylinder
     charge_center_r: float = 0.0  # locked; validated to exactly zero
     height_of_burst: float = 0.5

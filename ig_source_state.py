@@ -65,8 +65,10 @@ from models import SOURCE_MODEL_IG, SOURCE_MODEL_SCHEMA_VERSION
 # Single-material architecture: one gas fills the whole domain, so the burst gas
 # necessarily uses air's properties. These are the values the existing JWL case
 # already gives its `air` phase, so BF-IG introduces no new thermo constant.
-GAMMA_IDEAL_GAS = 1.4
-CV_IDEAL_GAS = 718.0
+from atmosphere import (
+    GAMMA_IDEAL_GAS, CV_IDEAL_GAS, AmbientState, AtmosphereError,
+    ambient_state as _ambient_state,
+)
 
 DERIVATION_ID = "ig_isothermal_burst/radial_shell_face_snapped/detonation_added/v2"
 
@@ -117,47 +119,14 @@ def _require_positive(name: str, value: Any) -> float:
     return number
 
 
-@dataclass(frozen=True)
-class AmbientState:
-    """Uniform far-field gas state, derived so it is exactly consistent with the EOS."""
-
-    p_atm: float
-    t_atm: float
-    gamma: float
-    cv: float
-    r_specific: float
-    rho: float
-    e: float
-
-
-def ambient_state(
-    p_atm: float,
-    t_atm: float,
-    gamma: float = GAMMA_IDEAL_GAS,
-    cv: float = CV_IDEAL_GAS,
-) -> AmbientState:
-    """Ambient density from the EOS rather than a hard-coded 1.225 kg/m^3.
-
-    ``rho = p/(R*T)`` is only 1.225 at exactly 101325 Pa / 288 K. Writing a constant
-    at any other ambient seeds a spurious starting wave, because blastFoam derives
-    ``e`` from the ``p`` and ``rho`` it is given.
-    """
-    p = _require_positive("p_atm", p_atm)
-    t = _require_positive("t_atm", t_atm)
-    g = _require_positive("gamma", gamma)
-    c = _require_positive("cv", cv)
-    if g <= 1.0:
-        raise IgSourceStateError(f"gamma must be > 1, got {g!r}")
-    r_specific = (g - 1.0) * c
-    return AmbientState(
-        p_atm=p,
-        t_atm=t,
-        gamma=g,
-        cv=c,
-        r_specific=r_specific,
-        rho=p / (r_specific * t),
-        e=c * t,
-    )
+def ambient_state(p_atm: float, t_atm: float,
+                  gamma: float = GAMMA_IDEAL_GAS,
+                  cv: float = CV_IDEAL_GAS) -> AmbientState:
+    """Compatibility boundary preserving the public IG exception type."""
+    try:
+        return _ambient_state(p_atm, t_atm, gamma, cv)
+    except AtmosphereError as exc:
+        raise IgSourceStateError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -170,6 +139,76 @@ class ChargeGeometry:
     volume_m3: float
     radius_m: float
     source_energy_j: float
+
+
+@dataclass(frozen=True)
+class DirectAxisymmetricBurst:
+    """Direct 2D burst: the same gas and energy rule as 1D, on a geometric sphere.
+
+    The 1D path snaps its radius to a radial cell face because that mesh is a
+    stack of spherical shells. The 2D mesh is an r-z wedge, so ``sphereToCell``
+    selects Cartesian cell centres inside the continuum sphere. The radius is
+    therefore the geometric charge radius, not a copied 1D face radius.
+
+    The user enters mass, charge density, specific detonation energy, burst
+    height, and ambient pressure and temperature. Volume is the full sphere
+    ``W / rho``. The wedge holds only its sector of that sphere, which is the
+    same equivalent-mass convention the 2D explosive charge already uses.
+    """
+
+    radius_m: float
+    volume_m3: float
+    mass_kg: float
+    rho_source: float
+    e_ambient: float
+    e_source: float
+    t_ambient: float
+    t_source: float
+    p_ambient: float
+    p_source: float
+    rho_ambient: float
+    gamma: float
+    cv: float
+    energy_added_j: float
+
+
+def direct_axisymmetric_burst(
+    *,
+    mass_kg: float,
+    rho_charge: float,
+    energy_j_per_kg: float,
+    p_atm: float,
+    t_atm: float,
+    gamma: float = GAMMA_IDEAL_GAS,
+    cv: float = CV_IDEAL_GAS,
+) -> DirectAxisymmetricBurst:
+    """Single-phase axisymmetric burst. No reaction and no explosive phase.
+
+    ``e_source = Cv*T_atm + E_charge``, ``rho_source = rho_charge``, and
+    ``p_source = (gamma - 1) * rho_source * e_source``. Outside the sphere the
+    gas is the ambient state ``rho = p/(R*T)``, ``e = Cv*T``. blastFoam then
+    recovers ``e`` from ``p`` and ``rho``, so ``T = e/Cv`` stays consistent.
+    """
+    ambient = ambient_state(p_atm, t_atm, gamma=gamma, cv=cv)
+    charge = charge_geometry(mass_kg, rho_charge, energy_j_per_kg)
+    e_source = ambient.e + charge.energy_j_per_kg
+    p_source = (ambient.gamma - 1.0) * charge.rho_charge * e_source
+    return DirectAxisymmetricBurst(
+        radius_m=charge.radius_m,
+        volume_m3=charge.volume_m3,
+        mass_kg=charge.mass_kg,
+        rho_source=charge.rho_charge,
+        e_ambient=ambient.e,
+        e_source=e_source,
+        t_ambient=ambient.t_atm,
+        t_source=e_source / ambient.cv,
+        p_ambient=ambient.p_atm,
+        p_source=p_source,
+        rho_ambient=ambient.rho,
+        gamma=ambient.gamma,
+        cv=ambient.cv,
+        energy_added_j=charge.source_energy_j,
+    )
 
 
 def charge_geometry(mass_kg: float, rho_charge: float, energy_j_per_kg: float) -> ChargeGeometry:

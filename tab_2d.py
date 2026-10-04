@@ -54,6 +54,12 @@ from dialogs import RemapFromDialog
 from external_case_workflow_2d import ImportMode2D, import_mode_label
 from imported_case_mapping_2d import FieldProvenance
 from material_catalog import materials_copy
+from models import (
+    SOURCE_MODEL_IG,
+    SOURCE_MODEL_JWL,
+    is_ideal_gas_source,
+    normalize_source_model,
+)
 from material_validation import REQUIRED_IMPORTED_PHYSICS_KEYS, UNSUPPORTED_IMPORT_KEYS
 from completion_1d import RUN_MODE_TERMINATE
 from models_2d import (
@@ -941,11 +947,18 @@ class Tab2D(QWidget):
         group, form = self._group("Initialization Source")
         self.cmb_source = QComboBox()
         self.cmb_source.addItems([DIRECT_SOURCE, REMAP_SOURCE])
+        self.cmb_method = QComboBox()
+        self.cmb_method.addItem("JWL", SOURCE_MODEL_JWL)
+        self.cmb_method.addItem("Ideal-Gas", SOURCE_MODEL_IG)
+        self._direct_source_model = SOURCE_MODEL_JWL
         form.addRow("Source:", self.cmb_source)
+        form.addRow("Method:", self.cmb_method)
         self._limit_width_to_half_or_text(self.cmb_source, 355)
+        self._limit_width_to_half_or_text(self.cmb_method, 355)
         layout.addWidget(group)
 
         self.grp_charge, form = self._group("Direct Charge")
+        self._charge_form = form
         self.cmb_material = QComboBox()
         self.cmb_material.addItems(self.materials_db.keys())
         self.cmb_shape = QComboBox()
@@ -1302,6 +1315,7 @@ class Tab2D(QWidget):
         label_style = INFO_ROW_STYLE.replace("font-size: 9pt;", "font-size: 9pt; font-weight: bold;")
         self._info_row_widgets = {}
         for key, caption in (
+            ("method", "Method"),
             ("radius_cells", "Radius Cells"),
             ("height_cells", "Height Cells"),
             ("cell_size", "Cell Size"),
@@ -1610,6 +1624,7 @@ class Tab2D(QWidget):
 
     def _connect_signals(self) -> None:
         self.cmb_source.currentTextChanged.connect(self._on_source_changed)
+        self.cmb_method.currentIndexChanged.connect(self._on_method_changed)
         self.btn_edit_remap.clicked.connect(self._open_remap_from_dialog)
         self.cmb_shape.currentTextChanged.connect(self._apply_enablement)
         self.cmb_mesh_mode.currentTextChanged.connect(self._apply_enablement)
@@ -1684,10 +1699,48 @@ class Tab2D(QWidget):
         self.spin_density.setValue(float(props["rho"]))
         self.spin_energy.setValue(float(props["energy"]))
 
-    def _apply_enablement(self, *_args) -> None:
+    def _set_form_row_visible(self, widget, visible: bool) -> None:
+        form = getattr(self, "_charge_form", None)
+        if form is not None:
+            label = form.labelForField(widget)
+            if label is not None:
+                label.setVisible(visible)
+        widget.setVisible(visible)
+
+    def _on_method_changed(self, *_args) -> None:
+        if self._loading:
+            return
+        if self.cmb_source.currentText() == DIRECT_SOURCE:
+            self._direct_source_model = normalize_source_model(self.cmb_method.currentData())
+        self._apply_enablement()
+
+    def _sync_method_combo(self) -> None:
         direct = self.cmb_source.currentText() == DIRECT_SOURCE
+        self.cmb_method.setEnabled(direct)
+        self.cmb_method.setToolTip(
+            ""
+            if direct
+            else "From 1D uses the linked case. This choice applies to a direct charge."
+        )
+        target = self._direct_source_model
+        if not direct:
+            from remap_snapshot_1d import positive_source_model
+
+            found = positive_source_model(self._remap_case_path or "")
+            if found in (SOURCE_MODEL_JWL, SOURCE_MODEL_IG):
+                target = found
+        index = self.cmb_method.findData(normalize_source_model(target))
+        if index >= 0 and self.cmb_method.currentIndex() != index:
+            self.cmb_method.blockSignals(True)
+            self.cmb_method.setCurrentIndex(index)
+            self.cmb_method.blockSignals(False)
+
+    def _apply_enablement(self, *_args) -> None:
+        self._sync_method_combo()
+        direct = self.cmb_source.currentText() == DIRECT_SOURCE
+        direct_ig = direct and is_ideal_gas_source(self.cmb_method.currentData())
         dynamic = self.cmb_mesh_mode.currentText() == DYNAMIC_MESH
-        cylinder = self.cmb_shape.currentText() == "Cylinder"
+        cylinder = (not direct_ig) and self.cmb_shape.currentText() == "Cylinder"
         # Remap imports initial fields only. Target HOB remains user-controlled
         # geometry/metadata (charge centre, burst class, UFC/KB, validation).
         self.grp_charge.setEnabled(True)
@@ -1714,7 +1767,22 @@ class Tab2D(QWidget):
         self.lbl_ld_title.setVisible(cylinder)
         self.lbl_charge_l.setVisible(cylinder)
         self.lbl_length_title.setVisible(cylinder)
-        self.grp_seed.setEnabled(direct and dynamic)
+        self._set_form_row_visible(self.cmb_shape, direct and not direct_ig)
+        self._set_form_row_visible(self.spin_det_height, direct and not direct_ig)
+        self.cmb_material.setToolTip(
+            "Density and energy presets only. Ideal-Gas does not use JWL coefficients."
+            if direct_ig
+            else ""
+        )
+        self.grp_seed.setVisible(not direct_ig)
+        self.grp_seed.setEnabled(direct and dynamic and not direct_ig)
+        alpha = self._field_radios.get("alpha.c4") if hasattr(self, "_field_radios") else None
+        if alpha is not None:
+            alpha.setVisible(not direct_ig)
+            if direct_ig and alpha.isChecked():
+                pressure = self._field_radios.get("p")
+                if pressure is not None:
+                    pressure.setChecked(True)
         self.grp_amr.setEnabled(dynamic)
         self.btn_mesh_amr.setEnabled(dynamic)
         self.refresh_remap_status()
@@ -1905,6 +1973,7 @@ class Tab2D(QWidget):
         self.mark_stale()
         if self.sender() in (
             self.cmb_source,
+            self.cmb_method,
             self.cmb_shape,
             self.cmb_mesh_mode,
             self.cmb_seed_mode,
@@ -2172,8 +2241,10 @@ class Tab2D(QWidget):
             else None
         )
 
+        method = "Ideal-Gas" if is_ideal_gas_source(getattr(inputs, "source_model", None)) else "JWL"
         if not direct:
             rows = [
+                ("method", method),
                 ("radius_cells", f"{domain.radial_cells:,}"),
                 ("height_cells", f"{domain.vertical_cells:,}"),
                 ("cell_size", self._format_info_length(domain.cell_size)),
@@ -2182,11 +2253,15 @@ class Tab2D(QWidget):
                 rows.append(("total_cells", f"{domain.total_cells:,}"))
             elif actual_total is not None:
                 rows = [
+                    ("method", method),
                     ("base_cell", self._format_info_length(domain.cell_size)),
                     ("total_cells", f"{actual_total:,}"),
                 ]
             else:
-                rows = [("base_cell", self._format_info_length(domain.cell_size))]
+                rows = [
+                    ("method", method),
+                    ("base_cell", self._format_info_length(domain.cell_size)),
+                ]
             return rows
 
         charge = result.charge
@@ -2202,6 +2277,7 @@ class Tab2D(QWidget):
                 else self._fixed_direct_charge_cells(domain, inputs, charge)
             )
             return [
+                ("method", "Ideal-Gas" if is_ideal_gas_source(getattr(inputs, "source_model", None)) else "JWL"),
                 ("radius_cells", f"{domain.radial_cells:,}"),
                 ("height_cells", f"{domain.vertical_cells:,}"),
                 ("charge_radius", self._format_info_length(radius)),
@@ -2216,6 +2292,7 @@ class Tab2D(QWidget):
         finest = float(domain.cell_size) / (2 ** max(0, int(level)))
         charge_resolution = (2.0 * float(radius)) / max(finest, 1.0e-15)
         rows = [
+            ("method", "Ideal-Gas" if is_ideal_gas_source(getattr(inputs, "source_model", None)) else "JWL"),
             ("finest_cell", self._format_info_length(finest)),
             ("charge_radius", self._format_info_length(radius)),
             ("charge_res", f"{charge_resolution:.2f} cells/D"),
@@ -2387,7 +2464,15 @@ class Tab2D(QWidget):
             height=self.spin_height.value(),
             cell_size=cell_size,
             initialization_source=self.cmb_source.currentText(),
-            charge_shape=self.cmb_shape.currentText(),
+            source_model=normalize_source_model(self.cmb_method.currentData()),
+            charge_shape=(
+                "Sphere"
+                if (
+                    self.cmb_source.currentText() == DIRECT_SOURCE
+                    and is_ideal_gas_source(self.cmb_method.currentData())
+                )
+                else self.cmb_shape.currentText()
+            ),
             height_of_burst=self.spin_hob.value(),
             detonation_height=self.spin_det_height.value(),
             charge_aspect=self.spin_ld.value(),
@@ -2525,6 +2610,12 @@ class Tab2D(QWidget):
                 (self.cmb_seed_mode, "charge_seed_mode"),
                 (self.cmb_estimator, "refine_indicator_field"),
             )
+            if "source_model" in values and values.get("source_model"):
+                model = normalize_source_model(values.get("source_model"))
+                self._direct_source_model = model
+                index = self.cmb_method.findData(model)
+                if index >= 0:
+                    self.cmb_method.setCurrentIndex(index)
             for widget, key in combos:
                 if key not in values:
                     continue

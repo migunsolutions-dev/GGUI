@@ -350,7 +350,7 @@ class Tab1D(QWidget):
                 (not ig) and self.combo_comp.currentText() == "Custom"
             )
             self.btn_edit_comp.setToolTip(
-                "JWL coefficients are unused for the Ideal-Gas Isothermal Burst."
+                "JWL coefficients are unused for Ideal-Gas."
                 if ig
                 else ""
             )

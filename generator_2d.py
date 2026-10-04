@@ -15,6 +15,7 @@ from axisymmetric_2d import (
     DYNAMIC_MESH,
     validate_case_inputs_2d,
 )
+from atmosphere import ambient_state
 from base_generator import ALPHA_C4_CHECK_SCRIPT, BaseGenerator
 from charge_capture import CAPTURE_CELL_SAFETY, auto_charge_capture_radius_m
 from bm3_reactant_energy import reactant_esref
@@ -55,6 +56,7 @@ class Generator2D(BaseGenerator):
         self.openfoam_bashrc = openfoam_bashrc
 
     def generate(self, case_name: str, inputs: CaseInputs2D) -> str:
+        ambient_state(inputs.p_atm, inputs.t_atm)  # validate before creating files
         validate_required_values(
             inputs,
             undefined_keys=getattr(inputs, "undefined_keys", ()) or (),
@@ -92,6 +94,11 @@ class Generator2D(BaseGenerator):
         )
         if inputs.initialization_source == DIRECT_SOURCE:
             checked = validate_case_inputs_2d(inputs)
+            if self._direct_is_ideal_gas(inputs):
+                # Single-phase gas has no alpha.c4 and no explosive seed region.
+                return (
+                    f"{restore} && blockMesh && setFields{internal_patch} && checkMesh"
+                )
             seed_level = (
                 checked.seed_plan.level_effective
                 if checked.seed_plan is not None
@@ -139,6 +146,17 @@ class Generator2D(BaseGenerator):
             "    ))\n"
         )
         self._write_text(os.path.join(case_dir, "remap_2d.py"), driver)
+
+    def _direct_is_ideal_gas(self, inputs: CaseInputs2D) -> bool:
+        """Direct Ideal-Gas does not consult a linked 1D case."""
+        if inputs.initialization_source != DIRECT_SOURCE:
+            return False
+        from models import is_ideal_gas_source
+
+        return is_ideal_gas_source(getattr(inputs, "source_model", None))
+
+    def _single_phase_ideal_gas(self, inputs: CaseInputs2D) -> bool:
+        return self._direct_is_ideal_gas(inputs) or self._remap_is_ideal_gas(inputs)
 
     def _remap_is_ideal_gas(self, inputs: CaseInputs2D) -> bool:
         """Ideal-Gas remap only when the linked 1D case is positively identified."""
@@ -263,7 +281,7 @@ mergePatchPairs ();
 
     def _write_initial_fields(self, case_dir: str, inputs: CaseInputs2D) -> None:
         zero = os.path.join(case_dir, "0.orig")
-        if self._remap_is_ideal_gas(inputs):
+        if self._single_phase_ideal_gas(inputs):
             from ig_source_state import ambient_state as ig_ambient
 
             state = ig_ambient(inputs.p_atm, inputs.t_atm)
@@ -273,7 +291,7 @@ mergePatchPairs ();
                 ("rho", "[1 -3 0 0 0 0 0]", state.rho),
             )
         else:
-            rho_air = inputs.p_atm / (287.05 * inputs.t_atm)
+            rho_air = ambient_state(inputs.p_atm, inputs.t_atm).rho
             scalar_specs = (
                 ("p", "[1 -1 -2 0 0 0 0]", inputs.p_atm),
                 ("T", "[0 0 0 1 0 0 0]", inputs.t_atm),
@@ -296,7 +314,7 @@ mergePatchPairs ();
         self._write_text(os.path.join(zero, "U"), u)
 
     def _write_phase_properties(self, case_dir: str, inputs: CaseInputs2D) -> None:
-        if self._remap_is_ideal_gas(inputs):
+        if self._single_phase_ideal_gas(inputs):
             from ig_source_state import ambient_state as ig_ambient
 
             state = ig_ambient(inputs.p_atm, inputs.t_atm)
@@ -331,12 +349,11 @@ thermodynamics  {{ Cv {state.cv:.10g}; Hf 0; }}
         remap = inputs.initialization_source != DIRECT_SOURCE
         # Cancel only BirchMurnaghan3::E(rho0). Cv*T stays. See bm3_reactant_energy.
         esref = reactant_esref(float(inputs.rho_charge))
-        use_com = "no" if remap else "yes"
-        points = (
-            f"        points ((0 {inputs.height_of_burst:.12g} 0));\n"
-            if remap
-            else ""
-        )
+        # A wedge centre-of-mass is off the axis. useCOM would light a ring,
+        # not the charge centre. The detonation point stays on the axis.
+        use_com = "no"
+        point_y = inputs.height_of_burst if remap else inputs.detonation_height
+        points = f"        points ((0 {point_y:.12g} 0));\n"
         content = self._foam_header("phaseProperties", "dictionary", "constant") + f"""
 phases (c4 air);
 c4
@@ -440,6 +457,33 @@ regions ();
 """
             self._write_text(os.path.join(case_dir, "system", "setFieldsDict"), content)
             return
+        if self._direct_is_ideal_gas(inputs):
+            from ig_source_state import direct_axisymmetric_burst
+
+            burst = direct_axisymmetric_burst(
+                mass_kg=float(inputs.mass_kg),
+                rho_charge=float(inputs.rho_charge),
+                energy_j_per_kg=float(inputs.energy_j_per_kg),
+                p_atm=float(inputs.p_atm),
+                t_atm=float(inputs.t_atm),
+            )
+            centre_y = float(inputs.height_of_burst)
+            content = self._foam_header("setFieldsDict", "dictionary", "system") + f"""
+fields (p rho);
+nBufferLayers 0;
+defaultFieldValues (volScalarFieldValue rho {burst.rho_ambient:.12g} volScalarFieldValue p {burst.p_ambient:.12g});
+regions
+(
+    sphereToCell
+    {{
+        centre (0 {centre_y:.12g} 0);
+        radius {burst.radius_m:.12g};
+        fieldValues (volScalarFieldValue rho {burst.rho_source:.12g} volScalarFieldValue p {burst.p_source:.12g});
+    }}
+);
+"""
+            self._write_text(os.path.join(case_dir, "system", "setFieldsDict"), content)
+            return
         if inputs.initialization_source != DIRECT_SOURCE:
             regions = ""
             level = 0
@@ -519,7 +563,7 @@ solvers
 }
 PIMPLE { nCorrectors 3; nNonOrthogonalCorrectors 0; }
 """
-        ideal = self._remap_is_ideal_gas(inputs)
+        ideal = self._single_phase_ideal_gas(inputs)
         if ideal:
             fv_body = r"""
 fluxScheme Tadmor;
@@ -785,7 +829,7 @@ functions
             else "blastFoam"
         )
         decompose = "decomposePar -force && " if inputs.cores > 1 else ""
-        listed_fields = "p rho U T" if self._remap_is_ideal_gas(inputs) else "p rho U T alpha.c4"
+        listed_fields = "p rho U T" if self._single_phase_ideal_gas(inputs) else "p rho U T alpha.c4"
         allrun = f"""#!/usr/bin/env bash
 cd "$(dirname "$0")" || exit 1
 source "{self.openfoam_bashrc}" || true

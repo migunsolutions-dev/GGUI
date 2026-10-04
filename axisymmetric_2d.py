@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 from charge_seed_plan import ChargeSeedPlan, build_charge_seed_plan
+from models import SourceModelError, is_ideal_gas_source, normalize_source_model
 from models_2d import CaseInputs2D
 from physical_charge_geometry import PhysicalChargeGeometry, physical_charge_geometry
 
@@ -206,7 +207,15 @@ def validate_case_inputs_2d(inputs: CaseInputs2D) -> ValidationResult2D:
         except (TypeError, ValueError) as exc:
             errors.append(str(exc))
 
-        if inputs.mesh_mode == DYNAMIC_MESH:
+        direct_ig = False
+        try:
+            normalize_source_model(getattr(inputs, "source_model", None))
+            direct_ig = is_ideal_gas_source(getattr(inputs, "source_model", None))
+        except SourceModelError as exc:
+            errors.append(str(exc))
+        if direct_ig and inputs.charge_shape != "Sphere":
+            errors.append("Direct Ideal-Gas uses a spherical burst.")
+        if inputs.mesh_mode == DYNAMIC_MESH and not direct_ig:
             try:
                 seed_plan = build_charge_seed_plan(inputs)
                 if not seed_plan.is_safe:
@@ -217,8 +226,9 @@ def validate_case_inputs_2d(inputs: CaseInputs2D) -> ValidationResult2D:
         elif charge is not None:
             cells = charge.d_min_m / max(float(inputs.cell_size), 1e-12)
             if cells + 1e-9 < float(inputs.charge_seed_min_cells):
+                mesh_name = "Ideal-Gas burst" if direct_ig else "Fixed Mesh"
                 errors.append(
-                    "Fixed Mesh cannot resolve the charge at the requested Base Cell Size "
+                    f"{mesh_name} cannot resolve the charge at the requested Base Cell Size "
                     f"({cells:.2f} cells across {charge.d_min_name}; minimum "
                     f"{inputs.charge_seed_min_cells}). Reduce Base Cell Size."
                 )
