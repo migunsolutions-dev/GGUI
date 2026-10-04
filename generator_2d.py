@@ -17,6 +17,7 @@ from axisymmetric_2d import (
 )
 from base_generator import ALPHA_C4_CHECK_SCRIPT, BaseGenerator
 from charge_capture import CAPTURE_CELL_SAFETY, auto_charge_capture_radius_m
+from bm3_reactant_energy import reactant_esref
 import jwl_activation_energy as jwl_act
 from material_catalog import jwl_parameters
 from material_validation import validate_required_values
@@ -328,6 +329,8 @@ thermodynamics  {{ Cv {state.cv:.10g}; Hf 0; }}
             dimension="2D",
         )
         remap = inputs.initialization_source != DIRECT_SOURCE
+        # Cancel only BirchMurnaghan3::E(rho0). Cv*T stays. See bm3_reactant_energy.
+        esref = reactant_esref(float(inputs.rho_charge))
         use_com = "no" if remap else "yes"
         points = (
             f"        points ((0 {inputs.height_of_burst:.12g} 0));\n"
@@ -345,7 +348,7 @@ c4
         equationOfState {{ rho0 {inputs.rho_charge:.12g}; Gamma 0.25; pRef 101298; K0 8.04e9; K0Prime 7.97; }}
         specie {{ molWeight 55.0; }}
         transport {{ mu 0; Pr 1; }}
-        thermodynamics {{ Cv 1400; Hf 0.0; }}
+        thermodynamics {{ Cv 1400; Hf 0.0; Esref {esref:.12g}; }}
     }}
     products
     {{
